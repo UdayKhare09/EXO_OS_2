@@ -142,7 +142,7 @@ $(ISO_IMAGE): $(KERNEL_ELF) $(LIMINE_DIR)/limine.h
 run: $(ISO_IMAGE)
 	qemu-system-x86_64          \
 	    -cdrom $(ISO_IMAGE)     \
-	    -m 512M                 \
+	    -m 2G                 \
 	    -smp 4                  \
 	    -serial stdio           \
 	    -enable-kvm             \

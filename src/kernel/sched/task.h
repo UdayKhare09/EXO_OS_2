@@ -1,7 +1,8 @@
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
-#include "mm/pmm.h"   /* for PAGE_SIZE */
+#include "mm/pmm.h"        /* for PAGE_SIZE   */
+#include "ipc/signal.h"    /* for sig_handler_t */
 
 #define TASK_STACK_SIZE   (PAGE_SIZE * 4)   /* 16 KiB default stack */
 #define TASK_NAME_MAX     32
@@ -15,6 +16,8 @@ typedef enum {
 
 typedef void (*task_entry_t)(void *arg);
 
+struct ipc_mailbox;   /* defined in ipc/ipc.c */
+
 typedef struct task {
     uint64_t      rsp;              /* saved stack pointer (top of regs frame)  */
     uint64_t      cr3;              /* page table root (kernel addr space share) */
@@ -24,6 +27,11 @@ typedef struct task {
     char          name[TASK_NAME_MAX];
     struct task  *next;             /* run-queue linked list                    */
     uintptr_t     stack_phys;       /* physical base of kernel stack            */
+
+    /* ── IPC + Signals ──────────────────────────────────────────────────── */
+    volatile uint32_t    sig_pending;   /* bitmask: bit N set = signal N pending */
+    sig_handler_t       *sig_handlers;  /* [NSIGS] handler table; NULL = all DFL  */
+    struct ipc_mailbox  *mailbox;       /* receive message queue                   */
 } task_t;
 
 /* Create a new task; returns NULL on error */
@@ -32,3 +40,6 @@ task_t *task_create(const char *name, task_entry_t entry, void *arg,
 
 /* Free a task (must be DEAD) */
 void task_destroy(task_t *t);
+
+/* Look up a task by TID (returns NULL if not found or dead) */
+task_t *task_lookup(uint32_t tid);

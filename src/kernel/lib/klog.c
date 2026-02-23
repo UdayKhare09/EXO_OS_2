@@ -85,10 +85,21 @@ static int kvsnprintf(char *buf, size_t cap, const char *fmt, va_list ap) {
     return (int)i;
 }
 
+/* Spinlock: serialize output so lines from different CPUs don't interleave */
+static volatile int klog_lock = 0;
+static inline void klog_acquire(void) {
+    while (__atomic_test_and_set(&klog_lock, __ATOMIC_ACQUIRE));
+}
+static inline void klog_release(void) {
+    __atomic_clear(&klog_lock, __ATOMIC_RELEASE);
+}
+
 static void klog_vprint(const char *fmt, va_list ap) {
     char buf[512];
     kvsnprintf(buf, sizeof(buf), fmt, ap);
+    klog_acquire();
     serial_puts(buf);
+    klog_release();
 }
 
 void klog_info(const char *fmt, ...) {

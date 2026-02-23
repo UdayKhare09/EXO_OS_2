@@ -23,6 +23,9 @@
 #include "lib/klog.h"
 #include "lib/panic.h"
 #include "lib/string.h"
+#include "mm/kmalloc.h"
+#include "ipc/ipc.h"
+#include "ipc/signal.h"
 #include "arch/x86_64/gdt.h"
 #include "arch/x86_64/idt.h"
 #include "arch/x86_64/cpu.h"
@@ -71,15 +74,74 @@ static volatile struct limine_kernel_address_request kaddr_req = {
     .revision = 0,
 };
 
-/* ── Simple test tasks ───────────────────────────────────────────────────── */
-static void task_hello(void *arg) {
-    uint32_t id = (uint32_t)(uintptr_t)arg;
-    for (int i = 0; i < 5; i++) {
-        KLOG_INFO("task%u: hello from round %d\n", id, i);
-        /* Yield by spinning a bit (real OS would do sleep/yield syscall) */
-        for (volatile int d = 0; d < 5000000; d++) cpu_pause();
+/* ── IPC + Signal test ───────────────────────────────────────────────────── */
+static volatile uint32_t g_consumer_tid  = 0;
+static volatile int      g_consumer_done = 0;
+
+/* Signal handlers — run in task context (safe to call KLOG_INFO) */
+static void on_sigusr1(int sig) {
+    (void)sig;
+    KLOG_INFO("[ipc] consumer: SIGUSR1 received!\n");
+}
+static void on_sigterm(int sig) {
+    (void)sig;
+    KLOG_INFO("[ipc] consumer: SIGTERM received, shutting down\n");
+    g_consumer_done = 1;
+}
+
+static void task_consumer(void *arg) {
+    (void)arg;
+    task_t *self = sched_current();
+    signal_set(self, SIGUSR1, on_sigusr1);
+    signal_set(self, SIGTERM, on_sigterm);
+    g_consumer_tid = self->tid;  /* publish TID so producer can find us */
+
+    KLOG_INFO("[ipc] consumer tid=%u ready\n", self->tid);
+    while (!g_consumer_done) {
+        ipc_msg_t msg;
+        int r = ipc_recv(&msg);   /* blocks; returns -1 on signal */
+        if (r == 0) {
+            KLOG_INFO("[ipc] consumer: msg type=%u data=%llu from tid=%u\n",
+                      msg.type, msg.data[0], msg.from_tid);
+        }
+        /* if r == -1 signal_dispatch already ran handlers above */
     }
-    KLOG_INFO("task%u: done\n", id);
+    KLOG_INFO("[ipc] consumer: exiting\n");
+}
+
+static void task_producer(void *arg) {
+    (void)arg;
+    task_t *self = sched_current();
+
+    /* Spin until consumer has published its TID */
+    while (!g_consumer_tid)
+        for (volatile int d = 0; d < 100000; d++) cpu_pause();
+
+    uint32_t ctid = g_consumer_tid;
+    KLOG_INFO("[ipc] producer tid=%u -> consumer tid=%u\n", self->tid, ctid);
+
+    /* Send 5 data messages */
+    for (uint32_t i = 1; i <= 5; i++) {
+        ipc_msg_t msg = { .from_tid = self->tid, .type = IPC_MSG_DATA,
+                          .data = { i, 0, 0, 0 } };
+        if (ipc_send(ctid, &msg) == 0)
+            KLOG_INFO("[ipc] producer: sent message %u\n", i);
+        for (volatile int d = 0; d < 3000000; d++) cpu_pause();
+    }
+
+    /* Send SIGUSR1 */
+    KLOG_INFO("[ipc] producer: sending SIGUSR1\n");
+    task_t *consumer = task_lookup(ctid);
+    if (consumer) signal_send(consumer, SIGUSR1);
+
+    for (volatile int d = 0; d < 5000000; d++) cpu_pause();
+
+    /* Send SIGTERM to shut the consumer down */
+    KLOG_INFO("[ipc] producer: sending SIGTERM\n");
+    consumer = task_lookup(ctid);
+    if (consumer) signal_send(consumer, SIGTERM);
+
+    KLOG_INFO("[ipc] producer: done\n");
 }
 
 /* ── Kernel entry point ─────────────────────────────────────────────────── */
@@ -134,6 +196,9 @@ void kmain(void) {
      * physical load address — those are completely different things. */
     vmm_init(hhdm_req.response->offset, read_cr3());
 
+    /* ── 5a. Kernel heap (slab allocator) ────────────────────────────────── */
+    kmalloc_init();
+
     /* ── 6. ACPI / MADT ──────────────────────────────────────────────────── */
     acpi_init((uintptr_t)rsdp_req.response->address);
 
@@ -156,11 +221,9 @@ void kmain(void) {
     /* ── 10. Enable interrupts ───────────────────────────────────────────── */
     cpu_sti();
 
-    /* ── 11. Spawn some test tasks ───────────────────────────────────────── */
-    for (uint32_t i = 0; i < 3; i++) {
-        task_t *t = task_create("hello", task_hello, (void *)(uintptr_t)i, 0);
-        if (t) sched_add_task(t, 0);
-    }
+    /* ── 11. Spawn IPC + signal test tasks ─────────────────────────────── */
+    sched_spawn("consumer", task_consumer, NULL);
+    sched_spawn("producer", task_producer, NULL);
     KLOG_INFO("Kernel init complete. Entering idle.\n");
 
     /* BSP falls into idle — scheduler timer will preempt as needed */

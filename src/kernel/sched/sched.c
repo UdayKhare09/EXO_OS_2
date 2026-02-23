@@ -1,5 +1,6 @@
 #include "sched.h"
 #include "task.h"
+#include "ipc/signal.h"
 #include "arch/x86_64/apic.h"
 #include "arch/x86_64/cpu.h"
 #include "arch/x86_64/smp.h"
@@ -22,6 +23,7 @@ typedef struct {
     task_t  *idle;        /* dedicated idle task                    */
     uint32_t queue_len;
     uint32_t cpu_id;
+    volatile int rq_lock; /* spinlock protecting queue_{head,tail,len} */
 } cpu_sched_t;
 
 static cpu_sched_t cpu_scheds[MAX_CPUS];
@@ -30,6 +32,27 @@ static cpu_sched_t cpu_scheds[MAX_CPUS];
 extern void task_switch_asm(uint64_t *old_rsp_ptr,
                             uint64_t  new_rsp,
                             uint64_t  new_cr3);
+
+/* ── Run-queue lock helpers ──────────────────────────────────────────────── */
+
+/* ISR context: interrupts already disabled; just spin on cross-CPU contention */
+static inline void rq_lock(cpu_sched_t *cs) {
+    while (__atomic_test_and_set(&cs->rq_lock, __ATOMIC_ACQUIRE));
+}
+static inline void rq_unlock(cpu_sched_t *cs) {
+    __atomic_clear(&cs->rq_lock, __ATOMIC_RELEASE);
+}
+
+/* Task context: disable local interrupts first so the timer ISR on THIS CPU
+ * cannot re-enter rq_lock while we hold it (same-CPU deadlock prevention). */
+static inline uint64_t irq_save_cli(void) {
+    uint64_t f;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(f) :: "memory");
+    return f;
+}
+static inline void irq_restore(uint64_t f) {
+    __asm__ volatile("pushq %0; popfq" :: "r"(f) : "memory");
+}
 
 /* ── Run-queue helpers ────────────────────────────────────────────────────── */
 static void rq_enqueue(cpu_sched_t *cs, task_t *t) {
@@ -93,7 +116,11 @@ void sched_init(uint32_t cpu_id) {
 void sched_add_task(task_t *t, uint32_t cpu_id) {
     cpu_sched_t *cs = &cpu_scheds[cpu_id];
     t->state = TASK_RUNNABLE;
+    uint64_t f = irq_save_cli();
+    rq_lock(cs);
     rq_enqueue(cs, t);
+    rq_unlock(cs);
+    irq_restore(f);
 }
 
 /* ── sched_tick: called from APIC timer ISR ──────────────────────────────── */
@@ -105,25 +132,47 @@ void sched_tick(void) {
 
     task_t *prev = cs->current;
 
+    rq_lock(cs);
     /* Re-enqueue previous task if still runnable */
     if (prev && prev != cs->idle && prev->state == TASK_RUNNING) {
         prev->state = TASK_RUNNABLE;
         rq_enqueue(cs, prev);
     }
 
-    /* Pick next runnable task */
-    task_t *next = NULL;
-    uint32_t tried = 0;
+    /* Pick next runnable task; collect dead tasks to free after unlock */
+    task_t *next      = NULL;
+    task_t *dead_list = NULL;
+    uint32_t tried    = 0;
     while (tried < cs->queue_len + 1) {
         task_t *t = rq_dequeue(cs);
         if (!t) break;
         if (t->state == TASK_RUNNABLE) { next = t; break; }
-        if (t->state == TASK_DEAD)     { task_destroy(t); tried++; continue; }
+        if (t->state == TASK_DEAD) {
+            t->next   = dead_list;
+            dead_list = t;
+            tried++;  continue;
+        }
         rq_enqueue(cs, t);   /* skip blocked tasks */
         tried++;
     }
+    rq_unlock(cs);
+
+    /* Free dead tasks outside the lock (task_destroy acquires kmalloc_lock) */
+    while (dead_list) {
+        task_t *d = dead_list;
+        dead_list = d->next;
+        d->next = NULL;
+        task_destroy(d);
+    }
 
     if (!next) next = cs->idle;   /* fallback to idle */
+
+    /* Fast-path SIGKILL: destroy the task before it runs */
+    if (next != cs->idle &&
+        (next->sig_pending & (1u << SIGKILL))) {
+        task_destroy(next);
+        next = cs->idle;
+    }
 
     next->state = TASK_RUNNING;
     cs->current = next;
@@ -156,8 +205,21 @@ void sched_block(void) {
 
 /* ── sched_unblock ───────────────────────────────────────────────────────── */
 void sched_unblock(task_t *t) {
-    t->state = TASK_RUNNABLE;
-    rq_enqueue(&cpu_scheds[t->cpu_id], t);
+    if (!t) return;
+    /* Atomically transition BLOCKED → RUNNABLE.
+     * If the task was not BLOCKED (already runnable, running, or dead),
+     * do nothing — it is already in a queue or doesn't need waking. */
+    task_state_t old = TASK_BLOCKED;
+    if (!__atomic_compare_exchange_n(&t->state, &old, TASK_RUNNABLE,
+                                     0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED))
+        return;
+
+    cpu_sched_t *cs = &cpu_scheds[t->cpu_id];
+    uint64_t f = irq_save_cli();
+    rq_lock(cs);
+    rq_enqueue(cs, t);
+    rq_unlock(cs);
+    irq_restore(f);
 }
 
 /* ── sched_current ───────────────────────────────────────────────────────── */
@@ -174,4 +236,26 @@ void sched_idle_loop(void) {
     KLOG_INFO("sched: CPU%u entering idle loop\n", ci->id);
     cpu_sti();
     for (;;) cpu_halt();
+}
+
+/* ── sched_pick_cpu: return CPU index with fewest queued tasks ────────────── */
+uint32_t sched_pick_cpu(void) {
+    uint32_t ncpus   = smp_cpu_count();
+    uint32_t best    = 0;
+    uint32_t min_len = cpu_scheds[0].queue_len;
+    for (uint32_t i = 1; i < ncpus; i++) {
+        if (cpu_scheds[i].queue_len < min_len) {
+            min_len = cpu_scheds[i].queue_len;
+            best    = i;
+        }
+    }
+    return best;
+}
+
+/* ── sched_spawn: create a task on the least-loaded CPU ──────────────────── */
+task_t *sched_spawn(const char *name, task_entry_t entry, void *arg) {
+    uint32_t cpu = sched_pick_cpu();
+    task_t  *t   = task_create(name, entry, arg, cpu);
+    if (t) sched_add_task(t, cpu);
+    return t;
 }

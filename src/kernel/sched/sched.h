@@ -26,5 +26,9 @@ __attribute__((noreturn)) void sched_idle_loop(void);
 /* Returns currently running task on this CPU */
 task_t *sched_current(void);
 
+/* Load-balanced task creation: picks the CPU with fewest queued tasks */
+uint32_t sched_pick_cpu(void);
+task_t  *sched_spawn(const char *name, task_entry_t entry, void *arg);
+
 /* Global tick-per-ms for APIC (set by main after calibration) */
 extern uint32_t g_apic_ticks_per_ms;

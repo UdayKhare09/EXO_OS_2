@@ -1,12 +1,34 @@
 #include "task.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
+#include "mm/kmalloc.h"
+#include "ipc/signal.h"
+#include "ipc/ipc.h"
 #include "lib/string.h"
 #include "lib/klog.h"
 #include "lib/panic.h"
 #include "arch/x86_64/cpu.h"
 #include <stdint.h>
 #include <stddef.h>
+
+/* ── Task ID registry ────────────────────────────────────────────────────── */
+#define TASK_TABLE_SIZE  1024
+static task_t *task_table[TASK_TABLE_SIZE];
+
+task_t *task_lookup(uint32_t tid) {
+    if (tid == 0 || tid >= TASK_TABLE_SIZE) return NULL;
+    return __atomic_load_n(&task_table[tid], __ATOMIC_ACQUIRE);
+}
+
+static void task_register(task_t *t) {
+    if (t->tid < TASK_TABLE_SIZE)
+        __atomic_store_n(&task_table[t->tid], t, __ATOMIC_RELEASE);
+}
+
+static void task_unregister(task_t *t) {
+    if (t->tid < TASK_TABLE_SIZE)
+        __atomic_store_n(&task_table[t->tid], (task_t *)NULL, __ATOMIC_RELEASE);
+}
 
 /* Initial register frame pushed onto a new task's stack.
  * task_switch_asm will pop these when first switching to this task. */
@@ -52,7 +74,13 @@ task_t *task_create(const char *name, task_entry_t entry, void *arg,
     t->cpu_id = cpu_id;
     t->next   = NULL;
 
+    /* IPC + signal resources */
+    t->sig_pending  = 0;
+    t->sig_handlers = signal_table_alloc();
+    t->mailbox      = ipc_mailbox_create(t);
+
     strncpy(t->name, name ? name : "unnamed", TASK_NAME_MAX - 1);
+    task_register(t);
 
     KLOG_DEBUG("task: created '%s' tid=%u cpu=%u rsp=%p\n",
                t->name, t->tid, t->cpu_id, (void *)t->rsp);
@@ -61,6 +89,9 @@ task_t *task_create(const char *name, task_entry_t entry, void *arg,
 
 void task_destroy(task_t *t) {
     if (!t) return;
+    task_unregister(t);
+    signal_table_free(t->sig_handlers);  t->sig_handlers = NULL;
+    ipc_mailbox_destroy(t->mailbox);     t->mailbox      = NULL;
     pmm_free_pages(t->stack_phys, TASK_STACK_SIZE / PAGE_SIZE);
     uintptr_t task_phys = vmm_virt_to_phys((uintptr_t)t);
     pmm_free_pages(task_phys, 1);
