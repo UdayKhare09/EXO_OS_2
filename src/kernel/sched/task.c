@@ -8,6 +8,7 @@
 #include "lib/klog.h"
 #include "lib/panic.h"
 #include "arch/x86_64/cpu.h"
+#include "fs/fd.h"   /* fd_close_all */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -83,6 +84,8 @@ task_t *task_create(const char *name, task_entry_t entry, void *arg,
     t->mailbox      = ipc_mailbox_create(t);
 
     strncpy(t->name, name ? name : "unnamed", TASK_NAME_MAX - 1);
+    t->cwd[0] = '/';
+    t->cwd[1] = '\0';
     task_register(t);
 
     KLOG_DEBUG("task: created '%s' tid=%u cpu=%u rsp=%p\n",
@@ -93,6 +96,7 @@ task_t *task_create(const char *name, task_entry_t entry, void *arg,
 void task_destroy(task_t *t) {
     if (!t) return;
     task_unregister(t);
+    fd_close_all(t);                         /* close all open file descriptors  */
     signal_table_free(t->sig_handlers);  t->sig_handlers = NULL;
     ipc_mailbox_destroy(t->mailbox);     t->mailbox      = NULL;
     pmm_free_pages(t->stack_phys, TASK_STACK_SIZE / PAGE_SIZE);

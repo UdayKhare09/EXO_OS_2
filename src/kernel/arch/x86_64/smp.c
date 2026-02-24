@@ -160,6 +160,15 @@ static void smp_install_trampoline(void) {
               len, SMP_TRAMPOLINE_PHYS);
 }
 
+/* ── Remove identity mapping of low memory after all APs have booted ──────── */
+static void smp_unmap_trampoline(void) {
+    for (uintptr_t pa = 0; pa < 0x200000; pa += PAGE_SIZE) {
+        vmm_unmap_page(pa);
+    }
+    /* Flush TLB on BSP — APs already have the same CR3 */
+    __asm__ volatile("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
+}
+
 /* ── Main SMP init called from BSP ───────────────────────────────────────── */
 void smp_init(void) {
     madt_info_t *madt  = acpi_get_madt_info();
@@ -184,4 +193,8 @@ void smp_init(void) {
     }
 
     KLOG_INFO("SMP: %u CPU(s) online\n", cpu_count);
+
+    /* Remove the identity mapping of low memory — no longer needed and
+     * leaving it mapped hides NULL-pointer dereferences / wild jumps. */
+    smp_unmap_trampoline();
 }

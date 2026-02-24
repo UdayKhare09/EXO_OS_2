@@ -4,8 +4,13 @@
 #include "mm/pmm.h"        /* for PAGE_SIZE   */
 #include "ipc/signal.h"    /* for sig_handler_t */
 
+/* Forward-declare file_t to avoid circular include (fs/fd.h includes sched/task.h) */
+struct file;
+
 #define TASK_STACK_SIZE   (PAGE_SIZE * 4)   /* 16 KiB default stack */
 #define TASK_NAME_MAX     32
+#define TASK_FD_TABLE_SIZE 256
+#define TASK_CWD_MAX      256
 
 typedef enum {
     TASK_RUNNABLE  = 0,
@@ -41,6 +46,10 @@ typedef struct task {
     volatile uint32_t    sig_pending;   /* bitmask: bit N set = signal N pending */
     sig_handler_t       *sig_handlers;  /* [NSIGS] handler table; NULL = all DFL  */
     struct ipc_mailbox  *mailbox;       /* receive message queue                   */
+
+    /* ── Filesystem ──────────────────────────────────────────────────────── */
+    struct file         *fd_table[TASK_FD_TABLE_SIZE];   /* open files        */
+    char                 cwd[TASK_CWD_MAX];              /* current working dir */
 } task_t;
 
 /* Create a new task; returns NULL on error */

@@ -8,6 +8,9 @@ LIMINE_DIR      := $(BUILD_DIR)/limine
 KERNEL_ELF      := $(BUILD_DIR)/exo.elf
 ISO_IMAGE       := $(BUILD_DIR)/exo.iso
 
+# Utility variable — comma is special in make function calls
+comma           := ,
+
 LIMINE_TAG      := v8.x-binary
 LIMINE_REPO     := https://github.com/limine-bootloader/limine.git
 
@@ -77,7 +80,10 @@ NASM_OBJS := $(patsubst $(SRC_DIR)/%.asm,  $(BUILD_DIR)/obj/%.asm.o,  $(NASM_SRC
 
 ALL_OBJS := $(C_OBJS) $(AS_OBJS) $(NASM_OBJS) $(TRAMPOLINE_OBJ) $(FONT_DATA_OBJ)
 
-.PHONY: all clean run
+DISK_IMG        := $(BUILD_DIR)/disk.img
+DISK_SIZE_MB    := 256
+
+.PHONY: all clean run run-debug disk
 
 all: $(ISO_IMAGE)
 
@@ -157,6 +163,26 @@ $(ISO_IMAGE): $(KERNEL_ELF) $(LIMINE_DIR)/limine.h
 	$(LIMINE_DIR)/limine bios-install $(ISO_IMAGE)
 	@echo ">>> ISO ready: $(ISO_IMAGE)"
 
+# ─── Build GPT disk image with EFI (FAT32) + Linux (ext2) partitions ─────────
+# Requires: sgdisk (gdisk), mkfs.fat (dosfstools), mkfs.ext2 (e2fsprogs),
+#           losetup + partprobe (util-linux, Linux only), udisksctl or
+#           a helper script.  Run as root or via sudo if loop setup requires it.
+disk: $(DISK_IMG)
+
+$(DISK_IMG):
+	@echo ">>> Creating $(DISK_SIZE_MB) MiB GPT disk image..."
+	dd if=/dev/zero of=$(DISK_IMG) bs=1M count=$(DISK_SIZE_MB) status=progress
+	@echo ">>> Partitioning: part1=EFI(FAT32, 32 MiB)  part2=Linux(ext2, rest)"
+	sgdisk -Z $(DISK_IMG)
+	sgdisk -n 1:2048:67583  -t 1:ef00 -c 1:"EFI System"  $(DISK_IMG)
+	sgdisk -n 2:67584:0     -t 2:8300 -c 2:"Linux Data"  $(DISK_IMG)
+	@echo ">>> Formatting partitions via loop device..."
+	@LOOPDEV=$$(sudo losetup --show -fP $(DISK_IMG)); \
+	    sudo mkfs.fat -F 32 -n "EFI" $${LOOPDEV}p1; \
+	    sudo mkfs.ext2 -L "LINUX" $${LOOPDEV}p2; \
+	    sudo losetup -d $${LOOPDEV}
+	@echo ">>> Disk image ready: $(DISK_IMG)"
+
 # ─── Run in QEMU ─────────────────────────────────────────────────────────────
 run: $(ISO_IMAGE)
 	qemu-system-x86_64                                      \
@@ -171,6 +197,8 @@ run: $(ISO_IMAGE)
 	    -device nec-usb-xhci,id=xhci                       \
 	    -device usb-kbd,bus=xhci.0                         \
 	    -device usb-mouse,bus=xhci.0                       \
+	    $(if $(wildcard $(DISK_IMG)),-drive file=$(DISK_IMG)$(comma)if=virtio$(comma)format=raw,) \
+		-boot order=d \
 	    -no-reboot
 
 run-debug: $(ISO_IMAGE)
@@ -187,7 +215,7 @@ run-debug: $(ISO_IMAGE)
 clean:
 	@rm -rf $(BUILD_DIR)/obj $(KERNEL_ELF) $(ISO_IMAGE) \
 	        $(ISO_DIR) $(BUILD_DIR)/limine.h             \
-	        $(FONT_DATA_C) $(FONT_DATA_OBJ)
+	        $(FONT_DATA_C) $(FONT_DATA_OBJ) $(DISK_IMG)
 	@echo ">>> Cleaned."
 
 distclean:

@@ -45,6 +45,18 @@
 #include "drivers/usb/usb_core.h"
 #include "drivers/usb/hid.h"
 
+/* ── Filesystem stack ────────────────────────────────────────────────────── */
+#include "fs/bcache.h"
+#include "fs/vfs.h"
+#include "fs/fat32/fat32.h"
+#include "fs/ext2/ext2.h"
+#include "fs/tmpfs/tmpfs.h"
+#include "drivers/storage/blkdev.h"
+#include "drivers/storage/virtio_blk.h"
+#include "drivers/storage/ahci.h"
+#include "fs/gpt.h"
+#include "syscall/syscall.h"
+
 /* ── Limine protocol: start marker ──────────────────────────────────────── */
 __attribute__((used, section(".limine_requests_start_marker")))
 static volatile LIMINE_REQUESTS_START_MARKER;
@@ -81,6 +93,56 @@ static volatile struct limine_kernel_address_request kaddr_req = {
     .id       = LIMINE_KERNEL_ADDRESS_REQUEST,
     .revision = 0,
 };
+
+/* ── Storage + filesystem initialisation task ────────────────────────────── */
+/* Spawned after interrupts are enabled so storage drivers can sleep/poll   */
+static void storage_init_task(void *arg) {
+    (void)arg;
+    KLOG_INFO("storage-init: scanning for block devices\n");
+
+    /* Initialise storage drivers: probe PCI for VirtIO-blk and AHCI */
+    virtio_blk_init();
+    ahci_init();
+
+    /* Scan each registered block device for GPT partition tables */
+    int n = blkdev_count();
+    for (int i = 0; i < n; i++) {
+        blkdev_t *dev = blkdev_get_nth(i);
+        if (!dev) continue;
+        /* Skip partition blkdevs (they have part_offset set) */
+        if (dev->part_offset) continue;
+
+        KLOG_INFO("storage-init: scanning %s for GPT\n", dev->name);
+        gpt_partition_t parts[16];
+        int np = gpt_scan(dev, parts, 16);
+        if (np <= 0) {
+            KLOG_WARN("storage-init: no GPT on %s\n", dev->name);
+            continue;
+        }
+        KLOG_INFO("storage-init: %d partition(s) found on %s\n", np, dev->name);
+    }
+
+    /* Auto-mount: try to find an ext2 partition and mount at /mnt/disk */
+    int total = blkdev_count();
+    for (int i = 0; i < total; i++) {
+        blkdev_t *dev = blkdev_get_nth(i);
+        if (!dev || !dev->part_offset) continue;
+        /* Try ext2 first */
+        int r = vfs_mount("/mnt/disk", dev, "ext2");
+        if (r == 0) {
+            KLOG_INFO("storage-init: ext2 mounted on /mnt/disk from %s\n", dev->name);
+            break;
+        }
+        /* Try FAT32 */
+        r = vfs_mount("/mnt/disk", dev, "fat32");
+        if (r == 0) {
+            KLOG_INFO("storage-init: fat32 mounted on /mnt/disk from %s\n", dev->name);
+            break;
+        }
+    }
+
+    KLOG_INFO("storage-init: done\n");
+}
 
 /* ── USB + HID init task ─────────────────────────────────────────────────── */
 /* Runs after cpu_sti() so that xHCI control transfers can use sched_sleep  */
@@ -148,7 +210,30 @@ void kmain(void) {
 
     /* ── 5a. Kernel heap (slab allocator) ────────────────────────────────── */
     kmalloc_init();
-    /* ── 5b. Input event subsystem (lock-free SPSC rings, safe pre-IRQ) ────── */
+
+    
+
+    /* ── 5b. Filesystem stack (VFS + pseudo-root via tmpfs) ──────────────── */
+    bcache_init();
+    vfs_init();
+    tmpfs_register();
+    fat32_register();
+    ext2_register();
+    /* Mount tmpfs as / so the kernel has a working VFS from the start */
+    if (vfs_mount("/", NULL, "tmpfs") < 0)
+        KLOG_WARN("vfs: failed to mount tmpfs as root\n");
+    else
+        KLOG_INFO("vfs: tmpfs mounted as root\n");
+    /* Create standard top-level directories */
+    vfs_mkdir("/dev",  0755);
+    vfs_mkdir("/tmp",  01777);
+    vfs_mkdir("/mnt",  0755);
+    vfs_mkdir("/mnt/disk", 0755);
+    vfs_mkdir("/proc", 0555);
+    /* Install INT 0x80 syscall gate */
+    syscall_init();
+
+    /* ── 5c. Input event subsystem (lock-free SPSC rings, safe pre-IRQ) ────── */
     input_init();
     /* ── 5b. PCI enumeration ─────────────────────────────────────────────── */
     static pci_device_t s_pci_buf[64];
@@ -193,6 +278,9 @@ void kmain(void) {
 
     /* ── 11. Spawn USB stack (as task — needs sched_sleep for xHCI cmds) ── */
     sched_spawn("usb-init", usb_init_task, NULL);
+
+    /* ── 12. Spawn storage + filesystem init task ────────────────────────── */
+    sched_spawn("storage-init", storage_init_task, NULL);
     KLOG_INFO("Kernel init complete. Entering idle.\n");
 
     /* ── 11. Enable interrupts — scheduler takes over from here ─────────── */

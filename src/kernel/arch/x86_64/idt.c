@@ -2,6 +2,8 @@
 #include "gdt.h"
 #include "lib/string.h"
 #include "lib/klog.h"
+#include "sched/sched.h"
+#include "sched/task.h"
 
 static idt_entry_t  idt[IDT_ENTRIES];
 static idtr_t       idtr;
@@ -27,10 +29,32 @@ void isr_dispatch(cpu_regs_t *regs) {
     uint8_t vec = (uint8_t)regs->vec;
     if (isr_handlers[vec]) {
         isr_handlers[vec](regs);
-    } else {
-        KLOG_WARN("Unhandled interrupt vec=0x%x err=0x%x rip=%p\n",
-                  vec, (uint32_t)regs->err, (void *)regs->rip);
+        return;
     }
+
+    /* ── Unhandled exception in vectors 0-31 ─────────────────────────────── */
+    if (vec < 32) {
+        KLOG_WARN("Unhandled exception vec=0x%x err=0x%x rip=%p\n",
+                  vec, (uint32_t)regs->err, (void *)regs->rip);
+
+        /* Fatal CPU exception: kill the current task (if not idle/kernel init)
+         * to prevent an infinite fault loop where iretq returns to the same
+         * faulting instruction. */
+        task_t *cur = sched_current();
+        if (cur && cur->tid > 0) {
+            KLOG_WARN("  killing task '%s' tid=%u\n", cur->name, cur->tid);
+            cur->state = TASK_DEAD;
+            sched_tick();
+            /* unreachable for the killed task */
+            for (;;) __asm__ volatile("cli; hlt");
+        }
+        /* If no current task (very early boot), halt the CPU */
+        for (;;) __asm__ volatile("cli; hlt");
+    }
+
+    /* Unhandled IRQ/vector above 31: just warn (these are non-fatal) */
+    KLOG_WARN("Unhandled interrupt vec=0x%x err=0x%x rip=%p\n",
+              vec, (uint32_t)regs->err, (void *)regs->rip);
 }
 
 void idt_init(void) {

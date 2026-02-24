@@ -1,0 +1,445 @@
+/* fs/vfs.c — VFS core: mount table, path resolution, vnode lifecycle */
+#include "vfs.h"
+#include "lib/klog.h"
+#include "lib/string.h"
+#include "mm/kmalloc.h"
+
+#include <stdbool.h>
+
+/* ── Registered filesystem types ─────────────────────────────────────────── */
+static fs_ops_t *g_fs_types[VFS_MAX_FS_TYPES];
+static int       g_fs_type_count = 0;
+
+/* ── Mount table ─────────────────────────────────────────────────────────── */
+static mount_t  g_mounts[VFS_MAX_MOUNTS];
+static vnode_t *g_root_vnode = NULL;
+
+/* ── Vnode pool (kmalloc-backed, no fixed pool limit) ─────────────────────── */
+vnode_t *vfs_alloc_vnode(void) {
+    return kzalloc(sizeof(vnode_t));
+}
+
+/* ── Init ─────────────────────────────────────────────────────────────────── */
+void vfs_init(void) {
+    memset(g_mounts, 0, sizeof(g_mounts));
+    g_root_vnode = NULL;
+    KLOG_INFO("vfs: initialised\n");
+}
+
+/* ── Filesystem registry ─────────────────────────────────────────────────── */
+int vfs_register_fs(fs_ops_t *ops) {
+    if (g_fs_type_count >= VFS_MAX_FS_TYPES) return -ENOMEM;
+    g_fs_types[g_fs_type_count++] = ops;
+    KLOG_INFO("vfs: registered filesystem '%s'\n", ops->name);
+    return 0;
+}
+
+static fs_ops_t *find_fs_type(const char *name) {
+    for (int i = 0; i < g_fs_type_count; i++)
+        if (strcmp(g_fs_types[i]->name, name) == 0)
+            return g_fs_types[i];
+    return NULL;
+}
+
+/* ── Vnode reference counting ────────────────────────────────────────────── */
+void vfs_vnode_get(vnode_t *v) {
+    if (v) v->refcount++;
+}
+
+void vfs_vnode_put(vnode_t *v) {
+    if (!v) return;
+    if (v->refcount == 0) return;
+    v->refcount--;
+    if (v->refcount == 0) {
+        if (v->ops && v->ops->evict) v->ops->evict(v);
+        /* fs is responsible for freeing v->fs_data; we free the vnode shell */
+        kfree(v);
+    }
+}
+
+/* ── Mount ───────────────────────────────────────────────────────────────── */
+int vfs_mount(const char *path, blkdev_t *dev, const char *fstype) {
+    fs_ops_t *ops = find_fs_type(fstype);
+    if (!ops) {
+        KLOG_WARN("vfs: mount: unknown filesystem '%s'\n", fstype);
+        return -EINVAL;
+    }
+
+    /* Find free mount slot */
+    mount_t *m = NULL;
+    for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
+        if (!g_mounts[i].active) { m = &g_mounts[i]; break; }
+    }
+    if (!m) { KLOG_WARN("vfs: mount table full\n"); return -ENOMEM; }
+
+    /* Allocate fs instance */
+    fs_inst_t *fsi = kzalloc(sizeof(fs_inst_t));
+    if (!fsi) return -ENOMEM;
+    fsi->dev  = dev;
+    fsi->ops  = ops;
+    fsi->mount = m;
+
+    /* Call filesystem's mount operation */
+    vnode_t *root = ops->mount(fsi, dev);
+    if (!root) {
+        KLOG_WARN("vfs: mount: '%s' failed to mount on '%s'\n",
+                  fstype, path ? path : "(null)");
+        kfree(fsi);
+        return -EIO;
+    }
+    fsi->root = root;
+    root->fsi = fsi;
+
+    /* Fill mount entry */
+    strncpy(m->path, path, VFS_MOUNT_PATH_MAX - 1);
+    m->root   = root;
+    m->fsi    = fsi;
+    m->active = true;
+
+    if (strcmp(path, "/") == 0 || g_root_vnode == NULL) {
+        g_root_vnode = root;
+        m->covered   = NULL;
+    } else {
+        /* Find the vnode at path to record the covered vnode */
+        int err = 0;
+        vnode_t *covered = vfs_lookup(path, true, &err);
+        m->covered = covered; /* may be NULL if path doesn't exist yet       */
+        if (covered) vfs_vnode_put(covered);
+    }
+
+    KLOG_INFO("vfs: mounted '%s' on '%s'\n", fstype, path);
+    return 0;
+}
+
+int vfs_unmount(const char *path) {
+    for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
+        mount_t *m = &g_mounts[i];
+        if (!m->active) continue;
+        if (strcmp(m->path, path) == 0) {
+            if (m->fsi->ops->unmount) m->fsi->ops->unmount(m->fsi);
+            kfree(m->fsi);
+            m->active = false;
+            KLOG_INFO("vfs: unmounted '%s'\n", path);
+            if (strcmp(path, "/") == 0) g_root_vnode = NULL;
+            return 0;
+        }
+    }
+    return -ENOENT;
+}
+
+vnode_t *vfs_get_root(void) {
+    return g_root_vnode;
+}
+
+/* ── Find the deepest mount that is a prefix of `path` ───────────────────── */
+static mount_t *find_mount_for_path(const char *path) {
+    mount_t *best = NULL;
+    size_t   best_len = 0;
+    for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
+        mount_t *m = &g_mounts[i];
+        if (!m->active) continue;
+        size_t mlen = strlen(m->path);
+        if (strncmp(path, m->path, mlen) == 0) {
+            /* Ensure mount path is a proper prefix (ends at '/' boundary) */
+            if (path[mlen] == '/' || path[mlen] == '\0') {
+                if (mlen > best_len) { best = m; best_len = mlen; }
+            }
+        }
+    }
+    return best;
+}
+
+/* ── Check if a vnode is a covered mountpoint; return mounted root if so ─── */
+static vnode_t *check_mountpoint(vnode_t *v) {
+    for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
+        mount_t *m = &g_mounts[i];
+        if (!m->active || !m->covered) continue;
+        if (m->covered == v) return m->root;
+    }
+    return v;
+}
+
+/* ── Path resolution ─────────────────────────────────────────────────────── */
+#define MAX_SYMLINK_DEPTH 8
+
+vnode_t *vfs_lookup(const char *path, bool follow_last_link, int *err_out) {
+    if (!path || path[0] != '/') {
+        if (err_out) *err_out = -EINVAL;
+        return NULL;
+    }
+    if (!g_root_vnode) {
+        if (err_out) *err_out = -EIO;
+        return NULL;
+    }
+
+    vnode_t *cur = g_root_vnode;
+    vfs_vnode_get(cur);
+
+    /* Skip leading '/' */
+    const char *p = path + 1;
+
+    int  link_depth = 0;
+    char component[VFS_NAME_MAX + 1];
+
+    while (*p) {
+        /* Skip redundant slashes */
+        while (*p == '/') p++;
+        if (!*p) break;
+
+        /* Extract next path component */
+        int clen = 0;
+        while (*p && *p != '/' && clen < VFS_NAME_MAX)
+            component[clen++] = *p++;
+        component[clen] = '\0';
+
+        bool is_last = (*p == '\0' || (*p == '/' && *(p+1) == '\0'));
+
+        /* Must be a directory to descend */
+        if (!VFS_S_ISDIR(cur->mode)) {
+            vfs_vnode_put(cur);
+            if (err_out) *err_out = -ENOTDIR;
+            return NULL;
+        }
+
+        /* Handle special names */
+        if (strcmp(component, ".") == 0) continue;
+        if (strcmp(component, "..") == 0) {
+            /* For now: treat ".." at root as staying at root */
+            /* TODO: proper parent tracking across mountpoints */
+            continue;
+        }
+
+        if (!cur->ops || !cur->ops->lookup) {
+            vfs_vnode_put(cur);
+            if (err_out) *err_out = -EIO;
+            return NULL;
+        }
+
+        vnode_t *child = cur->ops->lookup(cur, component);
+        vfs_vnode_put(cur);
+        if (!child) {
+            if (err_out) *err_out = -ENOENT;
+            return NULL;
+        }
+
+        /* Cross mountpoints */
+        vnode_t *mounted = check_mountpoint(child);
+        if (mounted != child) {
+            vfs_vnode_get(mounted);
+            vfs_vnode_put(child);
+            child = mounted;
+        }
+
+        /* Follow symlinks (unless last component and !follow_last_link) */
+        if (VFS_S_ISLNK(child->mode) && (!is_last || follow_last_link)) {
+            if (link_depth++ >= MAX_SYMLINK_DEPTH) {
+                vfs_vnode_put(child);
+                if (err_out) *err_out = -ELOOP;
+                return NULL;
+            }
+            char link_target[VFS_MOUNT_PATH_MAX];
+            if (!child->ops || !child->ops->readlink ||
+                child->ops->readlink(child, link_target, sizeof(link_target)) < 0) {
+                vfs_vnode_put(child);
+                if (err_out) *err_out = -EIO;
+                return NULL;
+            }
+            vfs_vnode_put(child);
+
+            /* Recurse for symlink target (only absolute links for now) */
+            if (link_target[0] == '/') {
+                /* Absolute symlink: restart from root */
+                cur = g_root_vnode;
+                vfs_vnode_get(cur);
+                p = link_target + 1;
+                /* We need to restart our walk — use a temporary buffer */
+                /* For simplicity, tail-call the resolver recursively */
+                int sub_err = 0;
+                vnode_t *result = vfs_lookup(link_target, follow_last_link, &sub_err);
+                vfs_vnode_put(cur);
+                if (!result && err_out) *err_out = sub_err;
+                return result;
+            }
+            /* Relative symlink — treat as relative to current dir (simplified) */
+            continue;
+        }
+
+        cur = child;
+    }
+
+    if (err_out) *err_out = 0;
+    return cur;
+}
+
+/* ── Helper: split path into parent + basename ───────────────────────────── */
+static int split_path(const char *path, char *parent_out, size_t parent_sz,
+                      char *name_out, size_t name_sz) {
+    size_t plen = strlen(path);
+    if (plen == 0 || path[0] != '/') return -EINVAL;
+
+    /* find last '/' */
+    const char *last_slash = path + plen - 1;
+    while (last_slash > path && *last_slash != '/') last_slash--;
+
+    size_t parent_len = (size_t)(last_slash - path);
+    if (parent_len == 0) parent_len = 1; /* keep "/" */
+
+    if (parent_len >= parent_sz) return -ENAMETOOLONG;
+    memcpy(parent_out, path, parent_len);
+    parent_out[parent_len] = '\0';
+
+    const char *name = last_slash + 1;
+    if (strlen(name) >= name_sz) return -ENAMETOOLONG;
+    strcpy(name_out, name);
+    return 0;
+}
+
+/* ── VFS operations ──────────────────────────────────────────────────────── */
+int vfs_stat(const char *path, vfs_stat_t *st) {
+    int err = 0;
+    vnode_t *v = vfs_lookup(path, true, &err);
+    if (!v) return err ? err : -ENOENT;
+    int ret = 0;
+    if (v->ops && v->ops->stat) ret = v->ops->stat(v, st);
+    else ret = -EIO;
+    vfs_vnode_put(v);
+    return ret;
+}
+
+int vfs_lstat(const char *path, vfs_stat_t *st) {
+    int err = 0;
+    vnode_t *v = vfs_lookup(path, false, &err);
+    if (!v) return err ? err : -ENOENT;
+    int ret = 0;
+    if (v->ops && v->ops->stat) ret = v->ops->stat(v, st);
+    else ret = -EIO;
+    vfs_vnode_put(v);
+    return ret;
+}
+
+int vfs_mkdir(const char *path, uint32_t mode) {
+    char parent[VFS_MOUNT_PATH_MAX], name[VFS_NAME_MAX + 1];
+    if (split_path(path, parent, sizeof(parent), name, sizeof(name)) < 0)
+        return -EINVAL;
+
+    int err = 0;
+    vnode_t *pdir = vfs_lookup(parent, true, &err);
+    if (!pdir) return err ? err : -ENOENT;
+
+    vnode_t *newdir = NULL;
+    if (pdir->ops && pdir->ops->mkdir)
+        newdir = pdir->ops->mkdir(pdir, name, mode);
+    vfs_vnode_put(pdir);
+    if (!newdir) return -EIO;
+    vfs_vnode_put(newdir);
+    return 0;
+}
+
+int vfs_unlink(const char *path) {
+    char parent[VFS_MOUNT_PATH_MAX], name[VFS_NAME_MAX + 1];
+    if (split_path(path, parent, sizeof(parent), name, sizeof(name)) < 0)
+        return -EINVAL;
+
+    int err = 0;
+    vnode_t *pdir = vfs_lookup(parent, true, &err);
+    if (!pdir) return err ? err : -ENOENT;
+
+    int ret = -EIO;
+    if (pdir->ops && pdir->ops->unlink)
+        ret = pdir->ops->unlink(pdir, name);
+    vfs_vnode_put(pdir);
+    return ret;
+}
+
+int vfs_rmdir(const char *path) {
+    char parent[VFS_MOUNT_PATH_MAX], name[VFS_NAME_MAX + 1];
+    if (split_path(path, parent, sizeof(parent), name, sizeof(name)) < 0)
+        return -EINVAL;
+
+    int err = 0;
+    vnode_t *pdir = vfs_lookup(parent, true, &err);
+    if (!pdir) return err ? err : -ENOENT;
+
+    int ret = -EIO;
+    if (pdir->ops && pdir->ops->rmdir)
+        ret = pdir->ops->rmdir(pdir, name);
+    else if (pdir->ops && pdir->ops->unlink)
+        ret = pdir->ops->unlink(pdir, name);
+    vfs_vnode_put(pdir);
+    return ret;
+}
+
+int vfs_rename(const char *old_path, const char *new_path) {
+    char old_parent[VFS_MOUNT_PATH_MAX], old_name[VFS_NAME_MAX + 1];
+    char new_parent[VFS_MOUNT_PATH_MAX], new_name[VFS_NAME_MAX + 1];
+
+    if (split_path(old_path, old_parent, sizeof(old_parent),
+                   old_name, sizeof(old_name)) < 0) return -EINVAL;
+    if (split_path(new_path, new_parent, sizeof(new_parent),
+                   new_name, sizeof(new_name)) < 0) return -EINVAL;
+
+    int err = 0;
+    vnode_t *old_dir = vfs_lookup(old_parent, true, &err);
+    if (!old_dir) return err ? err : -ENOENT;
+
+    vnode_t *new_dir = vfs_lookup(new_parent, true, &err);
+    if (!new_dir) { vfs_vnode_put(old_dir); return err ? err : -ENOENT; }
+
+    int ret = -EIO;
+    if (old_dir->ops && old_dir->ops->rename)
+        ret = old_dir->ops->rename(old_dir, old_name, new_dir, new_name);
+
+    vfs_vnode_put(old_dir);
+    vfs_vnode_put(new_dir);
+    return ret;
+}
+
+int vfs_symlink(const char *target, const char *link_path) {
+    char parent[VFS_MOUNT_PATH_MAX], name[VFS_NAME_MAX + 1];
+    if (split_path(link_path, parent, sizeof(parent), name, sizeof(name)) < 0)
+        return -EINVAL;
+
+    int err = 0;
+    vnode_t *pdir = vfs_lookup(parent, true, &err);
+    if (!pdir) return err ? err : -ENOENT;
+
+    int ret = -EIO;
+    if (pdir->ops && pdir->ops->symlink) {
+        vnode_t *lnk = pdir->ops->symlink(pdir, name, target);
+        if (lnk) { vfs_vnode_put(lnk); ret = 0; }
+    }
+    vfs_vnode_put(pdir);
+    return ret;
+}
+
+int vfs_readlink(const char *path, char *buf, size_t len) {
+    int err = 0;
+    vnode_t *v = vfs_lookup(path, false, &err);
+    if (!v) return err ? err : -ENOENT;
+    int ret = -EINVAL;
+    if (VFS_S_ISLNK(v->mode) && v->ops && v->ops->readlink)
+        ret = v->ops->readlink(v, buf, len);
+    vfs_vnode_put(v);
+    return ret;
+}
+
+int vfs_truncate(const char *path, uint64_t size) {
+    int err = 0;
+    vnode_t *v = vfs_lookup(path, true, &err);
+    if (!v) return err ? err : -ENOENT;
+    int ret = -EINVAL;
+    if (v->ops && v->ops->truncate) ret = v->ops->truncate(v, size);
+    vfs_vnode_put(v);
+    return ret;
+}
+
+void vfs_sync_all(void) {
+    for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
+        mount_t *m = &g_mounts[i];
+        if (!m->active) continue;
+        if (m->fsi->ops->sync) {
+            /* sync root vnode */
+            m->fsi->ops->sync(m->root);
+        }
+    }
+}

@@ -127,7 +127,7 @@ int pci_enumerate(pci_device_t *out, int max) {
 
 void pci_enable_device(const pci_device_t *d) {
     uint16_t cmd = pci_read16(d->bus, d->dev, d->fn, 0x04);
-    cmd |= (1 << 1) | (1 << 2);  /* Memory Space + Bus Master */
+    cmd |= (1 << 0) | (1 << 1) | (1 << 2);  /* I/O Space + Memory Space + Bus Master */
     pci_write16(d->bus, d->dev, d->fn, 0x04, cmd);
 }
 

@@ -39,60 +39,7 @@ void serial_puts(const char *s) {
     while (*s) serial_putc(*s++);
 }
 
-/* ---- minimal vsnprintf ---- */
-static void print_uint(uint64_t v, int base, int pad, char *buf, size_t *idx, size_t cap) {
-    const char *digits = "0123456789abcdef";
-    char tmp[64];
-    int len = 0;
-    if (v == 0) { tmp[len++] = '0'; }
-    while (v) { tmp[len++] = digits[v % base]; v /= base; }
-    /* zero-pad */
-    while (len < pad) tmp[len++] = '0';
-    /* reverse into buf */
-    for (int i = len - 1; i >= 0; i--) {
-        if (*idx < cap - 1) buf[(*idx)++] = tmp[i];
-    }
-}
-
-static int kvsnprintf(char *buf, size_t cap, const char *fmt, va_list ap) {
-    size_t i = 0;
-#define PUT(c) do { if (i < cap - 1) buf[i++] = (c); } while(0)
-    while (*fmt) {
-        if (*fmt != '%') { PUT(*fmt++); continue; }
-        fmt++;
-        int pad = 0;
-        while (*fmt >= '0' && *fmt <= '9') pad = pad*10 + (*fmt++ - '0');
-        /* Track length modifiers: 'l'/'ll' → 64-bit, others ignored */
-        int is_long = 0;
-        while (*fmt == 'l' || *fmt == 'h' || *fmt == 'z') {
-            if (*fmt == 'l') is_long = 1;
-            fmt++;
-        }
-        switch (*fmt++) {
-            case 'c': PUT((char)va_arg(ap, int)); break;
-            case 's': { const char *s = va_arg(ap, const char*);
-                        if (!s) s = "(null)";
-                        while (*s) PUT(*s++); break; }
-            case 'd': { int64_t v = is_long ? va_arg(ap, int64_t)
-                                            : (int64_t)va_arg(ap, int);
-                        if (v < 0) { PUT('-'); v = -v; }
-                        print_uint((uint64_t)v, 10, pad, buf, &i, cap); break; }
-            case 'u': print_uint(is_long ? va_arg(ap, uint64_t)
-                                        : (uint64_t)va_arg(ap, unsigned int),
-                                 10, pad, buf, &i, cap); break;
-            case 'x': print_uint(is_long ? va_arg(ap, uint64_t)
-                                        : (uint64_t)va_arg(ap, unsigned int),
-                                 16, pad, buf, &i, cap); break;
-            case 'p': { PUT('0'); PUT('x');
-                        print_uint((uint64_t)va_arg(ap, void*), 16, 16, buf, &i, cap); break; }
-            case '%': PUT('%'); break;
-            default: PUT('?'); break;
-        }
-    }
-    buf[i] = '\0';
-#undef PUT
-    return (int)i;
-}
+/* kvsnprintf is provided by lib/string.c (declared in lib/string.h) */
 
 /* Spinlock: serialize output so lines from different CPUs don't interleave */
 static volatile int klog_lock = 0;
