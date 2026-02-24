@@ -165,7 +165,7 @@ run: $(ISO_IMAGE)
 	    -smp 4                                              \
 	    -serial stdio                                       \
 	    -enable-kvm                                         \
-	    -device virtio-gpu-gl,xres=1280,yres=720            \
+	    -device virtio-gpu-gl,xres=1920,yres=1080           \
 	    -vga none                                           \
 	    -display sdl,gl=on                                  \
 	    -device nec-usb-xhci,id=xhci                       \

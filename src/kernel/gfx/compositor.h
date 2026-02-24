@@ -20,3 +20,19 @@ void compositor_set_bg(gfx_color_t c);
 
 /* Return the screen surface */
 gfx_surface_t *compositor_screen(void);
+
+/* ── Optional draw hooks ──────────────────────────────────────────────────── */
+/* Hook called AFTER desktop background, BEFORE windows (e.g. taskbar base).  */
+typedef void (*gfx_draw_hook_t)(gfx_surface_t *dst);
+void compositor_set_bg_hook(gfx_draw_hook_t fn);
+
+/* Hook called AFTER windows, BEFORE cursor (e.g. start menu overlay).        */
+void compositor_set_overlay_hook(gfx_draw_hook_t fn);
+
+/* Register a rect that is always unioned into the dirty region each compose.
+ * Use for areas that change independently of windows (e.g. the taskbar clock). */
+void compositor_set_bg_rect(gfx_rect_t r);
+
+/* Force the next compositor_compose() call to repaint the entire screen.
+ * Call whenever a full-screen overlay appears or disappears (start menu).   */
+void compositor_force_full(void);

@@ -58,12 +58,15 @@ gfx_window_t *wm_create(const char *title, int x, int y, int w, int h) {
     strncpy(win->title, title, sizeof(win->title) - 1);
     win->frame   = (gfx_rect_t){ x, y, w + 2*WM_BORDER,
                                        h + WM_TITLE_H + 2*WM_BORDER };
-    win->id      = g_next_id++;
-    win->flags   = WM_FLAG_DEFAULT;
-    win->visible = true;
-    win->focused = false;
-    win->userdata = NULL;
-    win->on_key   = NULL;
+    win->pre_max_frame = win->frame;
+    win->id        = g_next_id++;
+    win->flags     = WM_FLAG_DEFAULT;
+    win->visible   = true;
+    win->focused   = false;
+    win->minimized = false;
+    win->maximized = false;
+    win->userdata  = NULL;
+    win->on_key    = NULL;
     win->on_resize = NULL;
     win->on_close  = NULL;
     win->on_mouse  = NULL;
@@ -144,26 +147,108 @@ gfx_window_t *wm_get_focused(void) {
     return g_head; /* fallback: top window */
 }
 
+/* ── Minimize ─────────────────────────────────────────────────────────────── */
+void wm_minimize(gfx_window_t *win) {
+    if (!win || win->minimized) return;
+    dirty_expanded(win->frame);
+    win->minimized = true;
+    win->focused   = false;
+    /* give focus to next visible window */
+    for (gfx_window_t *w = g_head; w; w = w->next) {
+        if (w != win && w->visible && !w->minimized) {
+            wm_raise(w);
+            return;
+        }
+    }
+}
+
+/* ── Maximize ────────────────────────────────────────────────────────────── */
+void wm_maximize(gfx_window_t *win) {
+    if (!win || win->maximized) return;
+    win->pre_max_frame = win->frame;
+    dirty_expanded(win->frame);
+    /* Fill screen minus taskbar (taskbar height stored externally; use constant) */
+    int taskbar_h = 36;
+    int new_w = g_sw - 2 * WM_BORDER;
+    int new_h = g_sh - taskbar_h - WM_TITLE_H - 2 * WM_BORDER;
+    win->frame.x = 0;
+    win->frame.y = 0;
+    wm_resize(win, new_w, new_h);
+    win->maximized = true;
+    dirty_expanded(win->frame);
+}
+
+/* ── Restore ─────────────────────────────────────────────────────────────── */
+void wm_restore(gfx_window_t *win) {
+    if (!win) return;
+    if (win->minimized) {
+        win->minimized = false;
+        dirty_expanded(win->frame);
+        wm_raise(win);
+        return;
+    }
+    if (win->maximized) {
+        dirty_expanded(win->frame);
+        win->frame.x = win->pre_max_frame.x;
+        win->frame.y = win->pre_max_frame.y;
+        int cw = win->pre_max_frame.w - 2 * WM_BORDER;
+        int ch = win->pre_max_frame.h - WM_TITLE_H - 2 * WM_BORDER;
+        wm_resize(win, cw, ch);
+        win->maximized = false;
+        dirty_expanded(win->frame);
+    }
+}
+
+/* ── Focus cycle (Alt+Tab) ────────────────────────────────────────────────── */
+void wm_focus_next(void) {
+    /* Collect visible, non-minimized windows into a temporary array */
+    gfx_window_t *stack[WM_MAX_WIN];
+    int n = 0;
+    for (gfx_window_t *w = g_head; w && n < WM_MAX_WIN; w = w->next)
+        if (w->visible && !w->minimized)
+            stack[n++] = w;
+    if (n < 2) return;
+    /* stack[0] is current top / focused — raise stack[1] */
+    wm_raise(stack[1]);
+}
+
+void wm_focus_prev(void) {
+    gfx_window_t *stack[WM_MAX_WIN];
+    int n = 0;
+    for (gfx_window_t *w = g_head; w && n < WM_MAX_WIN; w = w->next)
+        if (w->visible && !w->minimized)
+            stack[n++] = w;
+    if (n < 2) return;
+    /* Raise the last window (bottom of stack) to become top */
+    wm_raise(stack[n - 1]);
+}
+
 void wm_damage(gfx_window_t *win) {
     if (win) dirty_expanded(win->frame);
+}
+
+/* Helper: integer distance squared between (px,py) and circle centre */
+static inline int dist2(int px, int py, int cx, int cy) {
+    int dx = px - cx, dy = py - cy;
+    return dx*dx + dy*dy;
 }
 
 /* ── Hit testing ──────────────────────────────────────────────────────────── */
 gfx_window_t *wm_hit_test(int x, int y, wm_hit_zone_t *zone_out) {
     for (gfx_window_t *w = g_head; w; w = w->next) {
-        if (!w->visible) continue;
+        if (!w->visible || w->minimized) continue;
         gfx_rect_t fr = w->frame;
 
         /* Check if point is inside the frame (with resize grip margin) */
-        int gx = (w->flags & WM_FLAG_RESIZABLE) ? WM_RESIZE_GRIP : 0;
+        int gx = (!w->maximized && (w->flags & WM_FLAG_RESIZABLE)) ? WM_RESIZE_GRIP : 0;
         gfx_rect_t expanded = { fr.x - gx, fr.y - gx,
                                 fr.w + 2*gx, fr.h + 2*gx };
         if (x < expanded.x || x >= expanded.x + expanded.w ||
             y < expanded.y || y >= expanded.y + expanded.h)
             continue;
 
-        /* Check resize zones (edges and corners) */
-        if (w->flags & WM_FLAG_RESIZABLE) {
+        /* Check resize zones (edges and corners) — not when maximized */
+        if (!w->maximized && (w->flags & WM_FLAG_RESIZABLE)) {
             bool near_left   = (x < fr.x + WM_RESIZE_GRIP);
             bool near_right  = (x >= fr.x + fr.w - WM_RESIZE_GRIP);
             bool near_top    = (y < fr.y + WM_RESIZE_GRIP);
@@ -179,20 +264,27 @@ gfx_window_t *wm_hit_test(int x, int y, wm_hit_zone_t *zone_out) {
             if (near_bottom)               { *zone_out = WM_HIT_RESIZE_S;  return w; }
         }
 
-        /* Must be inside actual frame for title/content/close */
+        /* Must be inside actual frame for title/content/buttons */
         if (x < fr.x || x >= fr.x + fr.w || y < fr.y || y >= fr.y + fr.h)
             continue;
 
-        /* Close button: 14×14 circle at top-right of title */
-        int bx = fr.x + fr.w - WM_BORDER - 16;
-        int by = fr.y + WM_BORDER + (WM_TITLE_H - 14) / 2;
-        if (x >= bx && x < bx + 14 && y >= by && y < by + 14) {
-            *zone_out = WM_HIT_CLOSE;
-            return w;
-        }
-
-        /* Title bar */
+        /* Traffic-light buttons in title bar (left side) */
         if (y < fr.y + WM_BORDER + WM_TITLE_H) {
+            int cy = fr.y + WM_BORDER + WM_TITLE_H / 2;
+            int r2 = WM_BTN_R * WM_BTN_R;
+
+            if ((w->flags & WM_FLAG_CLOSABLE) &&
+                dist2(x, y, fr.x + WM_BTN_CLOSE_X, cy) <= r2) {
+                *zone_out = WM_HIT_CLOSE; return w;
+            }
+            if ((w->flags & WM_FLAG_MINIMIZABLE) &&
+                dist2(x, y, fr.x + WM_BTN_MIN_X, cy) <= r2) {
+                *zone_out = WM_HIT_MINIMIZE; return w;
+            }
+            if ((w->flags & WM_FLAG_MAXIMIZABLE) &&
+                dist2(x, y, fr.x + WM_BTN_MAX_X, cy) <= r2) {
+                *zone_out = WM_HIT_MAXIMIZE; return w;
+            }
             *zone_out = WM_HIT_TITLE;
             return w;
         }
@@ -275,55 +367,115 @@ bool wm_is_dragging(void) {
 /* ── Window list ──────────────────────────────────────────────────────────── */
 gfx_window_t *wm_get_window_list(void) { return g_head; }
 
+/* ── Draw a traffic-light circle button ──────────────────────────────────── */
+static void draw_btn(gfx_surface_t *dst, int cx, int cy, int r, gfx_color_t col) {
+    /* Filled anti-aliased-ish circle via per-pixel distance test */
+    for (int py = cy - r - 1; py <= cy + r + 1; py++) {
+        for (int px = cx - r - 1; px <= cx + r + 1; px++) {
+            int dx = px - cx, dy = py - cy;
+            int d2 = dx*dx + dy*dy, r2 = r*r;
+            if (d2 <= r2)
+                gfx_putpixel(dst, px, py, col);
+            else if (d2 <= (r+1)*(r+1)) {
+                /* soft edge: blend with background */
+                gfx_color_t bg = gfx_getpixel(dst, px, py);
+                gfx_putpixel(dst, px, py, gfx_blend(bg, GFX_ARGB(0x80,
+                    GFX_R(col), GFX_G(col), GFX_B(col))));
+            }
+        }
+    }
+}
+
 /* ── Draw a single window onto dst ────────────────────────────────────────── */
 static void draw_window(gfx_surface_t *dst, gfx_window_t *win) {
-    if (!win->visible) return;
+    if (!win->visible || win->minimized) return;
     gfx_rect_t fr = win->frame;
 
-    /* Drop shadow (translucent black offset 3px) */
-    gfx_rect_t shadow = { fr.x + 3, fr.y + 3, fr.w, fr.h };
-    gfx_color_t shadow_col = GFX_ARGB(0x50, 0, 0, 0);
-    for (int sy = shadow.y; sy < shadow.y + shadow.h && sy < dst->h; sy++) {
-        if (sy < 0) continue;
-        for (int sx = shadow.x; sx < shadow.x + shadow.w && sx < dst->w; sx++) {
-            if (sx < 0) continue;
-            gfx_color_t old = gfx_getpixel(dst, sx, sy);
-            gfx_putpixel(dst, sx, sy, gfx_blend(old, shadow_col));
+    /* ── Multi-layer drop shadow ── */
+    gfx_color_t sh_cols[] = {
+        GFX_ARGB(0x18,0,0,0), GFX_ARGB(0x28,0,0,0),
+        GFX_ARGB(0x38,0,0,0), GFX_ARGB(0x28,0,0,0)
+    };
+    for (int i = 0; i < 4; i++) {
+        int off = i + 2;
+        gfx_rect_t sh = { fr.x + off, fr.y + off, fr.w, fr.h };
+        for (int sy = sh.y; sy < sh.y + sh.h && sy < dst->h; sy++) {
+            if (sy < 0) continue;
+            for (int sx = sh.x; sx < sh.x + sh.w && sx < dst->w; sx++) {
+                if (sx < 0) continue;
+                gfx_putpixel(dst, sx, sy,
+                    gfx_blend(gfx_getpixel(dst, sx, sy), sh_cols[i]));
+            }
         }
     }
 
-    /* Window border (rounded) */
-    gfx_color_t border_col = win->focused ? GFX_RGB(0x50,0x50,0x60)
-                                          : GFX_RGB(0x35,0x35,0x40);
-    gfx_fill_rounded(dst, fr, border_col, 5);
+    /* ── Outer frame (rounded, glass-like border) ── */
+    gfx_color_t border_col = win->focused
+        ? GFX_ARGB(0xFF, 0x60, 0x80, 0xC0)
+        : GFX_ARGB(0xFF, 0x40, 0x40, 0x50);
+    gfx_fill_rounded(dst, fr, border_col, WM_CORNER_R);
 
-    /* Title bar background */
+    /* ── Inner frame darkened inset (1px) ── */
+    gfx_rect_t inner = { fr.x + 1, fr.y + 1, fr.w - 2, fr.h - 2 };
+    gfx_color_t inner_col = win->focused
+        ? GFX_RGB(0x1A, 0x28, 0x45)
+        : GFX_RGB(0x22, 0x22, 0x2E);
+    gfx_fill_rounded(dst, inner, inner_col, WM_CORNER_R - 1);
+
+    /* ── Title bar gradient ── */
     gfx_rect_t tb = { fr.x + WM_BORDER, fr.y + WM_BORDER,
-                       fr.w - 2*WM_BORDER, WM_TITLE_H };
-    gfx_color_t tb_left  = win->focused ? GFX_RGB(0x20,0x60,0xD0)
-                                        : GFX_RGB(0x3A,0x3A,0x48);
-    gfx_color_t tb_right = win->focused ? GFX_RGB(0x10,0x40,0x90)
-                                        : GFX_RGB(0x30,0x30,0x3C);
-    gfx_fill_gradient_h(dst, tb, tb_left, tb_right);
+                      fr.w - 2*WM_BORDER, WM_TITLE_H };
+    gfx_color_t tb_l, tb_r;
+    if (win->focused) {
+        tb_l = GFX_RGB(0x1C, 0x3E, 0x80);
+        tb_r = GFX_RGB(0x0E, 0x22, 0x55);
+    } else {
+        tb_l = GFX_RGB(0x2E, 0x2E, 0x3A);
+        tb_r = GFX_RGB(0x24, 0x24, 0x30);
+    }
+    gfx_fill_gradient_h(dst, tb, tb_l, tb_r);
 
-    /* Title text */
-    const gfx_font_atlas_t *a = &g_font_atlas;
-    int tx = tb.x + 10;
-    int ty = tb.y + (WM_TITLE_H - a->cell_h) / 2;
-    gfx_draw_string(dst, tx, ty, win->title,
-                    GFX_RGB(0xEE,0xEE,0xF0), GFX_TRANSPARENT);
+    /* ── Subtle highlight line under title ── */
+    gfx_color_t sep = win->focused
+        ? GFX_RGB(0x30, 0x60, 0xA0) : GFX_RGB(0x33, 0x33, 0x42);
+    for (int sx = tb.x; sx < tb.x + tb.w; sx++)
+        gfx_putpixel(dst, sx, tb.y + tb.h, sep);
 
-    /* Close button (red circle, right side of title bar) */
-    if (win->flags & WM_FLAG_CLOSABLE) {
-        int bx = fr.x + fr.w - WM_BORDER - 18;
-        int by = fr.y + WM_BORDER + (WM_TITLE_H - 14) / 2;
-        gfx_fill_rounded(dst, (gfx_rect_t){bx, by, 14, 14},
-                          GFX_RGB(0xFF, 0x5F, 0x57), 7);
+    /* ── Traffic-light buttons ── */
+    int btn_cy = fr.y + WM_BORDER + WM_TITLE_H / 2;
+    if (win->flags & WM_FLAG_CLOSABLE)
+        draw_btn(dst, fr.x + WM_BTN_CLOSE_X, btn_cy, WM_BTN_R,
+                 GFX_RGB(0xFF, 0x5F, 0x57));  /* red */
+    if (win->flags & WM_FLAG_MINIMIZABLE)
+        draw_btn(dst, fr.x + WM_BTN_MIN_X, btn_cy, WM_BTN_R,
+                 GFX_RGB(0xFF, 0xBD, 0x2E));  /* yellow */
+    if (win->flags & WM_FLAG_MAXIMIZABLE)
+        draw_btn(dst, fr.x + WM_BTN_MAX_X, btn_cy, WM_BTN_R,
+                 win->maximized ? GFX_RGB(0x28, 0xCA, 0x41)
+                                : GFX_RGB(0x28, 0xC9, 0x40));  /* green */
+
+    /* ── Title text (centred after buttons) ── */
+    {
+        const gfx_font_atlas_t *a = &g_font_atlas;
+        /* Measure text width (approx cell_w * strlen) */
+        int title_len = 0;
+        const char *p = win->title;
+        while (*p++) title_len++;
+        int text_w = title_len * a->cell_w;
+        int text_x = tb.x + (tb.w - text_w) / 2;
+        if (text_x < tb.x + WM_BTN_MAX_X + WM_BTN_R + 8)
+            text_x = tb.x + WM_BTN_MAX_X + WM_BTN_R + 8;
+        int text_y = tb.y + (WM_TITLE_H - a->cell_h) / 2;
+        gfx_color_t title_col = win->focused
+            ? GFX_RGB(0xEE, 0xEE, 0xF8)
+            : GFX_RGB(0x88, 0x88, 0x99);
+        gfx_draw_string(dst, text_x, text_y, win->title,
+                        title_col, GFX_TRANSPARENT);
     }
 
-    /* Content area blit */
+    /* ── Content area blit ── */
     int cx = fr.x + WM_BORDER;
-    int cy = fr.y + WM_BORDER + WM_TITLE_H;
+    int cy = fr.y + WM_BORDER + WM_TITLE_H + 1; /* +1 for separator */
     gfx_blit(dst, cx, cy, win->surface,
              (gfx_rect_t){0, 0, win->surface->w, win->surface->h});
 }
@@ -335,7 +487,23 @@ void wm_compose(gfx_surface_t *dst, gfx_rect_t dirty) {
     int n = 0;
     for (gfx_window_t *w = g_head; w && n < WM_MAX_WIN; w = w->next)
         stack[n++] = w;
-    (void)dirty;
-    for (int i = n - 1; i >= 0; i--)
-        draw_window(dst, stack[i]);
+
+    for (int i = n - 1; i >= 0; i--) {
+        gfx_window_t *w = stack[i];
+        if (!w->visible || w->minimized) continue;
+
+        /* Skip windows (and their shadows) that don’t touch the dirty rect.
+         * Shadow extends WM_SHADOW px right+down, so expand check. */
+        if (!gfx_rect_empty(dirty)) {
+            gfx_rect_t expanded = {
+                w->frame.x - WM_SHADOW - 1,
+                w->frame.y - WM_SHADOW - 1,
+                w->frame.w + (WM_SHADOW + 1) * 2,
+                w->frame.h + (WM_SHADOW + 1) * 2
+            };
+            gfx_rect_t isect = gfx_rect_clip(expanded, dirty);
+            if (gfx_rect_empty(isect)) continue;
+        }
+        draw_window(dst, w);
+    }
 }

@@ -2,8 +2,9 @@
  *
  * Features:
  *   • Z-ordered window stack (front-to-back linked list)
- *   • Title bar with close button
+ *   • macOS-style traffic-light buttons: close (red), minimize (yellow), maximize (green)
  *   • Mouse-driven move (drag title bar) and resize (drag edges/corners)
+ *   • Minimize (hide to taskbar) + Maximize (fill screen) + Restore
  *   • Hit-testing API for desktop event routing
  *   • Per-window keyboard focus
  *   • Callback-based content rendering
@@ -14,25 +15,38 @@
 #include <stdbool.h>
 
 /* ── Layout constants ─────────────────────────────────────────────────────── */
-#define WM_TITLE_H   26   /* title bar height in pixels                     */
-#define WM_BORDER     2   /* window border thickness                        */
-#define WM_RESIZE_GRIP 6  /* resize handle grab zone (pixels from edge)     */
-#define WM_MAX_WIN   32   /* max simultaneous windows                       */
-#define WM_MIN_W    100   /* minimum window content width                   */
-#define WM_MIN_H     60   /* minimum window content height                  */
+#define WM_TITLE_H     30   /* title bar height in pixels                   */
+#define WM_BORDER       3   /* window border / corner-radius base           */
+#define WM_CORNER_R     8   /* rounded-corner radius for outer frame        */
+#define WM_RESIZE_GRIP  7   /* resize handle grab zone (pixels from edge)   */
+#define WM_MAX_WIN     32   /* max simultaneous windows                     */
+#define WM_MIN_W      120   /* minimum window content width                 */
+#define WM_MIN_H       60   /* minimum window content height                */
+
+/* Traffic-light button geometry (left side of title bar, macOS style) */
+#define WM_BTN_R        7   /* button circle radius                         */
+#define WM_BTN_CLOSE_X 16   /* centre-x offset from frame left              */
+#define WM_BTN_MIN_X   38   /* centre-x offset for minimize button          */
+#define WM_BTN_MAX_X   60   /* centre-x offset for maximize button          */
 
 /* ── Window flags ─────────────────────────────────────────────────────────── */
-#define WM_FLAG_MOVABLE    (1 << 0)
-#define WM_FLAG_RESIZABLE  (1 << 1)
-#define WM_FLAG_CLOSABLE   (1 << 2)
-#define WM_FLAG_DEFAULT    (WM_FLAG_MOVABLE | WM_FLAG_RESIZABLE | WM_FLAG_CLOSABLE)
-#define WM_FLAG_FIXED      (WM_FLAG_MOVABLE | WM_FLAG_CLOSABLE) /* not resizable */
+#define WM_FLAG_MOVABLE      (1 << 0)
+#define WM_FLAG_RESIZABLE    (1 << 1)
+#define WM_FLAG_CLOSABLE     (1 << 2)
+#define WM_FLAG_MINIMIZABLE  (1 << 3)
+#define WM_FLAG_MAXIMIZABLE  (1 << 4)
+#define WM_FLAG_DEFAULT      (WM_FLAG_MOVABLE | WM_FLAG_RESIZABLE | \
+                              WM_FLAG_CLOSABLE | WM_FLAG_MINIMIZABLE | \
+                              WM_FLAG_MAXIMIZABLE)
+#define WM_FLAG_FIXED        (WM_FLAG_MOVABLE | WM_FLAG_CLOSABLE)
 
 /* ── Hit-test zones ───────────────────────────────────────────────────────── */
 typedef enum {
     WM_HIT_NONE = 0,
     WM_HIT_TITLE,
     WM_HIT_CLOSE,
+    WM_HIT_MINIMIZE,
+    WM_HIT_MAXIMIZE,
     WM_HIT_CONTENT,
     WM_HIT_RESIZE_N,
     WM_HIT_RESIZE_S,
@@ -62,11 +76,14 @@ typedef void (*wm_mouse_cb_t)(struct gfx_window *win, int x, int y, uint8_t butt
 typedef struct gfx_window {
     gfx_surface_t  *surface;        /* client content pixels (excl. decorations) */
     gfx_rect_t      frame;          /* full window rect on screen                */
+    gfx_rect_t      pre_max_frame;  /* saved frame before maximize               */
     char            title[64];
     uint32_t        id;
     uint32_t        flags;          /* WM_FLAG_* bitmask */
     bool            visible;
     bool            focused;
+    bool            minimized;      /* hidden to taskbar                         */
+    bool            maximized;      /* filling screen (minus taskbar)            */
     void           *userdata;       /* opaque pointer for callbacks */
 
     /* Callbacks */
@@ -87,6 +104,11 @@ void            wm_resize(gfx_window_t *win, int new_w, int new_h);
 void            wm_raise(gfx_window_t *win);
 void            wm_damage(gfx_window_t *win);
 
+/* ── Minimize / Maximize / Restore ───────────────────────────────────────── */
+void            wm_minimize(gfx_window_t *win);
+void            wm_maximize(gfx_window_t *win);
+void            wm_restore(gfx_window_t *win);  /* un-minimize or un-maximize */
+
 /* ── Hit testing + Mouse interaction ──────────────────────────────────────── */
 gfx_window_t   *wm_hit_test(int x, int y, wm_hit_zone_t *zone_out);
 void            wm_begin_drag(gfx_window_t *win, wm_drag_mode_t mode,
@@ -98,6 +120,8 @@ bool            wm_is_dragging(void);
 /* ── Focus management ─────────────────────────────────────────────────────── */
 gfx_window_t   *wm_get_focused(void);
 void            wm_set_focus(gfx_window_t *win);
+void            wm_focus_next(void);    /* Alt+Tab cycle */
+void            wm_focus_prev(void);
 
 /* ── Composition ──────────────────────────────────────────────────────────── */
 void            wm_compose(gfx_surface_t *dst, gfx_rect_t dirty);
