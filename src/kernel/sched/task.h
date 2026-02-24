@@ -52,3 +52,9 @@ void task_destroy(task_t *t);
 
 /* Look up a task by TID (returns NULL if not found or dead) */
 task_t *task_lookup(uint32_t tid);
+
+/* Total number of task slots available */
+#define TASK_TABLE_SIZE 1024
+
+/* Access task table for enumeration (read-only) */
+task_t *task_get_from_table(uint32_t index);

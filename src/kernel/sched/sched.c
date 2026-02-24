@@ -356,3 +356,20 @@ void sched_sleep(uint32_t ms) {
     /* Yield CPU; sched_tick() will re-enqueue us after deadline */
     sched_tick();
 }
+
+/* ── Task snapshot for task manager ──────────────────────────────────────── */
+int sched_snapshot_tasks(sched_task_info_t *buf, int max_count) {
+    int n = 0;
+    for (uint32_t i = 0; i < TASK_TABLE_SIZE && n < max_count; i++) {
+        task_t *t = task_get_from_table(i);
+        if (!t || t->state == TASK_DEAD) continue;
+        buf[n].tid      = t->tid;
+        buf[n].cpu_id   = t->cpu_id;
+        buf[n].priority = t->priority;
+        buf[n].state    = t->state;
+        strncpy(buf[n].name, t->name, TASK_NAME_MAX - 1);
+        buf[n].name[TASK_NAME_MAX - 1] = '\0';
+        n++;
+    }
+    return n;
+}

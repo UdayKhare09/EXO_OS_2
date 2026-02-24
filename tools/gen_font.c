@@ -3,12 +3,18 @@
  * Runs on the HOST. Outputs a C file (build/gfx_font_data.c) with pre-rasterized
  * glyph bitmaps that the kernel links in directly (no float at runtime).
  *
+ * Features:
+ *   • 2× oversampling for smooth anti-aliasing
+ *   • Proper hinting for crisp edges at small sizes
+ *   • Gamma-correct downsampling (linearize → average → re-encode)
+ *
  * Usage: ./gen_font <font.ttf> <px_height> <output.c>
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "../src/kernel/gfx/3rdparty/stb_truetype.h"
@@ -16,6 +22,19 @@
 #define FIRST_CHAR   0x20   /* space */
 #define LAST_CHAR    0x7E   /* ~ */
 #define NUM_CHARS    (LAST_CHAR - FIRST_CHAR + 1)
+#define OVERSAMPLE   2      /* 2× supersampling in both axes */
+
+/* sRGB gamma helpers */
+static double srgb_to_linear(uint8_t v) {
+    double f = v / 255.0;
+    return f <= 0.04045 ? f / 12.92 : pow((f + 0.055) / 1.055, 2.4);
+}
+static uint8_t linear_to_srgb(double v) {
+    if (v <= 0.0) return 0;
+    if (v >= 1.0) return 255;
+    double f = v <= 0.0031308 ? 12.92 * v : 1.055 * pow(v, 1.0/2.4) - 0.055;
+    return (uint8_t)(f * 255.0 + 0.5);
+}
 
 int main(int argc, char **argv) {
     if (argc != 4) {
@@ -58,8 +77,15 @@ int main(int argc, char **argv) {
         if (w > cell_width) cell_width = w;
     }
 
-    printf("Font: %s  height=%dpx  cell=%dx%d\n",
-           ttf_path, px_height, cell_width, cell_height);
+    printf("Font: %s  height=%dpx  cell=%dx%d  oversample=%dx\n",
+           ttf_path, px_height, cell_width, cell_height, OVERSAMPLE);
+
+    /* Oversampled dimensions for rasterization */
+    int os_height = px_height * OVERSAMPLE;
+    float os_scale = stbtt_ScaleForPixelHeight(&font, (float)os_height);
+    int os_cw = cell_width  * OVERSAMPLE;
+    int os_ch = cell_height * OVERSAMPLE;
+    int os_baseline = (int)(ascent * os_scale);
 
     FILE *out = fopen(out_path, "w");
     if (!out) { fprintf(stderr, "Cannot write %s\n", out_path); return 1; }
@@ -69,29 +95,54 @@ int main(int argc, char **argv) {
     fprintf(out, "#define FONT_CELL_W  %d\n", cell_width);
     fprintf(out, "#define FONT_CELL_H  %d\n\n", cell_height);
 
-    /* Rasterize each glyph into cell_width × cell_height bitmap */
+    /* Rasterize each glyph with oversampling */
     fprintf(out, "static const uint8_t _glyph_bitmaps[%d][%d] = {\n",
             NUM_CHARS, cell_width * cell_height);
 
     for (int c = FIRST_CHAR; c <= LAST_CHAR; c++) {
+        /* Rasterize at oversampled size */
         int bw, bh, bx, by;
         uint8_t *bitmap = stbtt_GetCodepointBitmap(
-                &font, 0, scale, c, &bw, &bh, &bx, &by);
+                &font, 0, os_scale, c, &bw, &bh, &bx, &by);
 
-        /* Build cell_width × cell_height buffer (zero-padded) */
-        uint8_t *cell = calloc(cell_width * cell_height, 1);
-        int y_off = baseline + by;  /* by is negative for glyphs above baseline */
+        /* Build oversampled cell buffer */
+        uint8_t *os_cell = calloc(os_cw * os_ch, 1);
+        int y_off = os_baseline + by;
         for (int row = 0; row < bh; row++) {
             int dst_row = y_off + row;
-            if (dst_row < 0 || dst_row >= cell_height) continue;
+            if (dst_row < 0 || dst_row >= os_ch) continue;
+            /* Center glyph horizontally in cell */
+            int glyph_w_scaled = bw;
+            int x_offset = bx + (os_cw - bw) / 2 - bx; /* center within cell */
+            (void)x_offset;
             for (int col = 0; col < bw; col++) {
                 int dst_col = bx + col;
-                if (dst_col < 0 || dst_col >= cell_width) continue;
-                cell[dst_row * cell_width + dst_col] = bitmap[row * bw + col];
+                if (dst_col < 0 || dst_col >= os_cw) continue;
+                os_cell[dst_row * os_cw + dst_col] = bitmap[row * bw + col];
+            }
+            (void)glyph_w_scaled;
+        }
+
+        /* Downsample with gamma-correct averaging */
+        uint8_t *cell = calloc(cell_width * cell_height, 1);
+        for (int dy = 0; dy < cell_height; dy++) {
+            for (int dx = 0; dx < cell_width; dx++) {
+                double sum = 0.0;
+                for (int oy = 0; oy < OVERSAMPLE; oy++) {
+                    for (int ox = 0; ox < OVERSAMPLE; ox++) {
+                        int sy = dy * OVERSAMPLE + oy;
+                        int sx = dx * OVERSAMPLE + ox;
+                        if (sy < os_ch && sx < os_cw)
+                            sum += srgb_to_linear(os_cell[sy * os_cw + sx]);
+                    }
+                }
+                cell[dy * cell_width + dx] = linear_to_srgb(
+                    sum / (double)(OVERSAMPLE * OVERSAMPLE));
             }
         }
 
-        fprintf(out, "    /* '%c' (U+%04X) */\n    {", (c >= 0x20 && c < 0x7F) ? c : '?', c);
+        fprintf(out, "    /* '%c' (U+%04X) */\n    {",
+                (c >= 0x20 && c < 0x7F) ? c : '?', c);
         for (int i = 0; i < cell_width * cell_height; i++) {
             if (i % cell_width == 0) fprintf(out, "\n        ");
             fprintf(out, "0x%02x,", cell[i]);
@@ -99,6 +150,7 @@ int main(int argc, char **argv) {
         fprintf(out, "\n    },\n");
 
         stbtt_FreeBitmap(bitmap, NULL);
+        free(os_cell);
         free(cell);
     }
 

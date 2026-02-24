@@ -12,6 +12,8 @@ static uint8_t  *bitmap      = NULL;
 static uint64_t  bitmap_pages = 0;   /* total pages tracked     */
 static uint64_t  hhdm_base    = 0;   /* higher-half direct map  */
 static uint64_t  free_pages   = 0;
+static uint64_t  usable_pages = 0;   /* total usable (RAM) pages */
+
 
 static inline void bitmap_set(uint64_t page) {
     bitmap[page / 8] |=  (uint8_t)(1 << (page % 8));
@@ -54,6 +56,7 @@ void pmm_init(pmm_memmap_entry_t *entries, uint64_t entry_count,
         if (entries[i].type != MEMMAP_USABLE) continue;
         uint64_t start_page = entries[i].base / PAGE_SIZE;
         uint64_t num_pages  = entries[i].length / PAGE_SIZE;
+        usable_pages += num_pages;
         for (uint64_t p = start_page; p < start_page + num_pages; p++) {
             bitmap_clear(p);
             free_pages++;
@@ -112,3 +115,6 @@ void pmm_print_stats(void) {
     KLOG_INFO("PMM: %llu pages free (%llu MB)\n",
               free_pages, free_pages * PAGE_SIZE / (1024*1024));
 }
+
+uint64_t pmm_get_total_pages(void) { return usable_pages; }
+uint64_t pmm_get_free_pages(void)  { return free_pages; }

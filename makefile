@@ -159,15 +159,18 @@ $(ISO_IMAGE): $(KERNEL_ELF) $(LIMINE_DIR)/limine.h
 
 # ─── Run in QEMU ─────────────────────────────────────────────────────────────
 run: $(ISO_IMAGE)
-	qemu-system-x86_64                              \
-	    -cdrom $(ISO_IMAGE)                         \
-	    -m 2G                                       \
-	    -smp 4                                      \
-	    -serial stdio                               \
-	    -enable-kvm                                 \
-	    -device virtio-gpu-gl,xres=1280,yres=720    \
-	    -vga none                                   \
-	    -display sdl,gl=on                          \
+	qemu-system-x86_64                                      \
+	    -cdrom $(ISO_IMAGE)                                 \
+	    -m 2G                                               \
+	    -smp 4                                              \
+	    -serial stdio                                       \
+	    -enable-kvm                                         \
+	    -device virtio-gpu-gl,xres=1280,yres=720            \
+	    -vga none                                           \
+	    -display sdl,gl=on                                  \
+	    -device nec-usb-xhci,id=xhci                       \
+	    -device usb-kbd,bus=xhci.0                         \
+	    -device usb-mouse,bus=xhci.0                       \
 	    -no-reboot
 
 run-debug: $(ISO_IMAGE)

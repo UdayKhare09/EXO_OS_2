@@ -12,7 +12,6 @@
 #include <stddef.h>
 
 /* ── Task ID registry ────────────────────────────────────────────────────── */
-#define TASK_TABLE_SIZE  1024
 static task_t *task_table[TASK_TABLE_SIZE];
 
 task_t *task_lookup(uint32_t tid) {
@@ -99,4 +98,9 @@ void task_destroy(task_t *t) {
     pmm_free_pages(t->stack_phys, TASK_STACK_SIZE / PAGE_SIZE);
     uintptr_t task_phys = vmm_virt_to_phys((uintptr_t)t);
     pmm_free_pages(task_phys, 1);
+}
+
+task_t *task_get_from_table(uint32_t index) {
+    if (index >= TASK_TABLE_SIZE) return NULL;
+    return __atomic_load_n(&task_table[index], __ATOMIC_ACQUIRE);
 }

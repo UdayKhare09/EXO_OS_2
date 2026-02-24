@@ -79,15 +79,15 @@ static inline gfx_color_t gfx_getpixel(const gfx_surface_t *s, int x, int y) {
     return 0;
 }
 
-/* Alpha-blend src onto dst (src over dst) */
+/* Alpha-blend src onto dst (src over dst, proper /255 rounding) */
 static inline gfx_color_t gfx_blend(gfx_color_t dst, gfx_color_t src) {
     uint32_t a = GFX_A(src);
     if (a == 0xFF) return src;
     if (a == 0x00) return dst;
     uint32_t ia = 255 - a;
-    uint32_t r = (GFX_R(src) * a + GFX_R(dst) * ia) >> 8;
-    uint32_t g = (GFX_G(src) * a + GFX_G(dst) * ia) >> 8;
-    uint32_t b = (GFX_B(src) * a + GFX_B(dst) * ia) >> 8;
+    uint32_t r = (GFX_R(src) * a + GFX_R(dst) * ia + 128) / 255;
+    uint32_t g = (GFX_G(src) * a + GFX_G(dst) * ia + 128) / 255;
+    uint32_t b = (GFX_B(src) * a + GFX_B(dst) * ia + 128) / 255;
     return GFX_RGB(r, g, b);
 }
 

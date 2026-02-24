@@ -70,7 +70,8 @@
 /* Capsets */
 #define VIRTIO_GPU_CAPSET_VIRGL                1u
 
-#define VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM       2u
+#define VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM       1u   /* BGRA with alpha — cursor */
+#define VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM       2u   /* BGRX no alpha  — scanout */
 #define VIRTIO_GPU_FLAG_FENCE (1u)
 
 /* Resource IDs: 1=scanout/front, 2=back, 100=cursor, 3+ = dynamic */
@@ -352,6 +353,7 @@ static struct {
     /* Hardware cursor */
     uintptr_t              cursor_phys;
     gfx_color_t           *cursor_shadow;
+    uintptr_t              cursor_resp_phys;  /* pre-alloc'd dummy resp for cursor_cmd */
 
     /* virgl 3D */
     bool                   virgl_ok;
@@ -824,7 +826,7 @@ bool virtio_gpu_init(gfx_surface_t **out) {
     uintptr_t ccr_phys = alloc_dma(sizeof(*ccr), (void **)&ccr);
     ccr->hdr.type    = VIRTIO_GPU_CMD_RESOURCE_CREATE_2D;
     ccr->resource_id = RES_ID_CURSOR;
-    ccr->format      = VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM;
+    ccr->format      = VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM;  /* alpha needed for cursor */
     ccr->width       = CURSOR_W;
     ccr->height      = CURSOR_H;
     gpu_cmd(ccr, sizeof(*ccr));
@@ -838,6 +840,10 @@ bool virtio_gpu_init(gfx_surface_t **out) {
     cab->entries[0].length = (uint32_t)(cursor_pages * PAGE_SIZE);
     gpu_cmd(cab, sizeof(*cab));
     pmm_free_pages(cab_phys, 1);
+    /* Pre-allocate a permanent dummy response page for cursor_cmd so that
+     * cursor moves don't alloc/free a page at 200 Hz.                      */
+    gpu_ctrl_hdr_t *_cresp;
+    gpu.cursor_resp_phys = alloc_dma(sizeof(gpu_ctrl_hdr_t), (void **)&_cresp);
 
     /* ── SET_SCANOUT on front buffer ───────────────────────────────────── */
     if (!gpu_set_scanout(RES_ID_FRONT, fb_w, fb_h)) {
@@ -969,14 +975,25 @@ bool virtio_gpu_available(void) {
 
 /* ── Hardware cursor ──────────────────────────────────────────────────────── */
 
+/* Send a cursor-queue command (UPDATE_CURSOR or MOVE_CURSOR).
+ * These MUST go on queue 1 (curq) because in virgl mode the controlq
+ * (queue 0) is processed by the virgl host which doesn't understand
+ * virtio-gpu cursor opcodes (0x300/0x301) and returns errors.
+ * Falls back to ctlq if curq was not successfully initialised.          */
+static void cursor_cmd(void *req, uint32_t req_sz) {
+    if (!gpu.ready || !gpu.cursor_resp_phys) return;
+    virtq_t *vq = gpu.curq.desc ? &gpu.curq : &gpu.ctlq;
+    vq_submit2(vq, vmm_virt_to_phys((uintptr_t)req), req_sz,
+               gpu.cursor_resp_phys, sizeof(gpu_ctrl_hdr_t));
+}
+
 void virtio_gpu_cursor_set(const uint32_t *rgba64, uint32_t hot_x, uint32_t hot_y) {
     if (!gpu.ready) return;
 
     if (rgba64) {
-        /* Copy bitmap into cursor shadow */
+        /* Copy bitmap into cursor shadow and push to GPU resource via ctlq */
         memcpy(gpu.cursor_shadow, rgba64, CURSOR_W * CURSOR_H * 4);
 
-        /* TRANSFER_TO_HOST_2D for cursor resource */
         gpu_cmd_transfer_t *tf;
         uintptr_t tf_phys = alloc_dma(sizeof(*tf), (void **)&tf);
         tf->hdr.type    = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
@@ -984,34 +1001,34 @@ void virtio_gpu_cursor_set(const uint32_t *rgba64, uint32_t hot_x, uint32_t hot_
         tf->offset      = 0;
         tf->resource_id = RES_ID_CURSOR;
         tf->padding     = 0;
-        gpu_cmd(tf, sizeof(*tf));
+        gpu_cmd(tf, sizeof(*tf));   /* transfer stays on ctlq – that's correct */
         pmm_free_pages(tf_phys, 1);
     }
 
-    /* Update cursor on cursor queue (or controlq if no cursorq) */
+    /* UPDATE_CURSOR → cursor queue */
     gpu_cmd_cursor_t *cur;
     uintptr_t cur_phys = alloc_dma(sizeof(*cur), (void **)&cur);
-    cur->hdr.type      = VIRTIO_GPU_CMD_UPDATE_CURSOR;
+    cur->hdr.type       = VIRTIO_GPU_CMD_UPDATE_CURSOR;
     cur->pos.scanout_id = 0;
     cur->pos.x = 0; cur->pos.y = 0; cur->pos.padding = 0;
-    cur->resource_id   = rgba64 ? RES_ID_CURSOR : 0;
-    cur->hot_x         = hot_x;
-    cur->hot_y         = hot_y;
-    cur->padding       = 0;
-    gpu_cmd(cur, sizeof(*cur));
+    cur->resource_id    = rgba64 ? RES_ID_CURSOR : 0;
+    cur->hot_x          = hot_x;
+    cur->hot_y          = hot_y;
+    cur->padding        = 0;
+    cursor_cmd(cur, sizeof(*cur));
     pmm_free_pages(cur_phys, 1);
 }
 
 void virtio_gpu_cursor_move(int x, int y) {
-    if (!gpu.ready) return;
+    if (!gpu.ready || !gpu.cursor_resp_phys) return;
     gpu_cmd_cursor_t *cur;
     uintptr_t cur_phys = alloc_dma(sizeof(*cur), (void **)&cur);
-    cur->hdr.type      = VIRTIO_GPU_CMD_MOVE_CURSOR;
+    cur->hdr.type       = VIRTIO_GPU_CMD_MOVE_CURSOR;
     cur->pos.scanout_id = 0;
     cur->pos.x = (uint32_t)x; cur->pos.y = (uint32_t)y; cur->pos.padding = 0;
-    cur->resource_id   = 0;
-    cur->hot_x         = 0; cur->hot_y = 0; cur->padding = 0;
-    gpu_cmd(cur, sizeof(*cur));
+    cur->resource_id    = 0;
+    cur->hot_x          = 0; cur->hot_y = 0; cur->padding = 0;
+    cursor_cmd(cur, sizeof(*cur));
     pmm_free_pages(cur_phys, 1);
 }
 

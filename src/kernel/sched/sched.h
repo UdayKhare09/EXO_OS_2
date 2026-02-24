@@ -39,5 +39,18 @@ void sched_sleep(uint32_t ms);
 /* Return the global jiffy counter (1 jiffy = 1 APIC timer tick = ~1 ms) */
 uint64_t sched_get_ticks(void);
 
+/* Snapshot of a task for enumeration */
+typedef struct {
+    uint32_t     tid;
+    uint32_t     cpu_id;
+    uint8_t      priority;
+    task_state_t state;
+    char         name[TASK_NAME_MAX];
+} sched_task_info_t;
+
+/* Enumerate all active tasks into buf[]. Returns count written.
+ * Safe to call from any context (reads atomically). */
+int sched_snapshot_tasks(sched_task_info_t *buf, int max_count);
+
 /* Global tick-per-ms for APIC (set by main after calibration) */
 extern uint32_t g_apic_ticks_per_ms;

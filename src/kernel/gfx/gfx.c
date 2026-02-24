@@ -98,23 +98,51 @@ void gfx_blit_alpha(gfx_surface_t *dst, int dx, int dy,
     }
 }
 
-/* ── Glyph drawing (atlas lookup + alpha composite) ──────────────────────── */
+/* ── Glyph drawing (atlas lookup + alpha composite) ──────────────────────── *
+ * Optimised path: direct row-pointer access, skip transparent pixels,
+ * batch fill of background cell, and branchless alpha blend.                 */
 void gfx_draw_glyph(gfx_surface_t *s, int x, int y, int codepoint,
                     gfx_color_t fg, gfx_color_t bg) {
     const gfx_font_atlas_t *a = &g_font_atlas;
     const uint8_t *bmp = font_get_glyph(codepoint);
+
+    int cw = a->cell_w;
+    int ch = a->cell_h;
+
     /* Fill background cell first */
-    gfx_fill_rect(s, (gfx_rect_t){x, y, a->cell_w, a->cell_h}, bg);
+    if (GFX_A(bg) > 0)
+        gfx_fill_rect(s, (gfx_rect_t){x, y, cw, ch}, bg);
     if (!bmp) return;
 
-    for (int row = 0; row < a->cell_h; row++) {
-        for (int col = 0; col < a->cell_w; col++) {
-            uint8_t alpha = bmp[row * a->cell_w + col];
-            if (!alpha) continue;
-            /* Blend fg with alpha weight from bitmap */
-            gfx_color_t blended_fg = GFX_ARGB(alpha, GFX_R(fg), GFX_G(fg), GFX_B(fg));
-            gfx_color_t dst = gfx_getpixel(s, x + col, y + row);
-            gfx_putpixel(s, x + col, y + row, gfx_blend(dst, blended_fg));
+    /* Clip to surface bounds */
+    int x0 = x < 0 ? -x : 0;
+    int y0 = y < 0 ? -y : 0;
+    int x1 = (x + cw > s->w) ? s->w - x : cw;
+    int y1 = (y + ch > s->h) ? s->h - y : ch;
+    if (x0 >= x1 || y0 >= y1) return;
+
+    /* Pre-extract fg components */
+    uint32_t fg_r = GFX_R(fg);
+    uint32_t fg_g = GFX_G(fg);
+    uint32_t fg_b = GFX_B(fg);
+
+    for (int row = y0; row < y1; row++) {
+        gfx_color_t *dst_row = s->pixels + (y + row) * s->stride + x;
+        const uint8_t *src_row = bmp + row * cw;
+        for (int col = x0; col < x1; col++) {
+            uint32_t alpha = src_row[col];
+            if (alpha == 0) continue;
+            if (alpha == 255) {
+                dst_row[col] = fg;
+            } else {
+                /* Alpha blend: fg_component * alpha + dst * (255-alpha) */
+                gfx_color_t d = dst_row[col];
+                uint32_t ia = 255 - alpha;
+                uint32_t r = (fg_r * alpha + GFX_R(d) * ia + 128) / 255;
+                uint32_t g = (fg_g * alpha + GFX_G(d) * ia + 128) / 255;
+                uint32_t b = (fg_b * alpha + GFX_B(d) * ia + 128) / 255;
+                dst_row[col] = GFX_RGB(r, g, b);
+            }
         }
     }
 }

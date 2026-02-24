@@ -3,11 +3,11 @@
  * Hardware acceleration is at the presentation layer:
  *   • virtio_gpu_flush() does TRANSFER_TO_HOST_2D then virgl BLIT back→front
  *     (no CPU memcpy, tear-free presentation).
- *   • Hardware cursor via virtio_gpu_cursor_set/move().
- *   • virtio_gpu_virgl_fill/blit() are available for future per-window HW compositing.
+ *   • Software cursor drawn after all windows, before flush.
  */
 #include "compositor.h"
 #include "wm.h"
+#include "cursor.h"
 #include "virtio_gpu.h"
 #include "lib/string.h"
 
@@ -41,7 +41,10 @@ void compositor_compose(void) {
     /* 2. CPU: draw all visible windows into back-buffer shadow */
     wm_compose(g_screen, dr);
 
-    /* 3. GPU: TRANSFER shadow → back resource, then virgl BLIT back→front
+    /* 3. CPU: draw software cursor on top of everything */
+    cursor_draw(g_screen);
+
+    /* 4. GPU: TRANSFER shadow → back resource, then virgl BLIT back→front
      *         (or SET_SCANOUT swap when virgl is absent). No tearing. */
     if (g_flush_fn) g_flush_fn(dr);
 }
