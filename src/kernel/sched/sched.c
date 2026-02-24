@@ -15,15 +15,22 @@
 /* Exposed for AP cores to read after calibration */
 uint32_t g_apic_ticks_per_ms = 0;
 
+/* Global jiffy counter: incremented 1/ms by BSP timer ISR (~1 ms resolution) */
+static volatile uint64_t g_jiffies = 0;
+
+#define NPRIO  8    /* 0 = highest priority, 7 = lowest */
+#define TIMESLICE_TICKS  10   /* ticks before priority drop */
+
 /* ── Per-CPU scheduler state ─────────────────────────────────────────────── */
 typedef struct {
-    task_t  *current;     /* task currently running                 */
-    task_t  *queue_head;  /* head of run queue (circular singly-LL) */
-    task_t  *queue_tail;  /* tail                                   */
-    task_t  *idle;        /* dedicated idle task                    */
-    uint32_t queue_len;
+    task_t  *current;         /* task currently running                     */
+    task_t  *queue_head[NPRIO]; /* head of each priority queue              */
+    task_t  *queue_tail[NPRIO]; /* tail of each priority queue              */
+    task_t  *idle;            /* dedicated idle task                        */
+    task_t  *sleep_head;      /* linked list of sleeping tasks (sleep_next) */
+    uint32_t queue_len;       /* total tasks across all queues              */
     uint32_t cpu_id;
-    volatile int rq_lock; /* spinlock protecting queue_{head,tail,len} */
+    volatile int rq_lock;     /* spinlock protecting all queues             */
 } cpu_sched_t;
 
 static cpu_sched_t cpu_scheds[MAX_CPUS];
@@ -56,25 +63,31 @@ static inline void irq_restore(uint64_t f) {
 
 /* ── Run-queue helpers ────────────────────────────────────────────────────── */
 static void rq_enqueue(cpu_sched_t *cs, task_t *t) {
+    uint8_t pri = t->priority;
+    if (pri >= NPRIO) pri = NPRIO - 1;
+
     t->next = NULL;
-    if (!cs->queue_head) {
-        cs->queue_head = cs->queue_tail = t;
+    if (!cs->queue_head[pri]) {
+        cs->queue_head[pri] = cs->queue_tail[pri] = t;
     } else {
-        cs->queue_tail->next = t;
-        cs->queue_tail = t;
+        cs->queue_tail[pri]->next = t;
+        cs->queue_tail[pri]       = t;
     }
     cs->queue_len++;
 }
 
-/* Dequeue from front */
+/* Dequeue from highest priority non-empty queue */
 static task_t *rq_dequeue(cpu_sched_t *cs) {
-    if (!cs->queue_head) return NULL;
-    task_t *t = cs->queue_head;
-    cs->queue_head = t->next;
-    if (!cs->queue_head) cs->queue_tail = NULL;
-    t->next = NULL;
-    cs->queue_len--;
-    return t;
+    for (int pri = 0; pri < NPRIO; pri++) {
+        if (!cs->queue_head[pri]) continue;
+        task_t *t = cs->queue_head[pri];
+        cs->queue_head[pri] = t->next;
+        if (!cs->queue_head[pri]) cs->queue_tail[pri] = NULL;
+        t->next = NULL;
+        cs->queue_len--;
+        return t;
+    }
+    return NULL;
 }
 
 /* ── Idle task entry ──────────────────────────────────────────────────────── */
@@ -130,13 +143,46 @@ void sched_tick(void) {
     uint32_t     cpu_id = ci->id;
     cpu_sched_t *cs     = &cpu_scheds[cpu_id];
 
+    /* Advance jiffy counter on CPU 0 (shared millisecond clock) */
+    if (cpu_id == 0)
+        __atomic_add_fetch(&g_jiffies, 1, __ATOMIC_RELAXED);
+
+    uint64_t now = __atomic_load_n(&g_jiffies, __ATOMIC_RELAXED);
+
     task_t *prev = cs->current;
 
+    /* MLFQ: increment timeslice counter for running task */
+    if (prev && prev != cs->idle && prev->state == TASK_RUNNING) {
+        prev->timeslice_ticks++;
+    }
+
     rq_lock(cs);
-    /* Re-enqueue previous task if still runnable */
+    /* Re-enqueue previous task if still runnable (with priority adjustment) */
     if (prev && prev != cs->idle && prev->state == TASK_RUNNING) {
         prev->state = TASK_RUNNABLE;
+
+        /* MLFQ feedback: if task used full timeslice, drop priority */
+        if (prev->timeslice_ticks >= TIMESLICE_TICKS) {
+            if (prev->priority < NPRIO - 1) prev->priority++;
+            prev->timeslice_ticks = 0;
+        }
+
         rq_enqueue(cs, prev);
+    }
+
+    /* Wake sleeping tasks whose deadline has passed */
+    task_t **sp = &cs->sleep_head;
+    while (*sp) {
+        task_t *st = *sp;
+        if (now >= st->sleep_deadline) {
+            *sp = st->sleep_next;   /* unlink */
+            st->sleep_next    = NULL;
+            st->sleep_deadline = 0;
+            st->state          = TASK_RUNNABLE;
+            rq_enqueue(cs, st);
+        } else {
+            sp = &st->sleep_next;
+        }
     }
 
     /* Pick next runnable task; collect dead tasks to free after unlock */
@@ -174,6 +220,11 @@ void sched_tick(void) {
         next = cs->idle;
     }
 
+    /* Reset timeslice counter when task starts running */
+    if (next != cs->idle) {
+        next->timeslice_ticks = 0;
+    }
+
     next->state = TASK_RUNNING;
     cs->current = next;
 
@@ -199,7 +250,14 @@ void sched_task_exit(void) {
 void sched_block(void) {
     cpu_info_t  *ci = smp_self();
     cpu_sched_t *cs = &cpu_scheds[ci->id];
-    cs->current->state = TASK_BLOCKED;
+    task_t *cur = cs->current;
+
+    /* MLFQ: voluntary block (I/O wait) → boost priority (reward) */
+    if (cur && cur != cs->idle && cur->priority > 0) {
+        cur->priority--;
+    }
+
+    cur->state = TASK_BLOCKED;
     sched_tick();
 }
 
@@ -258,4 +316,43 @@ task_t *sched_spawn(const char *name, task_entry_t entry, void *arg) {
     task_t  *t   = task_create(name, entry, arg, cpu);
     if (t) sched_add_task(t, cpu);
     return t;
+}
+/* ── sched_set_priority ───────────────────────────────────────────────── */
+void sched_set_priority(task_t *t, uint8_t priority) {
+    if (!t) return;
+    if (priority >= NPRIO) priority = NPRIO - 1;
+    t->priority = priority;
+    t->timeslice_ticks = 0;
+}
+
+/* ── sched_get_ticks ──────────────────────────────────────────────────── */
+uint64_t sched_get_ticks(void) {
+    return __atomic_load_n(&g_jiffies, __ATOMIC_RELAXED);
+}
+
+/* ── sched_sleep ───────────────────────────────────────────────────────── */
+void sched_sleep(uint32_t ms) {
+    if (ms == 0) return;
+
+    cpu_info_t  *ci = smp_self();
+    cpu_sched_t *cs = &cpu_scheds[ci->id];
+    task_t      *cur = cs->current;
+
+    uint64_t deadline = __atomic_load_n(&g_jiffies, __ATOMIC_RELAXED) + ms;
+
+    uint64_t f = irq_save_cli();
+    rq_lock(cs);
+
+    cur->sleep_deadline = deadline;
+    cur->state          = TASK_SLEEPING;
+
+    /* Prepend to per-CPU sleep list */
+    cur->sleep_next  = cs->sleep_head;
+    cs->sleep_head   = cur;
+
+    rq_unlock(cs);
+    irq_restore(f);
+
+    /* Yield CPU; sched_tick() will re-enqueue us after deadline */
+    sched_tick();
 }

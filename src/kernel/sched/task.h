@@ -12,6 +12,7 @@ typedef enum {
     TASK_RUNNING   = 1,
     TASK_BLOCKED   = 2,
     TASK_DEAD      = 3,
+    TASK_SLEEPING  = 4,   /* blocked until sleep_deadline tick */
 } task_state_t;
 
 typedef void (*task_entry_t)(void *arg);
@@ -27,6 +28,14 @@ typedef struct task {
     char          name[TASK_NAME_MAX];
     struct task  *next;             /* run-queue linked list                    */
     uintptr_t     stack_phys;       /* physical base of kernel stack            */
+
+    /* ── Scheduling (MLFQ) ──────────────────────────────────────────────── */
+    uint8_t       priority;         /* 0=highest, 7=lowest                       */
+    uint32_t      timeslice_ticks;  /* ticks used in current timeslice           */
+
+    /* ── Sleep ──────────────────────────────────────────────────────────── */
+    uint64_t      sleep_deadline;   /* wake when g_jiffies >= this value         */
+    struct task  *sleep_next;       /* sleep-list linked list                    */
 
     /* ── IPC + Signals ──────────────────────────────────────────────────── */
     volatile uint32_t    sig_pending;   /* bitmask: bit N set = signal N pending */

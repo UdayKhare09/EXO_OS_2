@@ -19,3 +19,7 @@ void serial_puts(const char *s);
 #define KLOG_WARN(fmt,  ...) klog_warn ("[W] " fmt, ##__VA_ARGS__)
 #define KLOG_ERR(fmt,   ...) klog_error("[E] " fmt, ##__VA_ARGS__)
 #define KLOG_DEBUG(fmt, ...) klog_debug("[D] " fmt, ##__VA_ARGS__)
+
+/* Optional secondary write callback (e.g., framebuffer console).
+ * Set to NULL to disable. Called with the formatted string after serial. */
+void klog_set_write_fn(void (*fn)(const char *s));

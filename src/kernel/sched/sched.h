@@ -30,5 +30,14 @@ task_t *sched_current(void);
 uint32_t sched_pick_cpu(void);
 task_t  *sched_spawn(const char *name, task_entry_t entry, void *arg);
 
+/* Set task priority (0=highest, 7=lowest); default is 4 */
+void sched_set_priority(task_t *t, uint8_t priority);
+
+/* Sleep current task for at least `ms` milliseconds */
+void sched_sleep(uint32_t ms);
+
+/* Return the global jiffy counter (1 jiffy = 1 APIC timer tick = ~1 ms) */
+uint64_t sched_get_ticks(void);
+
 /* Global tick-per-ms for APIC (set by main after calibration) */
 extern uint32_t g_apic_ticks_per_ms;

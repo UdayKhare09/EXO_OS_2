@@ -74,6 +74,10 @@ task_t *task_create(const char *name, task_entry_t entry, void *arg,
     t->cpu_id = cpu_id;
     t->next   = NULL;
 
+    /* Priority scheduler fields */
+    t->priority        = 4;   /* default: middle priority (0-7) */
+    t->timeslice_ticks = 0;
+
     /* IPC + signal resources */
     t->sig_pending  = 0;
     t->sig_handlers = signal_table_alloc();

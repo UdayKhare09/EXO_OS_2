@@ -57,6 +57,12 @@ LDFLAGS         :=                      \
 # Collect sources
 C_SRCS  := $(shell find $(SRC_DIR) -name '*.c')
 AS_SRCS := $(shell find $(SRC_DIR) -name '*.S')
+
+# ── Pre-rasterised font (TrueType → C array, host-side tool) ─────────────────
+FONT_TOOL     := $(BUILD_DIR)/tools/gen_font
+FONT_TTF      := $(SRC_DIR)/gfx/3rdparty/font.ttf
+FONT_DATA_C   := $(BUILD_DIR)/gfx_font_data.c
+FONT_DATA_OBJ := $(BUILD_DIR)/obj/gfx_font_data.c.o
 # Trampoline is special: built as flat binary then wrapped in an ELF object
 TRAMPOLINE_SRC  := $(ARCH_DIR)/trampoline.asm
 TRAMPOLINE_BIN  := $(BUILD_DIR)/obj/arch/x86_64/trampoline.bin
@@ -69,7 +75,7 @@ C_OBJS    := $(patsubst $(SRC_DIR)/%.c,    $(BUILD_DIR)/obj/%.c.o,    $(C_SRCS))
 AS_OBJS   := $(patsubst $(SRC_DIR)/%.S,    $(BUILD_DIR)/obj/%.S.o,    $(AS_SRCS))
 NASM_OBJS := $(patsubst $(SRC_DIR)/%.asm,  $(BUILD_DIR)/obj/%.asm.o,  $(NASM_SRCS))
 
-ALL_OBJS := $(C_OBJS) $(AS_OBJS) $(NASM_OBJS) $(TRAMPOLINE_OBJ)
+ALL_OBJS := $(C_OBJS) $(AS_OBJS) $(NASM_OBJS) $(TRAMPOLINE_OBJ) $(FONT_DATA_OBJ)
 
 .PHONY: all clean run
 
@@ -89,6 +95,19 @@ $(LIMINE_DIR)/limine.h:
 # Copy limine.h to build/ so the kernel can include it
 $(BUILD_DIR)/limine.h: $(LIMINE_DIR)/limine.h
 	@cp $(LIMINE_DIR)/limine.h $(BUILD_DIR)/limine.h
+
+# ─── Host gen_font tool: pre-rasterise TrueType → C array ───────────────────
+$(FONT_TOOL): tools/gen_font.c
+	@mkdir -p $(dir $@)
+	cc -O2 -o $@ $< -lm
+
+$(FONT_DATA_C): $(FONT_TOOL) $(FONT_TTF)
+	@mkdir -p $(dir $@)
+	$< $(FONT_TTF) 26 $@
+
+$(FONT_DATA_OBJ): $(FONT_DATA_C) $(BUILD_DIR)/limine.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
 
 # ─── Trampoline: flat binary → ELF object ────────────────────────────────────
 $(TRAMPOLINE_BIN): $(TRAMPOLINE_SRC)
@@ -140,12 +159,15 @@ $(ISO_IMAGE): $(KERNEL_ELF) $(LIMINE_DIR)/limine.h
 
 # ─── Run in QEMU ─────────────────────────────────────────────────────────────
 run: $(ISO_IMAGE)
-	qemu-system-x86_64          \
-	    -cdrom $(ISO_IMAGE)     \
-	    -m 2G                 \
-	    -smp 4                  \
-	    -serial stdio           \
-	    -enable-kvm             \
+	qemu-system-x86_64                              \
+	    -cdrom $(ISO_IMAGE)                         \
+	    -m 2G                                       \
+	    -smp 4                                      \
+	    -serial stdio                               \
+	    -enable-kvm                                 \
+	    -device virtio-gpu-gl,xres=1280,yres=720    \
+	    -vga none                                   \
+	    -display sdl,gl=on                          \
 	    -no-reboot
 
 run-debug: $(ISO_IMAGE)
@@ -154,12 +176,15 @@ run-debug: $(ISO_IMAGE)
 	    -m 512M                 \
 	    -smp 4                  \
 	    -serial stdio           \
+	    -device virtio-gpu-gl   \
+	    -vga none               \
 	    -no-reboot              \
 	    -s -S
 
 clean:
 	@rm -rf $(BUILD_DIR)/obj $(KERNEL_ELF) $(ISO_IMAGE) \
-	        $(ISO_DIR) $(BUILD_DIR)/limine.h
+	        $(ISO_DIR) $(BUILD_DIR)/limine.h             \
+	        $(FONT_DATA_C) $(FONT_DATA_OBJ)
 	@echo ">>> Cleaned."
 
 distclean:

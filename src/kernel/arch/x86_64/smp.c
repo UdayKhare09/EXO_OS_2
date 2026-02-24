@@ -71,6 +71,9 @@ void smp_ap_entry(cpu_info_t *info) {
     /* Init per-CPU scheduler */
     sched_init(info->id);
 
+    /* Start periodic LAPIC timer on this AP (same rate as BSP) */
+    apic_timer_init(g_apic_ticks_per_ms);
+
     info->online = 1;
 
     /* Signal BSP that we are ready */

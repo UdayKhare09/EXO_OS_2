@@ -62,18 +62,27 @@ static int kvsnprintf(char *buf, size_t cap, const char *fmt, va_list ap) {
         fmt++;
         int pad = 0;
         while (*fmt >= '0' && *fmt <= '9') pad = pad*10 + (*fmt++ - '0');
-        /* Skip length modifiers (l, ll, h, hh, z) — we always pull 64-bit */
-        while (*fmt == 'l' || *fmt == 'h' || *fmt == 'z') fmt++;
+        /* Track length modifiers: 'l'/'ll' → 64-bit, others ignored */
+        int is_long = 0;
+        while (*fmt == 'l' || *fmt == 'h' || *fmt == 'z') {
+            if (*fmt == 'l') is_long = 1;
+            fmt++;
+        }
         switch (*fmt++) {
             case 'c': PUT((char)va_arg(ap, int)); break;
             case 's': { const char *s = va_arg(ap, const char*);
                         if (!s) s = "(null)";
                         while (*s) PUT(*s++); break; }
-            case 'd': { int64_t v = va_arg(ap, int64_t);
+            case 'd': { int64_t v = is_long ? va_arg(ap, int64_t)
+                                            : (int64_t)va_arg(ap, int);
                         if (v < 0) { PUT('-'); v = -v; }
                         print_uint((uint64_t)v, 10, pad, buf, &i, cap); break; }
-            case 'u': print_uint(va_arg(ap, uint64_t), 10, pad, buf, &i, cap); break;
-            case 'x': print_uint(va_arg(ap, uint64_t), 16, pad, buf, &i, cap); break;
+            case 'u': print_uint(is_long ? va_arg(ap, uint64_t)
+                                        : (uint64_t)va_arg(ap, unsigned int),
+                                 10, pad, buf, &i, cap); break;
+            case 'x': print_uint(is_long ? va_arg(ap, uint64_t)
+                                        : (uint64_t)va_arg(ap, unsigned int),
+                                 16, pad, buf, &i, cap); break;
             case 'p': { PUT('0'); PUT('x');
                         print_uint((uint64_t)va_arg(ap, void*), 16, 16, buf, &i, cap); break; }
             case '%': PUT('%'); break;
@@ -94,11 +103,16 @@ static inline void klog_release(void) {
     __atomic_clear(&klog_lock, __ATOMIC_RELEASE);
 }
 
+/* Secondary write callback (e.g. framebuffer console) */
+static void (*g_write_fn)(const char *) = NULL;
+void klog_set_write_fn(void (*fn)(const char *s)) { g_write_fn = fn; }
+
 static void klog_vprint(const char *fmt, va_list ap) {
     char buf[512];
     kvsnprintf(buf, sizeof(buf), fmt, ap);
     klog_acquire();
     serial_puts(buf);
+    if (g_write_fn) g_write_fn(buf);
     klog_release();
 }
 

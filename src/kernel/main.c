@@ -36,6 +36,11 @@
 #include "mm/vmm.h"
 #include "sched/sched.h"
 #include "sched/task.h"
+#include "arch/x86_64/pci.h"
+#include "gfx/virtio_gpu.h"
+#include "gfx/compositor.h"
+#include "gfx/wm.h"
+#include "gfx/fbcon.h"
 
 /* ── Limine protocol: start marker ──────────────────────────────────────── */
 __attribute__((used, section(".limine_requests_start_marker")))
@@ -73,6 +78,51 @@ static volatile struct limine_kernel_address_request kaddr_req = {
     .id       = LIMINE_KERNEL_ADDRESS_REQUEST,
     .revision = 0,
 };
+
+/* ── Sleep test ──────────────────────────────────────────────────────────── */
+static void task_sleeper(void *arg) {
+    (void)arg;
+    task_t *self = sched_current();
+    KLOG_INFO("[sleep] task tid=%u starting\n", self->tid);
+
+    for (int i = 0; i < 5; i++) {
+        uint64_t t0 = sched_get_ticks();
+        sched_sleep(200);   /* sleep 200 ms */
+        uint64_t t1 = sched_get_ticks();
+        KLOG_INFO("[sleep] woke up after ~%llu ms (tick %llu -> %llu)\n",
+                  (unsigned long long)(t1 - t0),
+                  (unsigned long long)t0,
+                  (unsigned long long)t1);
+    }
+    KLOG_INFO("[sleep] task done\n");
+}
+
+/* ── Priority scheduler test ─────────────────────────────────────────────── */
+static void task_high_pri(void *arg) {
+    (void)arg;
+    task_t *self = sched_current();
+    sched_set_priority(self, 0);  /* highest priority */
+    KLOG_INFO("[prio] high-pri task (tid=%u) priority=0\n", self->tid);
+
+    for (int i = 0; i < 5; i++) {
+        KLOG_INFO("[prio] high-pri round %d\n", i);
+        for (volatile int d = 0; d < 500000; d++) cpu_pause();
+    }
+    KLOG_INFO("[prio] high-pri task done\n");
+}
+
+static void task_low_pri(void *arg) {
+    (void)arg;
+    task_t *self = sched_current();
+    sched_set_priority(self, 7);  /* lowest priority */
+    KLOG_INFO("[prio] low-pri task (tid=%u) priority=7\n", self->tid);
+
+    for (int i = 0; i < 5; i++) {
+        KLOG_INFO("[prio] low-pri round %d\n", i);
+        for (volatile int d = 0; d < 500000; d++) cpu_pause();
+    }
+    KLOG_INFO("[prio] low-pri task done\n");
+}
 
 /* ── IPC + Signal test ───────────────────────────────────────────────────── */
 static volatile uint32_t g_consumer_tid  = 0;
@@ -199,6 +249,26 @@ void kmain(void) {
     /* ── 5a. Kernel heap (slab allocator) ────────────────────────────────── */
     kmalloc_init();
 
+    /* ── 5b. PCI enumeration ─────────────────────────────────────────────── */
+    static pci_device_t s_pci_buf[64];
+    int pci_count = pci_enumerate(s_pci_buf, 64);
+    KLOG_INFO("pci: found %d device(s)\n", pci_count);
+
+    /* ── 5c. Graphics stack (VirtIO GPU only) ───────────────────────────── */
+    {
+        gfx_surface_t *screen = NULL;
+        if (!virtio_gpu_init(&screen)) {
+            KLOG_ERR("gfx: VirtIO GPU required but not found — halting\n");
+            goto halt;
+        }
+        KLOG_INFO("gfx: VirtIO GPU %dx%d ready\n", screen->w, screen->h);
+        compositor_init(screen, virtio_gpu_flush);
+        compositor_set_bg(GFX_DESKTOP_BG);
+        wm_init(screen->w, screen->h);
+        fbcon_init();
+        fbcon_takeover_klog();
+    }
+
     /* ── 6. ACPI / MADT ──────────────────────────────────────────────────── */
     acpi_init((uintptr_t)rsdp_req.response->address);
 
@@ -218,13 +288,17 @@ void kmain(void) {
     /* ── 9. SMP: bring up AP cores ───────────────────────────────────────── */
     smp_init();
 
-    /* ── 10. Enable interrupts ───────────────────────────────────────────── */
-    cpu_sti();
-
-    /* ── 11. Spawn IPC + signal test tasks ─────────────────────────────── */
+    /* ── 10. Spawn all tasks (interrupts still OFF) ─────────────────────── */
+    KLOG_INFO("Spawning priority test tasks...\n");
+    sched_spawn("high-pri", task_high_pri, NULL);
+    sched_spawn("low-pri",  task_low_pri,  NULL);
+    sched_spawn("sleeper",  task_sleeper,  NULL);
     sched_spawn("consumer", task_consumer, NULL);
     sched_spawn("producer", task_producer, NULL);
     KLOG_INFO("Kernel init complete. Entering idle.\n");
+
+    /* ── 11. Enable interrupts — scheduler takes over from here ─────────── */
+    cpu_sti();
 
     /* BSP falls into idle — scheduler timer will preempt as needed */
     sched_idle_loop();
