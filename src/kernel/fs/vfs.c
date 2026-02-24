@@ -149,14 +149,14 @@ static mount_t *find_mount_for_path(const char *path) {
     return best;
 }
 
-/* ── Check if a vnode is a covered mountpoint; return mounted root if so ─── */
-static vnode_t *check_mountpoint(vnode_t *v) {
+/* ── Check if a resolved path is a mount point; return mounted root if so ── */
+static mount_t *find_mount_exact(const char *resolved_path) {
     for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
         mount_t *m = &g_mounts[i];
-        if (!m->active || !m->covered) continue;
-        if (m->covered == v) return m->root;
+        if (!m->active) continue;
+        if (strcmp(m->path, resolved_path) == 0) return m;
     }
-    return v;
+    return NULL;
 }
 
 /* ── Path resolution ─────────────────────────────────────────────────────── */
@@ -172,14 +172,32 @@ vnode_t *vfs_lookup(const char *path, bool follow_last_link, int *err_out) {
         return NULL;
     }
 
-    vnode_t *cur = g_root_vnode;
-    vfs_vnode_get(cur);
+    /* Find the deepest mount that is a prefix of `path` to start from */
+    mount_t *start_mount = find_mount_for_path(path);
+    vnode_t *cur;
+    const char *p;
 
-    /* Skip leading '/' */
-    const char *p = path + 1;
+    if (start_mount && strcmp(start_mount->path, "/") != 0) {
+        /* Path starts inside a non-root mount; begin at its root vnode
+         * and skip the mount-path prefix in the input path. */
+        cur = start_mount->root;
+        vfs_vnode_get(cur);
+        p = path + strlen(start_mount->path);
+        if (*p == '/') p++;  /* skip separator after mount prefix */
+    } else {
+        cur = g_root_vnode;
+        vfs_vnode_get(cur);
+        p = path + 1;  /* skip leading '/' */
+    }
 
     int  link_depth = 0;
     char component[VFS_NAME_MAX + 1];
+    /* Track the resolved path so we can match mount points by path */
+    char resolved[VFS_MOUNT_PATH_MAX];
+    if (start_mount && strcmp(start_mount->path, "/") != 0)
+        strncpy(resolved, start_mount->path, VFS_MOUNT_PATH_MAX);
+    else
+        resolved[0] = '\0';  /* will become "/" after first append */
 
     while (*p) {
         /* Skip redundant slashes */
@@ -206,7 +224,37 @@ vnode_t *vfs_lookup(const char *path, bool follow_last_link, int *err_out) {
         if (strcmp(component, "..") == 0) {
             /* For now: treat ".." at root as staying at root */
             /* TODO: proper parent tracking across mountpoints */
+            /* Trim last component from resolved path */
+            char *last_slash = strrchr(resolved, '/');
+            if (last_slash && last_slash != resolved)
+                *last_slash = '\0';
+            else
+                resolved[0] = '\0';
             continue;
+        }
+
+        /* Build the resolved path for this component */
+        size_t rlen = strlen(resolved);
+        if (rlen == 0 || resolved[rlen - 1] != '/') {
+            if (rlen + 1 < VFS_MOUNT_PATH_MAX) {
+                resolved[rlen] = '/';
+                resolved[rlen + 1] = '\0';
+                rlen++;
+            }
+        }
+        if (rlen + (size_t)clen < VFS_MOUNT_PATH_MAX) {
+            memcpy(resolved + rlen, component, clen);
+            resolved[rlen + clen] = '\0';
+        }
+
+        /* Check if this resolved path is a mount point */
+        mount_t *mp = find_mount_exact(resolved);
+        if (mp && mp->root && mp->root != cur) {
+            /* Switch to the mounted filesystem's root */
+            vfs_vnode_put(cur);
+            cur = mp->root;
+            vfs_vnode_get(cur);
+            continue;  /* don't do a lookup in the underlying fs */
         }
 
         if (!cur->ops || !cur->ops->lookup) {
@@ -220,14 +268,6 @@ vnode_t *vfs_lookup(const char *path, bool follow_last_link, int *err_out) {
         if (!child) {
             if (err_out) *err_out = -ENOENT;
             return NULL;
-        }
-
-        /* Cross mountpoints */
-        vnode_t *mounted = check_mountpoint(child);
-        if (mounted != child) {
-            vfs_vnode_get(mounted);
-            vfs_vnode_put(child);
-            child = mounted;
         }
 
         /* Follow symlinks (unless last component and !follow_last_link) */

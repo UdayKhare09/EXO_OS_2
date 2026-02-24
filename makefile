@@ -1,18 +1,38 @@
 # EXO_OS Root Makefile
-# Uses Limine 8 as bootloader, downloaded into build/limine
+# Uses Limine 8 as UEFI bootloader, boots from a GPT disk image.
+# EFI System Partition (FAT32) = /boot  — holds Limine + kernel + config
+# Linux Data Partition (ext2)  = /      — root filesystem
 
 ARCH            := x86_64
 BUILD_DIR       := build
-ISO_DIR         := $(BUILD_DIR)/iso_root
 LIMINE_DIR      := $(BUILD_DIR)/limine
 KERNEL_ELF      := $(BUILD_DIR)/exo.elf
-ISO_IMAGE       := $(BUILD_DIR)/exo.iso
 
 # Utility variable — comma is special in make function calls
 comma           := ,
 
 LIMINE_TAG      := v8.x-binary
 LIMINE_REPO     := https://github.com/limine-bootloader/limine.git
+
+# ── Disk image layout ────────────────────────────────────────────────────────
+DISK_IMG        := $(BUILD_DIR)/exo.img
+DISK_SIZE_MB    := 256
+# Partition 1: EFI System (FAT32) — sectors 2048..133119 = 64 MiB
+# 64 MiB ensures >= 65525 clusters for valid FAT32 (UEFI spec compliant)
+EFI_START       := 2048
+EFI_END         := 133119
+EFI_SECTORS     := $(shell echo $$((133119 - 2048 + 1)))
+# Partition 2: Linux root (ext2) — sector 133120 to end of disk
+ROOT_START      := 133120
+
+# Intermediate partition images
+EFI_IMG         := $(BUILD_DIR)/efi.img
+ROOT_IMG        := $(BUILD_DIR)/root.img
+
+# OVMF firmware for UEFI boot
+OVMF_CODE       := /usr/share/edk2/x64/OVMF_CODE.4m.fd
+OVMF_VARS_TMPL  := /usr/share/edk2/x64/OVMF_VARS.4m.fd
+OVMF_VARS       := $(BUILD_DIR)/OVMF_VARS.4m.fd
 
 # ── Toolchain (Clang + LLD — no cross-compiler needed) ──────────────────────
 CC              := clang
@@ -80,12 +100,9 @@ NASM_OBJS := $(patsubst $(SRC_DIR)/%.asm,  $(BUILD_DIR)/obj/%.asm.o,  $(NASM_SRC
 
 ALL_OBJS := $(C_OBJS) $(AS_OBJS) $(NASM_OBJS) $(TRAMPOLINE_OBJ) $(FONT_DATA_OBJ)
 
-DISK_IMG        := $(BUILD_DIR)/disk.img
-DISK_SIZE_MB    := 256
+.PHONY: all clean run run-debug
 
-.PHONY: all clean run run-debug disk
-
-all: $(ISO_IMAGE)
+all: $(DISK_IMG)
 
 # ─── Download & prepare Limine 8 ───────────────────────────────────────
 # Clone the v8.x-binary branch (has prebuilt EFI/BIOS blobs + limine.c)
@@ -143,79 +160,87 @@ $(KERNEL_ELF): $(ALL_OBJS)
 	@echo ">>> Linking kernel..."
 	$(LD) $(LDFLAGS) $(ALL_OBJS) -o $@
 
-# ─── Build ISO ────────────────────────────────────────────────────────────────
-$(ISO_IMAGE): $(KERNEL_ELF) $(LIMINE_DIR)/limine.h
-	@echo ">>> Building ISO..."
-	@mkdir -p $(ISO_DIR)/boot/limine
-	@mkdir -p $(ISO_DIR)/EFI/BOOT
-	@cp $(KERNEL_ELF)                         $(ISO_DIR)/boot/exo.elf
-	@cp src/boot/limine.conf                  $(ISO_DIR)/boot/limine/limine.conf
-	@cp $(LIMINE_DIR)/limine-bios.sys         $(ISO_DIR)/boot/limine/
-	@cp $(LIMINE_DIR)/limine-bios-cd.bin      $(ISO_DIR)/boot/limine/
-	@cp $(LIMINE_DIR)/limine-uefi-cd.bin      $(ISO_DIR)/boot/limine/
-	@cp $(LIMINE_DIR)/BOOTX64.EFI             $(ISO_DIR)/EFI/BOOT/
-	xorriso -as mkisofs                                             \
-	    -b       boot/limine/limine-bios-cd.bin                    \
-	    -no-emul-boot -boot-load-size 4 -boot-info-table           \
-	    --efi-boot boot/limine/limine-uefi-cd.bin                  \
-	    -efi-boot-part --efi-boot-image --protective-msdos-label   \
-	    $(ISO_DIR) -o $(ISO_IMAGE)
-	$(LIMINE_DIR)/limine bios-install $(ISO_IMAGE)
-	@echo ">>> ISO ready: $(ISO_IMAGE)"
+# ─── Build EFI partition image (FAT32 via mtools — no root needed) ────────────
+$(EFI_IMG): $(KERNEL_ELF) $(LIMINE_DIR)/limine.h
+	@echo ">>> Building EFI partition (FAT32)..."
+	dd if=/dev/zero of=$@ bs=512 count=$(EFI_SECTORS) 2>/dev/null
+	mkfs.fat -F 32 -n "EFI" $@ >/dev/null
+	mmd -i $@ ::/EFI ::/EFI/BOOT ::/boot ::/boot/limine
+	mcopy -i $@ $(LIMINE_DIR)/BOOTX64.EFI   ::/EFI/BOOT/BOOTX64.EFI
+	mcopy -i $@ $(KERNEL_ELF)               ::/boot/exo.elf
+	mcopy -i $@ src/boot/limine.conf         ::/boot/limine/limine.conf
+	@echo "    EFI partition ready ($(EFI_SECTORS) sectors)"
 
-# ─── Build GPT disk image with EFI (FAT32) + Linux (ext2) partitions ─────────
-# Requires: sgdisk (gdisk), mkfs.fat (dosfstools), mkfs.ext2 (e2fsprogs),
-#           losetup + partprobe (util-linux, Linux only), udisksctl or
-#           a helper script.  Run as root or via sudo if loop setup requires it.
-disk: $(DISK_IMG)
+# ─── Build root partition image (ext2 via mkfs.ext2 + debugfs — no root) ─────
+$(ROOT_IMG): $(KERNEL_ELF)
+	@echo ">>> Building root partition (ext2)..."
+	$(eval ROOT_SECTORS := $(shell echo $$(($(DISK_SIZE_MB) * 2048 - $(ROOT_START) - 33))))
+	dd if=/dev/zero of=$@ bs=512 count=$(ROOT_SECTORS) 2>/dev/null
+	mkfs.ext2 -q -L "EXOOS_ROOT" -b 4096 $@
+	@# Create standard directory hierarchy inside ext2
+	debugfs -w -R "mkdir dev"  $@ 2>/dev/null || true
+	debugfs -w -R "mkdir tmp"  $@ 2>/dev/null || true
+	debugfs -w -R "mkdir boot" $@ 2>/dev/null || true
+	debugfs -w -R "mkdir proc" $@ 2>/dev/null || true
+	debugfs -w -R "mkdir home" $@ 2>/dev/null || true
+	debugfs -w -R "mkdir etc"  $@ 2>/dev/null || true
+	@echo "    root partition ready ($(ROOT_SECTORS) sectors)"
 
-$(DISK_IMG):
-	@echo ">>> Creating $(DISK_SIZE_MB) MiB GPT disk image..."
-	dd if=/dev/zero of=$(DISK_IMG) bs=1M count=$(DISK_SIZE_MB) status=progress
-	@echo ">>> Partitioning: part1=EFI(FAT32, 32 MiB)  part2=Linux(ext2, rest)"
-	sgdisk -Z $(DISK_IMG)
-	sgdisk -n 1:2048:67583  -t 1:ef00 -c 1:"EFI System"  $(DISK_IMG)
-	sgdisk -n 2:67584:0     -t 2:8300 -c 2:"Linux Data"  $(DISK_IMG)
-	@echo ">>> Formatting partitions via loop device..."
-	@LOOPDEV=$$(sudo losetup --show -fP $(DISK_IMG)); \
-	    sudo mkfs.fat -F 32 -n "EFI" $${LOOPDEV}p1; \
-	    sudo mkfs.ext2 -L "LINUX" $${LOOPDEV}p2; \
-	    sudo losetup -d $${LOOPDEV}
-	@echo ">>> Disk image ready: $(DISK_IMG)"
+# ─── Assemble full GPT disk image ────────────────────────────────────────────
+$(DISK_IMG): $(EFI_IMG) $(ROOT_IMG)
+	@echo ">>> Assembling $(DISK_SIZE_MB) MiB GPT disk image..."
+	dd if=/dev/zero of=$@ bs=1M count=$(DISK_SIZE_MB) 2>/dev/null
+	sgdisk -Z $@ >/dev/null 2>&1
+	sgdisk -n 1:$(EFI_START):$(EFI_END) -t 1:ef00 -c 1:"EFI System"  $@ >/dev/null
+	sgdisk -n 2:$(ROOT_START):0         -t 2:8300 -c 2:"Linux Root"   $@ >/dev/null
+	@# Write partition images into the correct offsets
+	dd if=$(EFI_IMG)  of=$@ bs=512 seek=$(EFI_START)  conv=notrunc 2>/dev/null
+	dd if=$(ROOT_IMG) of=$@ bs=512 seek=$(ROOT_START) conv=notrunc 2>/dev/null
+	@echo ">>> Disk image ready: $@"
 
-# ─── Run in QEMU ─────────────────────────────────────────────────────────────
-run: $(ISO_IMAGE)
-	qemu-system-x86_64                                      \
-	    -cdrom $(ISO_IMAGE)                                 \
-	    -m 2G                                               \
-	    -smp 4                                              \
-	    -serial stdio                                       \
-	    -enable-kvm                                         \
-	    -device virtio-gpu-gl,xres=1920,yres=1080           \
-	    -vga none                                           \
-	    -display sdl,gl=on                                  \
-	    -device nec-usb-xhci,id=xhci                       \
-	    -device usb-kbd,bus=xhci.0                         \
-	    -device usb-mouse,bus=xhci.0                       \
-	    $(if $(wildcard $(DISK_IMG)),-drive file=$(DISK_IMG)$(comma)if=virtio$(comma)format=raw,) \
-		-boot order=d \
+# ─── Copy OVMF_VARS template (writable per-VM copy) ──────────────────────────
+$(OVMF_VARS): $(OVMF_VARS_TMPL)
+	@cp $< $@
+
+# ─── Run in QEMU with UEFI (OVMF) ───────────────────────────────────────────
+run: $(DISK_IMG) $(OVMF_VARS)
+	qemu-system-x86_64                                                  \
+	    -machine q35                                                    \
+	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE)       \
+	    -drive if=pflash,format=raw,file=$(OVMF_VARS)                   \
+	    -drive id=hd0,file=$(DISK_IMG),format=raw,if=none               \
+	    -device virtio-blk-pci,drive=hd0                                \
+	    -m 2G                                                           \
+	    -smp 4                                                          \
+	    -serial stdio                                                   \
+	    -enable-kvm                                                     \
+	    -device virtio-gpu-gl,xres=1920,yres=1080                       \
+	    -vga none                                                       \
+	    -display sdl,gl=on                                              \
+	    -device nec-usb-xhci,id=xhci                                   \
+	    -device usb-kbd,bus=xhci.0                                      \
+	    -device usb-mouse,bus=xhci.0                                    \
 	    -no-reboot
 
-run-debug: $(ISO_IMAGE)
-	qemu-system-x86_64          \
-	    -cdrom $(ISO_IMAGE)     \
-	    -m 512M                 \
-	    -smp 4                  \
-	    -serial stdio           \
-	    -device virtio-gpu-gl   \
-	    -vga none               \
-	    -no-reboot              \
+run-debug: $(DISK_IMG) $(OVMF_VARS)
+	qemu-system-x86_64                                                  \
+	    -machine q35                                                    \
+	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE)       \
+	    -drive if=pflash,format=raw,file=$(OVMF_VARS)                   \
+	    -drive id=hd0,file=$(DISK_IMG),format=raw,if=none               \
+	    -device virtio-blk-pci,drive=hd0                                \
+	    -m 2G                                                           \
+	    -smp 4                                                          \
+	    -serial stdio                                                   \
+	    -device virtio-gpu-gl                                           \
+	    -vga none                                                       \
+	    -no-reboot                                                      \
 	    -s -S
 
 clean:
-	@rm -rf $(BUILD_DIR)/obj $(KERNEL_ELF) $(ISO_IMAGE) \
-	        $(ISO_DIR) $(BUILD_DIR)/limine.h             \
-	        $(FONT_DATA_C) $(FONT_DATA_OBJ) $(DISK_IMG)
+	@rm -rf $(BUILD_DIR)/obj $(KERNEL_ELF) $(DISK_IMG)           \
+	        $(EFI_IMG) $(ROOT_IMG) $(BUILD_DIR)/limine.h         \
+	        $(FONT_DATA_C) $(FONT_DATA_OBJ) $(OVMF_VARS)
 	@echo ">>> Cleaned."
 
 distclean:

@@ -105,41 +105,69 @@ static void storage_init_task(void *arg) {
     ahci_init();
 
     /* Scan each registered block device for GPT partition tables */
+    gpt_partition_t parts[16];
+    int found_parts = 0;
     int n = blkdev_count();
     for (int i = 0; i < n; i++) {
         blkdev_t *dev = blkdev_get_nth(i);
         if (!dev) continue;
-        /* Skip partition blkdevs (they have part_offset set) */
-        if (dev->part_offset) continue;
+        if (dev->part_offset) continue;   /* skip partition blkdevs */
 
         KLOG_INFO("storage-init: scanning %s for GPT\n", dev->name);
-        gpt_partition_t parts[16];
-        int np = gpt_scan(dev, parts, 16);
+        int np = gpt_scan(dev, parts + found_parts, 16 - found_parts);
         if (np <= 0) {
             KLOG_WARN("storage-init: no GPT on %s\n", dev->name);
             continue;
         }
         KLOG_INFO("storage-init: %d partition(s) found on %s\n", np, dev->name);
+        found_parts += np;
     }
 
-    /* Auto-mount: try to find an ext2 partition and mount at /mnt/disk */
-    int total = blkdev_count();
-    for (int i = 0; i < total; i++) {
-        blkdev_t *dev = blkdev_get_nth(i);
-        if (!dev || !dev->part_offset) continue;
-        /* Try ext2 first */
-        int r = vfs_mount("/mnt/disk", dev, "ext2");
-        if (r == 0) {
-            KLOG_INFO("storage-init: ext2 mounted on /mnt/disk from %s\n", dev->name);
-            break;
-        }
-        /* Try FAT32 */
-        r = vfs_mount("/mnt/disk", dev, "fat32");
-        if (r == 0) {
-            KLOG_INFO("storage-init: fat32 mounted on /mnt/disk from %s\n", dev->name);
-            break;
+    /* Mount ext2 partition at / (root filesystem, replaces tmpfs) */
+    bool root_mounted = false;
+    for (int i = 0; i < found_parts; i++) {
+        if (!parts[i].blkdev) continue;
+        if (gpt_guid_equal(&parts[i].type_guid, &GPT_GUID_LINUX_DATA)) {
+            int r = vfs_mount("/", parts[i].blkdev, "ext2");
+            if (r == 0) {
+                KLOG_INFO("storage-init: ext2 root mounted at / from %s\n",
+                          parts[i].blkdev->name);
+                root_mounted = true;
+                break;
+            }
         }
     }
+    if (!root_mounted) {
+        /* Fallback: try every partition as ext2 */
+        for (int i = 0; i < found_parts; i++) {
+            if (!parts[i].blkdev) continue;
+            if (vfs_mount("/", parts[i].blkdev, "ext2") == 0) {
+                KLOG_INFO("storage-init: ext2 root mounted at / from %s (fallback)\n",
+                          parts[i].blkdev->name);
+                root_mounted = true;
+                break;
+            }
+        }
+    }
+    if (!root_mounted)
+        KLOG_WARN("storage-init: no ext2 root filesystem found!\n");
+
+    /* Mount EFI System Partition (FAT32) at /boot */
+    bool boot_mounted = false;
+    for (int i = 0; i < found_parts; i++) {
+        if (!parts[i].blkdev) continue;
+        if (gpt_guid_equal(&parts[i].type_guid, &GPT_GUID_EFI_SYSTEM)) {
+            int r = vfs_mount("/boot", parts[i].blkdev, "fat32");
+            if (r == 0) {
+                KLOG_INFO("storage-init: fat32 (EFI) mounted at /boot from %s\n",
+                          parts[i].blkdev->name);
+                boot_mounted = true;
+                break;
+            }
+        }
+    }
+    if (!boot_mounted)
+        KLOG_WARN("storage-init: no EFI partition found for /boot\n");
 
     KLOG_INFO("storage-init: done\n");
 }
@@ -224,11 +252,12 @@ void kmain(void) {
         KLOG_WARN("vfs: failed to mount tmpfs as root\n");
     else
         KLOG_INFO("vfs: tmpfs mounted as root\n");
-    /* Create standard top-level directories */
+    /* Create standard top-level directories on initial tmpfs root.
+     * storage_init_task will later mount ext2 at / (replacing tmpfs)
+     * and FAT32 at /boot.  The ext2 image has these dirs pre-created. */
     vfs_mkdir("/dev",  0755);
     vfs_mkdir("/tmp",  01777);
-    vfs_mkdir("/mnt",  0755);
-    vfs_mkdir("/mnt/disk", 0755);
+    vfs_mkdir("/boot", 0755);
     vfs_mkdir("/proc", 0555);
     /* Install INT 0x80 syscall gate */
     syscall_init();
