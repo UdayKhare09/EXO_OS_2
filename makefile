@@ -214,9 +214,7 @@ run: $(DISK_IMG) $(OVMF_VARS)
 	    -smp 4                                                          \
 	    -serial stdio                                                   \
 	    -enable-kvm                                                     \
-	    -device virtio-gpu-gl,xres=1920,yres=1080                       \
-	    -vga none                                                       \
-	    -display sdl,gl=on                                              \
+	    -vga std                                                        \
 	    -device nec-usb-xhci,id=xhci                                   \
 	    -device usb-kbd,bus=xhci.0                                      \
 	    -device usb-mouse,bus=xhci.0                                    \
@@ -232,8 +230,7 @@ run-debug: $(DISK_IMG) $(OVMF_VARS)
 	    -m 2G                                                           \
 	    -smp 4                                                          \
 	    -serial stdio                                                   \
-	    -device virtio-gpu-gl                                           \
-	    -vga none                                                       \
+	    -vga std                                                        \
 	    -no-reboot                                                      \
 	    -s -S
 

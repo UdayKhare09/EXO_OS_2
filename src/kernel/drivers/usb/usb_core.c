@@ -271,47 +271,44 @@ void usb_core_init(void) {
 }
 
 /* ─── USB event task (kernel task, runs forever) ─────────────────────────── */
+/* NOTE: this task is spawned AFTER xhci_init() returns successfully, so    */
+/* g_xhci.evt_ring.trbs is guaranteed to be non-NULL on first iteration.    */
 static void usb_event_task(void *arg) {
     (void)arg;
-    /* g_usb_event_task is set by usb_init() before spawning,
-     * so IRQ handlers can unblock us from the first interrupt.             */
     KLOG_INFO("usb: event task started\n");
 
     for (;;) {
-        /* Atomically consume the IRQ-set wakeup token BEFORE processing.
-         * This ordering prevents the lost-wakeup race:
-         *   1. Clear token (any subsequent IRQ will set it again)
-         *   2. Process event ring (drains all current events)
-         *   3. If token is still 0 and nothing pending → safe to block;
-         *      if an IRQ fired between steps 1 and 3 the token is now 1
-         *      so we loop instead of blocking.                            */
+        /* Clear the wakeup token before draining the event ring so we
+         * cannot miss an event that fires during processing.               */
         __atomic_store_n(&g_xhci_ev_pending, 0, __ATOMIC_RELAXED);
 
-        int events = xhci_process_events();
+        xhci_process_events();
         xhci_handle_pending_connects();
 
-        /* Re-check token: non-zero means an IRQ arrived during processing */
-        int tok = __atomic_load_n(&g_xhci_ev_pending, __ATOMIC_ACQUIRE);
-        if (!events && !g_xhci.pending_count && !tok) {
-            sched_block();
-        }
+        /* Poll every 1 ms.  sched_sleep() instead of sched_block() because:
+         * with legacy INTx (no MSI), xhci_irq at vector 0x40 is never
+         * delivered (the IOAPIC is not reprogrammed to route INTA#).
+         * sched_block() would sleep forever; 1 ms polling is imperceptible
+         * for USB HID keyboards/mice.                                      */
+        sched_sleep(1);
     }
 }
 
-/* ─── Top-level init ─────────────────────────────────────────────────────── */
+/* ─── Top-level init ──────────────────────────────────────────────────────── */
 bool usb_init(void) {
     usb_core_init();
-
-    /* Spawn the event task FIRST and record the task pointer so the
-     * IRQ handler (xhci_irq) can unblock it even before the task body
-     * runs.  This also means xhci_submit_cmd's sched_sleep path works
-     * once interrupts are enabled.                                          */
-    g_usb_event_task = sched_spawn("usb-evt", usb_event_task, NULL);
 
     if (!xhci_init()) {
         KLOG_WARN("usb: xHCI init failed — USB not available\n");
         return false;
     }
+
+    /* Spawn the event task AFTER xhci_init() succeeds so that
+     * g_xhci.evt_ring.trbs is valid before the task's first iteration.
+     * The IRQ handler (xhci_irq) stores g_usb_event_task and calls
+     * sched_unblock() — this is safe even if the task hasn't run yet,
+     * because sched_unblock() is a no-op for TASK_RUNNABLE state.        */
+    g_usb_event_task = sched_spawn("usb-evt", usb_event_task, NULL);
 
     KLOG_INFO("usb: stack ready\n");
     return true;

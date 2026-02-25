@@ -69,10 +69,11 @@ int kvsnprintf(char *buf, size_t size, const char *fmt, va_list ap) {
         int width = 0;
         while (*f >= '0' && *f <= '9') width = width * 10 + (*f++ - '0');
 
-        /* Long modifier */
+        /* Long/size modifier */
         int lng = 0;
-        if (*f == 'l') { lng = 1; f++; }
-        if (*f == 'l') { lng = 2; f++; }
+        if (*f == 'z') { lng = (sizeof(size_t) == 8) ? 2 : 1; f++; }
+        else if (*f == 'l') { lng = 1; f++;
+            if (*f == 'l') { lng = 2; f++; } }
 
         switch (*f) {
         case 'c':

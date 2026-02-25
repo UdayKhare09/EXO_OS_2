@@ -1,389 +1,436 @@
-/* gfx/fbcon.c — Instance-based VT100 framebuffer console
+/* gfx/fbcon.c — Limine GOP framebuffer text console
  *
- * Each fbcon_t is a self-contained terminal with its own WM window,
- * cursor position, ANSI parser state, and color attributes.
- * Multiple instances can coexist for multi-terminal desktop.
+ * Renders text directly into the linear framebuffer Limine maps for us at
+ * boot time.  No VirtIO GPU, no compositor, no window manager needed.
+ *
+ * Design notes
+ * ─────────────
+ *  • One global fbcon_t singleton (g_fbcon).  Shell / klog can share it.
+ *  • Colour palette: 16 classic ANSI entries stored as 0xAARRGGBB.
+ *  • ANSI sequences recognised (enough for the shell):
+ *      ESC[0m  ESC[1m  ESC[2J  ESC[H
+ *      ESC[<n>m  (30-37 fg, 40-47 bg, 90-97 bright fg, 100-107 bright bg)
+ *  • Cursor is a single-cell filled block drawn/erased on demand.
  */
+
 #include "fbcon.h"
-#include "wm.h"
-#include "compositor.h"
-#include "font.h"
-#include "gfx.h"
-#include "lib/klog.h"
-#include "mm/kmalloc.h"
+#include "font.h"          /* g_font_atlas, font_get_glyph()  */
+#include "lib/string.h"    /* memset, strlen                  */
+#include "mm/kmalloc.h"    /* kzalloc                         */
+
 #include <stdarg.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <stdbool.h>
-#include "lib/string.h"
 
-/* ── Padding inside the window content surface ────────────────────────────── */
-#define FBCON_PAD_X   4
-#define FBCON_PAD_Y   4
-
-/* ── ANSI colour table (16 colours in ARGB) ─────────────────────────────── */
-static const gfx_color_t g_ansi[16] = {
-    GFX_RGB(  0,  0,  0),   /* 0  black   */
-    GFX_RGB(170,  0,  0),   /* 1  red     */
-    GFX_RGB(  0,170,  0),   /* 2  green   */
-    GFX_RGB(170,170,  0),   /* 3  yellow  */
-    GFX_RGB(  0,  0,170),   /* 4  blue    */
-    GFX_RGB(170,  0,170),   /* 5  magenta */
-    GFX_RGB(  0,170,170),   /* 6  cyan    */
-    GFX_RGB(170,170,170),   /* 7  white   */
-    /* bright */
-    GFX_RGB( 85, 85, 85),
-    GFX_RGB(255, 85, 85),
-    GFX_RGB( 85,255, 85),
-    GFX_RGB(255,255, 85),
-    GFX_RGB( 85, 85,255),
-    GFX_RGB(255, 85,255),
-    GFX_RGB( 85,255,255),
-    GFX_RGB(255,255,255),
+/* ── Colours ─────────────────────────────────────────────────────────────── */
+static const uint32_t g_palette[16] = {
+    /* normal (0-7) */
+    0xFF1A1A2E,  /* 0  Black       */
+    0xFFE06C75,  /* 1  Red         */
+    0xFF98C379,  /* 2  Green       */
+    0xFFE5C07B,  /* 3  Yellow      */
+    0xFF61AFEF,  /* 4  Blue        */
+    0xFFC678DD,  /* 5  Magenta     */
+    0xFF56B6C2,  /* 6  Cyan        */
+    0xFFABB2BF,  /* 7  White       */
+    /* bright (8-15) */
+    0xFF282C34,  /* 8  Bright Black  */
+    0xFFBE5046,  /* 9  Bright Red    */
+    0xFF7A9F60,  /* 10 Bright Green  */
+    0xFFD19A66,  /* 11 Bright Yellow */
+    0xFF528BFF,  /* 12 Bright Blue   */
+    0xFFA9A1E1,  /* 13 Bright Magenta*/
+    0xFF2BBAC5,  /* 14 Bright Cyan   */
+    0xFFFFFFFF,  /* 15 Bright White  */
 };
-#define DEFAULT_FG  7
-#define DEFAULT_BG  0
+#define COL_BG_DEFAULT    g_palette[0]   /* dark navy background */
+#define COL_FG_DEFAULT    g_palette[7]   /* soft white           */
 
-/* ── Parser state ────────────────────────────────────────────────────────── */
+/* ── ANSI parser state ───────────────────────────────────────────────────── */
 typedef enum {
-    PS_NORMAL,
-    PS_ESC,
-    PS_CSI,
-    PS_CSI_PARAM,
-} parse_state_t;
+    ANSI_NORMAL,
+    ANSI_ESC,
+    ANSI_CSI,
+} ansi_state_t;
 
-/* ── Console instance ────────────────────────────────────────────────────── */
+/* ── Console struct ──────────────────────────────────────────────────────── */
+#define MAX_CSI_PARAMS 8
+
 struct fbcon {
-    gfx_window_t *win;
-    int           cols, rows;
-    int           cw, ch;         /* cell width/height */
-    int           cx, cy;         /* cursor col/row    */
-    uint8_t       fg, bg;
-    bool          bold;
-    parse_state_t ps;
-    int           csi_params[8];
-    int           csi_n;
-    int           csi_cur;
+    /* Framebuffer */
+    uint32_t *fb;
+    uint32_t  fb_w, fb_h, fb_pitch_u32;   /* pitch in uint32_t units */
+
+    /* Font metrics */
+    int cw, ch;        /* cell width / height in px */
+
+    /* Grid dimensions */
+    int cols, rows;
+
+    /* Cursor position (in character cells) */
+    int col, row;
+
+    /* Current colours */
+    uint32_t fg, bg;
+    bool bold;
+
+    /* Cursor visibility */
+    bool cursor_visible;
+    bool cursor_drawn;
+
+    /* ANSI parser */
+    ansi_state_t ansi;
+    int  csi_params[MAX_CSI_PARAMS];
+    int  csi_nparams;
 };
 
-/* ── Helpers ──────────────────────────────────────────────────────────────── */
-static inline gfx_surface_t *surf(fbcon_t *c) {
-    return c->win ? c->win->surface : NULL;
+static fbcon_t g_fbcon_storage;
+static fbcon_t *g_fbcon = NULL;
+
+/* ── Low-level pixel helpers ─────────────────────────────────────────────── */
+
+static inline void put_pixel(fbcon_t *c, int x, int y, uint32_t colour) {
+    if ((unsigned)x >= c->fb_w || (unsigned)y >= c->fb_h) return;
+    c->fb[y * c->fb_pitch_u32 + x] = colour;
 }
 
-static void cell_clear(fbcon_t *c, int col, int row) {
-    gfx_surface_t *s = surf(c); if (!s) return;
-    int px = FBCON_PAD_X + col * c->cw;
-    int py = FBCON_PAD_Y + row * c->ch;
-    gfx_fill_rect(s, (gfx_rect_t){px, py, c->cw, c->ch}, g_ansi[c->bg]);
+/* Fill a rect with a solid colour */
+static void fill_rect(fbcon_t *c, int x, int y, int w, int h, uint32_t col) {
+    for (int dy = 0; dy < h; dy++)
+        for (int dx = 0; dx < w; dx++)
+            put_pixel(c, x + dx, y + dy, col);
 }
 
-static void cell_put(fbcon_t *c, int col, int row, char ch) {
-    gfx_surface_t *s = surf(c); if (!s) return;
-    int px = FBCON_PAD_X + col * c->cw;
-    int py = FBCON_PAD_Y + row * c->ch;
-    gfx_fill_rect(s, (gfx_rect_t){px, py, c->cw, c->ch}, g_ansi[c->bg]);
-    gfx_color_t fg = g_ansi[c->bold ? (c->fg | 8) : c->fg];
-    gfx_draw_glyph(s, px, py, (uint8_t)ch, fg, GFX_TRANSPARENT);
-}
+/* Draw one character cell at pixel (px, py) with the given glyph bitmap */
+static void draw_glyph(fbcon_t *c, int px, int py, char ch, uint32_t fg, uint32_t bg) {
+    const uint8_t *bmp = font_get_glyph((unsigned char)ch);
 
-static void dirty_row(fbcon_t *c, int row) {
-    if (!c->win) return;
-    gfx_rect_t r = {
-        c->win->frame.x + WM_BORDER + FBCON_PAD_X,
-        c->win->frame.y + WM_BORDER + WM_TITLE_H + FBCON_PAD_Y + row * c->ch,
-        c->cols * c->cw,
-        c->ch
-    };
-    compositor_dirty(r);
-}
+    /* Background fill */
+    fill_rect(c, px, py, c->cw, c->ch, bg);
 
-static void scroll_up(fbcon_t *c) {
-    gfx_surface_t *s = surf(c); if (!s) return;
-    int row_bytes = c->cols * c->cw;
-    int total_h   = c->rows * c->ch;
-    for (int py = FBCON_PAD_Y; py < FBCON_PAD_Y + total_h - c->ch; py++) {
-        gfx_color_t *dst_row = s->pixels + py            * s->stride + FBCON_PAD_X;
-        gfx_color_t *src_row = s->pixels + (py + c->ch) * s->stride + FBCON_PAD_X;
-        memcpy(dst_row, src_row, (size_t)(row_bytes * sizeof(gfx_color_t)));
-    }
-    for (int py = FBCON_PAD_Y + total_h - c->ch; py < FBCON_PAD_Y + total_h; py++) {
-        gfx_color_t *row = s->pixels + py * s->stride + FBCON_PAD_X;
-        for (int i = 0; i < row_bytes; i++) row[i] = g_ansi[DEFAULT_BG];
-    }
-    compositor_dirty(c->win->frame);
-}
+    if (!bmp) return;
 
-static void newline(fbcon_t *c) {
-    c->cx = 0;
-    c->cy++;
-    if (c->cy >= c->rows) {
-        scroll_up(c);
-        c->cy = c->rows - 1;
-    }
-}
-
-static void clear_screen(fbcon_t *c) {
-    gfx_surface_t *s = surf(c); if (!s) return;
-    gfx_fill_rect(s, (gfx_rect_t){0, 0, s->w, s->h}, g_ansi[DEFAULT_BG]);
-    c->cx = c->cy = 0;
-    compositor_dirty(c->win->frame);
-}
-
-static void clear_eol(fbcon_t *c) {
-    for (int col = c->cx; col < c->cols; col++) cell_clear(c, col, c->cy);
-    dirty_row(c, c->cy);
-}
-
-/* ── CSI dispatch ─────────────────────────────────────────────────────────── */
-static void csi_dispatch(fbcon_t *c, char cmd) {
-    int p0 = (c->csi_n > 0) ? c->csi_params[0] : 0;
-    int p1 = (c->csi_n > 1) ? c->csi_params[1] : 0;
-    switch (cmd) {
-    case 'A': c->cy -= (p0 ? p0 : 1); if (c->cy < 0) c->cy = 0; break;
-    case 'B': c->cy += (p0 ? p0 : 1); if (c->cy >= c->rows) c->cy = c->rows-1; break;
-    case 'C': c->cx += (p0 ? p0 : 1); if (c->cx >= c->cols) c->cx = c->cols-1; break;
-    case 'D': c->cx -= (p0 ? p0 : 1); if (c->cx < 0) c->cx = 0; break;
-    case 'H': case 'f':
-        c->cy = (p0 ? p0 - 1 : 0); if (c->cy >= c->rows) c->cy = c->rows-1;
-        c->cx = (p1 ? p1 - 1 : 0); if (c->cx >= c->cols) c->cx = c->cols-1;
-        break;
-    case 'J':
-        if (p0 == 2 || p0 == 0) clear_screen(c);
-        break;
-    case 'K':
-        clear_eol(c);
-        break;
-    case 'm':
-        for (int i = 0; i <= c->csi_n; i++) {
-            int v = (i < c->csi_n) ? c->csi_params[i] : c->csi_cur;
-            if (v == 0)  { c->fg = DEFAULT_FG; c->bg = DEFAULT_BG; c->bold = false; }
-            else if (v == 1) c->bold = true;
-            else if (v == 22) c->bold = false;
-            else if (v >= 30 && v <= 37) c->fg = (uint8_t)(v - 30);
-            else if (v == 39)            c->fg = DEFAULT_FG;
-            else if (v >= 40 && v <= 47) c->bg = (uint8_t)(v - 40);
-            else if (v == 49)            c->bg = DEFAULT_BG;
-            else if (v >= 90 && v <= 97) c->fg = (uint8_t)(v - 90 + 8);
-            else if (v >= 100&&v <=107)  c->bg = (uint8_t)(v - 100 + 8);
-        }
-        break;
-    default: break;
-    }
-}
-
-/* ── Public: create instance ──────────────────────────────────────────────── */
-fbcon_t *fbcon_create(const char *title, int x, int y, int w, int h) {
-    const gfx_font_atlas_t *a = &g_font_atlas;
-    fbcon_t *c = kzalloc(sizeof(*c));
-    if (!c) return NULL;
-
-    c->cw = a->cell_w;
-    c->ch = a->cell_h;
-
-    if (w <= 0 || h <= 0) {
-        gfx_surface_t *screen = compositor_screen();
-        int sw = screen ? screen->w : 1280;
-        int sh = screen ? screen->h : 720;
-        w = sw * 3 / 5;
-        h = sh * 2 / 3;
-    }
-
-    /* Calculate cols/rows from content area minus padding */
-    c->cols = (w - 2 * FBCON_PAD_X) / c->cw;
-    c->rows = (h - 2 * FBCON_PAD_Y) / c->ch;
-    if (c->cols < 20) c->cols = 20;
-    if (c->rows < 5) c->rows = 5;
-
-    int win_w = c->cols * c->cw + 2 * FBCON_PAD_X;
-    int win_h = c->rows * c->ch + 2 * FBCON_PAD_Y;
-
-    c->win = wm_create(title, x, y, win_w, win_h);
-    if (!c->win) {
-        kfree(c);
-        return NULL;
-    }
-    c->win->userdata = c;
-    gfx_fill_rect(c->win->surface,
-                  (gfx_rect_t){0, 0, c->win->surface->w, c->win->surface->h},
-                  g_ansi[DEFAULT_BG]);
-
-    c->fg   = DEFAULT_FG;
-    c->bg   = DEFAULT_BG;
-    c->bold = false;
-    c->ps   = PS_NORMAL;
-
-    KLOG_INFO("fbcon: '%s' %dx%d cols/rows, cell %dx%d\n",
-              title, c->cols, c->rows, c->cw, c->ch);
-    return c;
-}
-
-void fbcon_destroy(fbcon_t *c) {
-    if (!c) return;
-    if (c->win) wm_destroy(c->win);
-    kfree(c);
-}
-
-struct gfx_window *fbcon_get_window(fbcon_t *c) { return c ? c->win : NULL; }
-int fbcon_get_cols(fbcon_t *c) { return c ? c->cols : 0; }
-int fbcon_get_rows(fbcon_t *c) { return c ? c->rows : 0; }
-
-/* ── Resize callback ──────────────────────────────────────────────────────── */
-void fbcon_on_resize(fbcon_t *c, int new_w, int new_h) {
-    if (!c) return;
-    c->cols = (new_w - 2 * FBCON_PAD_X) / c->cw;
-    c->rows = (new_h - 2 * FBCON_PAD_Y) / c->ch;
-    if (c->cols < 10) c->cols = 10;
-    if (c->rows < 3)  c->rows = 3;
-    if (c->cx >= c->cols) c->cx = c->cols - 1;
-    if (c->cy >= c->rows) c->cy = c->rows - 1;
-}
-
-/* ── Character output ─────────────────────────────────────────────────────── */
-void fbcon_putchar_inst(fbcon_t *c, char ch) {
-    if (!c || !c->win) return;
-
-    switch (c->ps) {
-    case PS_NORMAL:
-        if (ch == 0x1B) { c->ps = PS_ESC; return; }
-        if (ch == '\r') { c->cx = 0; return; }
-        if (ch == '\n') { newline(c); dirty_row(c, c->cy); compositor_compose(); return; }
-        if (ch == '\t') {
-            int next = (c->cx + 8) & ~7;
-            while (c->cx < next && c->cx < c->cols) { cell_put(c, c->cx, c->cy, ' '); c->cx++; }
-            dirty_row(c, c->cy); return;
-        }
-        if (ch == '\b') {
-            if (c->cx > 0) { c->cx--; cell_clear(c, c->cx, c->cy); dirty_row(c, c->cy); }
-            return;
-        }
-        if ((uint8_t)ch < 0x20) return;
-        cell_put(c, c->cx, c->cy, ch);
-        dirty_row(c, c->cy);
-        c->cx++;
-        if (c->cx >= c->cols) newline(c);
-        compositor_compose();
-        return;
-
-    case PS_ESC:
-        if (ch == '[') { c->ps = PS_CSI; c->csi_n = 0; c->csi_cur = 0; return; }
-        c->ps = PS_NORMAL;
-        return;
-
-    case PS_CSI:
-    case PS_CSI_PARAM:
-        if (ch >= '0' && ch <= '9') {
-            c->csi_cur = c->csi_cur * 10 + (ch - '0');
-            c->ps = PS_CSI_PARAM;
-            return;
-        }
-        if (ch == ';') {
-            if (c->csi_n < 8) c->csi_params[c->csi_n++] = c->csi_cur;
-            c->csi_cur = 0;
-            return;
-        }
-        if (c->csi_n < 8) c->csi_params[c->csi_n] = c->csi_cur;
-        csi_dispatch(c, ch);
-        c->ps = PS_NORMAL;
-        compositor_compose();
-        return;
-    }
-}
-
-void fbcon_puts_inst(fbcon_t *c, const char *s) {
-    while (*s) fbcon_putchar_inst(c, *s++);
-}
-
-/* Minimal vsnprintf for fbcon_printf (no FPU, no libc) */
-static int fbcon_vsnprintf(char *buf, size_t cap, const char *fmt, va_list ap) {
-    size_t i = 0;
-#define FPUT(ch) do { if (i < cap - 1) buf[i++] = (ch); } while(0)
-    while (*fmt) {
-        if (*fmt != '%') { FPUT(*fmt++); continue; }
-        fmt++;
-        /* skip length modifiers */
-        while (*fmt == 'l' || *fmt == 'h' || *fmt == 'z') fmt++;
-        switch (*fmt++) {
-        case 's': { const char *s = va_arg(ap, const char *); if (!s) s="(null)"; while (*s) FPUT(*s++); break; }
-        case 'c': FPUT((char)va_arg(ap, int)); break;
-        case 'd': {
-            int64_t v = va_arg(ap, int64_t);
-            char tmp[24]; int n = 0;
-            if (v < 0) { FPUT('-'); v = -v; }
-            if (v == 0) { FPUT('0'); break; }
-            while (v) { tmp[n++] = '0' + (int)(v % 10); v /= 10; }
-            while (n > 0) FPUT(tmp[--n]); break; }
-        case 'u': {
-            uint64_t v = va_arg(ap, uint64_t);
-            char tmp[24]; int n = 0;
-            if (v == 0) { FPUT('0'); break; }
-            while (v) { tmp[n++] = '0' + (int)(v % 10); v /= 10; }
-            while (n > 0) FPUT(tmp[--n]); break; }
-        case 'x': {
-            uint64_t v = va_arg(ap, uint64_t);
-            char tmp[18]; int n = 0;
-            const char *h = "0123456789abcdef";
-            if (v == 0) { FPUT('0'); break; }
-            while (v) { tmp[n++] = h[v & 0xF]; v >>= 4; }
-            while (n > 0) FPUT(tmp[--n]); break; }
-        case '%': FPUT('%'); break;
-        default: FPUT('?'); break;
+    /* Blend each pixel using the alpha coverage byte from the atlas */
+    for (int gy = 0; gy < c->ch; gy++) {
+        for (int gx = 0; gx < c->cw; gx++) {
+            uint8_t a = bmp[gy * c->cw + gx];
+            if (a == 0) continue;
+            if (a == 255) {
+                put_pixel(c, px + gx, py + gy, fg);
+            } else {
+                /* Simple alpha blend: out = fg*a/255 + bg*(255-a)/255 */
+                uint32_t fa = a, ba = 255 - a;
+                uint8_t r = (uint8_t)(((fg >> 16 & 0xFF) * fa + (bg >> 16 & 0xFF) * ba) / 255);
+                uint8_t g_ = (uint8_t)(((fg >>  8 & 0xFF) * fa + (bg >>  8 & 0xFF) * ba) / 255);
+                uint8_t b_ = (uint8_t)(((fg       & 0xFF) * fa + (bg       & 0xFF) * ba) / 255);
+                put_pixel(c, px + gx, py + gy, 0xFF000000 | (r << 16) | (g_ << 8) | b_);
+            }
         }
     }
-    buf[i] = '\0';
-#undef FPUT
-    return (int)i;
 }
 
-static char g_fmtbuf[1024];
-void fbcon_printf_inst(fbcon_t *c, const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    fbcon_vsnprintf(g_fmtbuf, sizeof(g_fmtbuf), fmt, ap);
-    va_end(ap);
-    fbcon_puts_inst(c, g_fmtbuf);
+/* ── Cursor ──────────────────────────────────────────────────────────────── */
+
+static void cursor_erase(fbcon_t *c) {
+    if (!c->cursor_drawn) return;
+    int px = c->col * c->cw;
+    int py = c->row * c->ch;
+    fill_rect(c, px, py, c->cw, c->ch, c->bg);
+    c->cursor_drawn = false;
 }
 
-/* ── Text cursor ──────────────────────────────────────────────────────────── */
+static void cursor_draw(fbcon_t *c) {
+    if (c->cursor_drawn) return;
+    if (!c->cursor_visible) return;
+    int px = c->col * c->cw;
+    int py = c->row * c->ch;
+    /* Draw a filled block in fg colour */
+    fill_rect(c, px, py, c->cw, c->ch, c->fg);
+    c->cursor_drawn = true;
+}
+
 void fbcon_show_cursor_inst(fbcon_t *c) {
-    gfx_surface_t *s = surf(c);
-    if (!s || !c->win) return;
-    int px = FBCON_PAD_X + c->cx * c->cw;
-    int py = FBCON_PAD_Y + c->cy * c->ch + c->ch - 3;
-    gfx_fill_rect(s, (gfx_rect_t){px, py, c->cw, 2}, GFX_WHITE);
-    dirty_row(c, c->cy);
-    compositor_compose();
+    if (!c) return;
+    c->cursor_visible = true;
+    cursor_draw(c);
 }
 
 void fbcon_hide_cursor_inst(fbcon_t *c) {
-    cell_clear(c, c->cx, c->cy);
-    dirty_row(c, c->cy);
+    if (!c) return;
+    c->cursor_visible = false;
+    cursor_erase(c);
 }
 
-/* ── Legacy single-instance wrapper ───────────────────────────────────────── */
-static fbcon_t *g_legacy = NULL;
-
-void fbcon_init(void) {
-    gfx_surface_t *screen = compositor_screen();
-    int sw = screen ? screen->w : 1280;
-    int sh = screen ? screen->h : 720;
-    int w  = sw * 3 / 5;
-    int h  = sh * 2 / 3;
-    g_legacy = fbcon_create("Terminal", 10, 10, w, h);
-    if (g_legacy)
-        compositor_compose();
+void fbcon_tick(fbcon_t *c) {
+    if (!c || !c->cursor_visible) return;
+    if (c->cursor_drawn) cursor_erase(c);
+    else                 cursor_draw(c);
 }
 
-void fbcon_putchar(char c)                    { fbcon_putchar_inst(g_legacy, c); }
-void fbcon_puts(const char *s)                { fbcon_puts_inst(g_legacy, s); }
-void fbcon_printf(const char *fmt, ...)       {
+/* ── Scrolling ───────────────────────────────────────────────────────────── */
+static void scroll_up(fbcon_t *c) {
+    /* Blit rows 1..rows-1 up by one */
+    uint32_t row_pixels = (uint32_t)c->ch * c->fb_pitch_u32;
+    uint32_t total      = (uint32_t)(c->rows - 1) * row_pixels;
+
+    uint32_t *dst = c->fb;
+    uint32_t *src = c->fb + row_pixels;
+
+    for (uint32_t i = 0; i < total; i++)
+        dst[i] = src[i];
+
+    /* Clear the last row */
+    fill_rect(c, 0, (c->rows - 1) * c->ch, c->fb_w, c->ch, c->bg);
+}
+
+/* ── Newline / carriage-return ───────────────────────────────────────────── */
+static void newline(fbcon_t *c) {
+    c->col = 0;
+    c->row++;
+    if (c->row >= c->rows) {
+        scroll_up(c);
+        c->row = c->rows - 1;
+    }
+}
+
+/* ── ANSI CSI dispatch ───────────────────────────────────────────────────── */
+static void apply_sgr(fbcon_t *c) {
+    for (int i = 0; i < c->csi_nparams; i++) {
+        int p = c->csi_params[i];
+        if (p == 0) {
+            c->fg = COL_FG_DEFAULT; c->bg = COL_BG_DEFAULT; c->bold = false;
+        } else if (p == 1) {
+            c->bold = true;
+        } else if (p == 2) {
+            c->bold = false;
+        } else if (p >= 30 && p <= 37) {
+            c->fg = g_palette[(p - 30) + (c->bold ? 8 : 0)];
+        } else if (p >= 40 && p <= 47) {
+            c->bg = g_palette[p - 40];
+        } else if (p >= 90 && p <= 97) {
+            c->fg = g_palette[(p - 90) + 8];
+        } else if (p >= 100 && p <= 107) {
+            c->bg = g_palette[(p - 100) + 8];
+        }
+    }
+}
+
+static void csi_dispatch(fbcon_t *c, char cmd) {
+    switch (cmd) {
+    case 'm':
+        if (c->csi_nparams == 0) {
+            c->csi_params[0] = 0; c->csi_nparams = 1;
+        }
+        apply_sgr(c);
+        break;
+    case 'J':
+        /* ESC[2J: clear screen */
+        fill_rect(c, 0, 0, (int)c->fb_w, (int)c->fb_h, c->bg);
+        break;
+    case 'H':
+        /* ESC[H or ESC[row;colH: move cursor */
+        c->row = (c->csi_nparams > 0 && c->csi_params[0] > 0) ? c->csi_params[0] - 1 : 0;
+        c->col = (c->csi_nparams > 1 && c->csi_params[1] > 0) ? c->csi_params[1] - 1 : 0;
+        if (c->row >= c->rows) c->row = c->rows - 1;
+        if (c->col >= c->cols) c->col = c->cols - 1;
+        break;
+    default:
+        break;
+    }
+}
+
+/* ── Core character emit ─────────────────────────────────────────────────── */
+static void emit_char(fbcon_t *c, char ch) {
+    switch (c->ansi) {
+
+    case ANSI_NORMAL:
+        if (ch == '\033') { c->ansi = ANSI_ESC; return; }
+        if (ch == '\r') { c->col = 0; return; }
+        if (ch == '\n') { newline(c); return; }
+        if (ch == '\b') {
+            if (c->col > 0) {
+                c->col--;
+                int px = c->col * c->cw, py = c->row * c->ch;
+                fill_rect(c, px, py, c->cw, c->ch, c->bg);
+            }
+            return;
+        }
+        if (ch == '\t') {
+            int next = (c->col + 8) & ~7;
+            if (next >= c->cols) next = c->cols - 1;
+            while (c->col < next) {
+                int px = c->col * c->cw, py = c->row * c->ch;
+                fill_rect(c, px, py, c->cw, c->ch, c->bg);
+                c->col++;
+            }
+            return;
+        }
+        /* Printable */
+        {
+            int px = c->col * c->cw, py = c->row * c->ch;
+            draw_glyph(c, px, py, ch, c->fg, c->bg);
+            c->col++;
+            if (c->col >= c->cols) newline(c);
+        }
+        return;
+
+    case ANSI_ESC:
+        if (ch == '[') {
+            c->ansi = ANSI_CSI;
+            for (int i = 0; i < MAX_CSI_PARAMS; i++) c->csi_params[i] = 0;
+            c->csi_nparams = 0;
+        } else {
+            c->ansi = ANSI_NORMAL;
+        }
+        return;
+
+    case ANSI_CSI:
+        if (ch >= '0' && ch <= '9') {
+            if (c->csi_nparams == 0) c->csi_nparams = 1;
+            c->csi_params[c->csi_nparams - 1] =
+                c->csi_params[c->csi_nparams - 1] * 10 + (ch - '0');
+        } else if (ch == ';') {
+            if (c->csi_nparams < MAX_CSI_PARAMS) {
+                c->csi_nparams++;
+                c->csi_params[c->csi_nparams - 1] = 0;
+            }
+        } else {
+            csi_dispatch(c, ch);
+            c->ansi = ANSI_NORMAL;
+        }
+        return;
+    }
+}
+
+/* ── Public API ──────────────────────────────────────────────────────────── */
+
+void fbcon_init(const fbcon_fb_t *fb) {
+    fbcon_t *c = &g_fbcon_storage;
+    c->fb          = fb->fb;
+    c->fb_w        = fb->width;
+    c->fb_h        = fb->height;
+    c->fb_pitch_u32 = fb->pitch / 4;
+
+    c->cw = g_font_atlas.cell_w;
+    c->ch = g_font_atlas.cell_h;
+
+    c->cols = (int)(fb->width  / (uint32_t)c->cw);
+    c->rows = (int)(fb->height / (uint32_t)c->ch);
+
+    c->col = 0; c->row = 0;
+    c->fg  = COL_FG_DEFAULT;
+    c->bg  = COL_BG_DEFAULT;
+    c->bold = false;
+
+    c->cursor_visible = false;
+    c->cursor_drawn   = false;
+    c->ansi           = ANSI_NORMAL;
+
+    /* Clear screen */
+    fill_rect(c, 0, 0, (int)c->fb_w, (int)c->fb_h, c->bg);
+
+    g_fbcon = c;
+}
+
+fbcon_t *fbcon_get(void) { return g_fbcon; }
+
+void fbcon_putchar_inst(fbcon_t *c, char ch) {
+    if (!c) return;
+    bool was_drawn = c->cursor_drawn;
+    if (was_drawn) cursor_erase(c);
+    emit_char(c, ch);
+    if (was_drawn) cursor_draw(c);
+}
+
+void fbcon_puts_inst(fbcon_t *c, const char *s) {
+    if (!c || !s) return;
+    bool was_drawn = c->cursor_drawn;
+    if (was_drawn) cursor_erase(c);
+    while (*s) emit_char(c, *s++);
+    if (was_drawn) cursor_draw(c);
+}
+
+/* ── Minimal printf ──────────────────────────────────────────────────────── */
+
+static void puts_n(fbcon_t *c, const char *s, int n) {
+    for (int i = 0; i < n && s[i]; i++) emit_char(c, s[i]);
+}
+
+static void put_uint(fbcon_t *c, unsigned long long v, int base, bool upper) {
+    const char *digs = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+    char buf[64];
+    int  len = 0;
+    if (v == 0) { emit_char(c, '0'); return; }
+    while (v) { buf[len++] = digs[v % (unsigned)base]; v /= (unsigned)base; }
+    for (int i = len - 1; i >= 0; i--) emit_char(c, buf[i]);
+}
+
+void fbcon_printf_inst(fbcon_t *c, const char *fmt, ...) {
+    if (!c || !fmt) return;
     va_list ap;
     va_start(ap, fmt);
-    fbcon_vsnprintf(g_fmtbuf, sizeof(g_fmtbuf), fmt, ap);
-    va_end(ap);
-    fbcon_puts_inst(g_legacy, g_fmtbuf);
-}
-void fbcon_show_cursor(void)                  { fbcon_show_cursor_inst(g_legacy); }
-void fbcon_hide_cursor(void)                  { fbcon_hide_cursor_inst(g_legacy); }
 
-static void fbcon_klog_write(const char *msg) { fbcon_puts_inst(g_legacy, msg); }
-void fbcon_takeover_klog(void)                { klog_set_write_fn(fbcon_klog_write); }
+    bool was_drawn = c->cursor_drawn;
+    if (was_drawn) cursor_erase(c);
+
+    while (*fmt) {
+        if (*fmt != '%') { emit_char(c, *fmt++); continue; }
+        fmt++; /* skip '%' */
+
+        /* Flags / width (minimal) */
+        bool alt   = false;
+        int  width = 0;
+        if (*fmt == '#') { alt = true; fmt++; }
+        if (*fmt == '0') { fmt++; }   /* zero-padding: recorded but not yet implemented */
+        while (*fmt >= '1' && *fmt <= '9') { width = width * 10 + (*fmt++ - '0'); }
+
+        /* Length modifier */
+        bool is_long  = false;
+        bool is_llong = false;
+        if (*fmt == 'l') { is_long = true;  fmt++;
+            if (*fmt == 'l') { is_llong = true; fmt++; } }
+        else if (*fmt == 'z') { is_llong = (sizeof(size_t) == 8); fmt++; }
+
+        char spec = *fmt++;
+        switch (spec) {
+        case 'c': emit_char(c, (char)va_arg(ap, int)); break;
+        case 's': { const char *s = va_arg(ap, const char *); if (!s) s = "(null)";
+                    puts_n(c, s, 65536); break; }
+        case 'd': case 'i': {
+            long long v;
+            if (is_llong) v = va_arg(ap, long long);
+            else if (is_long) v = va_arg(ap, long);
+            else v = va_arg(ap, int);
+            if (v < 0) { emit_char(c, '-'); v = -v; }
+            put_uint(c, (unsigned long long)v, 10, false);
+            break; }
+        case 'u': {
+            unsigned long long v;
+            if (is_llong) v = va_arg(ap, unsigned long long);
+            else if (is_long) v = va_arg(ap, unsigned long);
+            else v = va_arg(ap, unsigned int);
+            put_uint(c, v, 10, false);
+            break; }
+        case 'x': case 'X': {
+            unsigned long long v;
+            if (is_llong) v = va_arg(ap, unsigned long long);
+            else if (is_long) v = va_arg(ap, unsigned long);
+            else v = va_arg(ap, unsigned int);
+            if (alt) { emit_char(c, '0'); emit_char(c, spec == 'X' ? 'X' : 'x'); }
+            put_uint(c, v, 16, spec == 'X');
+            break; }
+        case 'p': {
+            uintptr_t v = (uintptr_t)va_arg(ap, void *);
+            emit_char(c, '0'); emit_char(c, 'x');
+            put_uint(c, (unsigned long long)v, 16, false);
+            break; }
+        case '%': emit_char(c, '%'); break;
+        default:  emit_char(c, '%'); emit_char(c, spec); break;
+        }
+        (void)width; /* width formatting not implemented; avoid warning */
+    }
+
+    if (was_drawn) cursor_draw(c);
+    va_end(ap);
+}

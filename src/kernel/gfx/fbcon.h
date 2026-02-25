@@ -1,47 +1,49 @@
-/* gfx/fbcon.h — Instance-based framebuffer console (VT100 terminal window)
+/* gfx/fbcon.h — Limine GOP framebuffer text console
  *
- * Each fbcon_t owns its own WM window, cursor state, and ANSI parser.
- * Multiple terminals can coexist simultaneously.
+ * A simple, self-contained terminal that renders directly into the Limine
+ * linear framebuffer that the bootloader hands us.  No VirtIO GPU, no
+ * compositor — just pixels.
+ *
+ * Features
+ *   • Pre-rasterised font via the existing g_font_atlas (gfx/font.h)
+ *   • Scrolling, wrap, backspace, \n / \r
+ *   • ANSI colour escape sequences (foreground, background, bold, reset)
+ *   • Blinking text cursor (toggled by fbcon_tick)
+ *   • printf-style fbcon_printf_inst
+ *
+ * Only one instance is ever created (g_fbcon), initialised early in kmain.
  */
 #pragma once
 #include <stdint.h>
+#include <stddef.h>
 #include <stdbool.h>
 
-/* Opaque console instance */
+/* ── Framebuffer descriptor passed in from Limine ───────────────────────── */
+typedef struct {
+    uint32_t *fb;       /* HHDM-mapped linear framebuffer                   */
+    uint32_t  width;    /* horizontal pixels                                 */
+    uint32_t  height;   /* vertical pixels                                   */
+    uint32_t  pitch;    /* bytes per row  (may be > width*4 due to padding)  */
+} fbcon_fb_t;
+
+/* ── Console instance ───────────────────────────────────────────────────── */
 typedef struct fbcon fbcon_t;
 
-/* Create a new terminal window at (x,y) with given content width/height.
- * Pass 0,0 for w,h to auto-size based on screen. */
-fbcon_t *fbcon_create(const char *title, int x, int y, int w, int h);
+/* Initialise the global console from a Limine framebuffer.
+ * Must be called once, before any fbcon_puts_inst / fbcon_printf_inst.  */
+void fbcon_init(const fbcon_fb_t *fb);
 
-/* Destroy a terminal instance */
-void fbcon_destroy(fbcon_t *con);
+/* Return the global singleton (NULL before fbcon_init) */
+fbcon_t *fbcon_get(void);
 
-/* Character / string output */
-void fbcon_putchar_inst(fbcon_t *con, char c);
-void fbcon_puts_inst(fbcon_t *con, const char *s);
-void fbcon_printf_inst(fbcon_t *con, const char *fmt, ...);
+/* ── Output primitives ──────────────────────────────────────────────────── */
+void fbcon_putchar_inst (fbcon_t *c, char ch);
+void fbcon_puts_inst    (fbcon_t *c, const char *s);
+void fbcon_printf_inst  (fbcon_t *c, const char *fmt, ...);
 
-/* Text cursor (2-px underline) */
-void fbcon_show_cursor_inst(fbcon_t *con);
-void fbcon_hide_cursor_inst(fbcon_t *con);
+/* ── Cursor control ─────────────────────────────────────────────────────── */
+void fbcon_show_cursor_inst(fbcon_t *c);
+void fbcon_hide_cursor_inst(fbcon_t *c);
 
-/* Get the underlying WM window */
-struct gfx_window;
-struct gfx_window *fbcon_get_window(fbcon_t *con);
-
-/* Get columns/rows */
-int fbcon_get_cols(fbcon_t *con);
-int fbcon_get_rows(fbcon_t *con);
-
-/* Resize callback — called by WM when window is resized */
-void fbcon_on_resize(fbcon_t *con, int new_w, int new_h);
-
-/* ── Legacy single-instance API (used by main.c init) ────────────────────── */
-void fbcon_init(void);
-void fbcon_putchar(char c);
-void fbcon_puts(const char *s);
-void fbcon_printf(const char *fmt, ...);
-void fbcon_show_cursor(void);
-void fbcon_hide_cursor(void);
-void fbcon_takeover_klog(void);
+/* Blink tick — call from a periodic timer / scheduler task at ~2 Hz */
+void fbcon_tick(fbcon_t *c);

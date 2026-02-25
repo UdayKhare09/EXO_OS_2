@@ -6,20 +6,23 @@
  *   2.  GDT + IDT on BSP
  *   3.  PMM from Limine memory map
  *   4.  VMM (HHDM offset) + kernel heap
- *   5.  PCI enumeration
- *   6.  Graphics stack (VirtIO GPU)
- *   7.  ACPI / MADT
- *   8.  APIC (disable PIC, enable LAPIC, calibrate timer)
- *   9.  SMP (bring up AP cores)
- *   10. Scheduler, USB stack (via task)
- *   11. Enable interrupts → idle loop
+ *   5.  Filesystem stack (VFS, tmpfs, FAT32, ext2)
+ *   6.  Input event subsystem
+ *   7.  PCI enumeration
+ *   8.  Limine GOP framebuffer → fbcon text console
+ *   9.  ACPI / MADT
+ *  10.  APIC (disable PIC, enable LAPIC, calibrate timer)
+ *  11.  SMP (bring up AP cores)
+ *  12.  Scheduler
+ *  13.  Spawn: shell task, USB stack task, storage-init task
+ *  14.  Enable interrupts → idle loop
  */
 
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
 
-/* Limine 8 protocol header — downloaded into build/ by the Makefile */
+/* Limine 8 protocol header */
 #include <limine.h>
 
 #include "lib/klog.h"
@@ -37,15 +40,14 @@
 #include "sched/sched.h"
 #include "sched/task.h"
 #include "arch/x86_64/pci.h"
-#include "gfx/virtio_gpu.h"
-#include "gfx/compositor.h"
-#include "gfx/wm.h"
-#include "gfx/desktop.h"
+#include "gfx/fbcon.h"
+#include "gfx/font.h"
 #include "drivers/input/input.h"
 #include "drivers/usb/usb_core.h"
 #include "drivers/usb/hid.h"
+#include "shell/shell.h"
 
-/* ── Filesystem stack ────────────────────────────────────────────────────── */
+/* ── Filesystem stack ───────────────────────────────────────────────────── */
 #include "fs/bcache.h"
 #include "fs/vfs.h"
 #include "fs/fat32/fat32.h"
@@ -57,19 +59,19 @@
 #include "fs/gpt.h"
 #include "syscall/syscall.h"
 
-/* ── Limine protocol: start marker ──────────────────────────────────────── */
+/* ── Limine protocol: start marker ────────────────────────────────────── */
 __attribute__((used, section(".limine_requests_start_marker")))
 static volatile LIMINE_REQUESTS_START_MARKER;
 
-/* ── Base revision: MUST live between start and end markers ──────────────── */
+/* ── Base revision ─────────────────────────────────────────────────────── */
 __attribute__((section(".limine_requests")))
 LIMINE_BASE_REVISION(3)
 
-/* ── Limine protocol: end marker ─────────────────────────────────────────── */
+/* ── Limine protocol: end marker ───────────────────────────────────────── */
 __attribute__((used, section(".limine_requests_end_marker")))
 static volatile LIMINE_REQUESTS_END_MARKER;
 
-/* ── Limine requests ─────────────────────────────────────────────────────── */
+/* ── Limine requests ───────────────────────────────────────────────────── */
 __attribute__((used, section(".limine_requests")))
 static volatile struct limine_memmap_request memmap_req = {
     .id       = LIMINE_MEMMAP_REQUEST,
@@ -94,24 +96,28 @@ static volatile struct limine_kernel_address_request kaddr_req = {
     .revision = 0,
 };
 
-/* ── Storage + filesystem initialisation task ────────────────────────────── */
-/* Spawned after interrupts are enabled so storage drivers can sleep/poll   */
+/* GOP framebuffer — replaces VirtIO GPU */
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_framebuffer_request fb_req = {
+    .id       = LIMINE_FRAMEBUFFER_REQUEST,
+    .revision = 0,
+};
+
+/* ── Storage + filesystem initialisation task ───────────────────────────── */
 static void storage_init_task(void *arg) {
     (void)arg;
     KLOG_INFO("storage-init: scanning for block devices\n");
 
-    /* Initialise storage drivers: probe PCI for VirtIO-blk and AHCI */
     virtio_blk_init();
     ahci_init();
 
-    /* Scan each registered block device for GPT partition tables */
     gpt_partition_t parts[16];
     int found_parts = 0;
     int n = blkdev_count();
     for (int i = 0; i < n; i++) {
         blkdev_t *dev = blkdev_get_nth(i);
         if (!dev) continue;
-        if (dev->part_offset) continue;   /* skip partition blkdevs */
+        if (dev->part_offset) continue;
 
         KLOG_INFO("storage-init: scanning %s for GPT\n", dev->name);
         int np = gpt_scan(dev, parts + found_parts, 16 - found_parts);
@@ -123,27 +129,23 @@ static void storage_init_task(void *arg) {
         found_parts += np;
     }
 
-    /* Mount ext2 partition at / (root filesystem, replaces tmpfs) */
+    /* Mount ext2 at / */
     bool root_mounted = false;
     for (int i = 0; i < found_parts; i++) {
         if (!parts[i].blkdev) continue;
         if (gpt_guid_equal(&parts[i].type_guid, &GPT_GUID_LINUX_DATA)) {
-            int r = vfs_mount("/", parts[i].blkdev, "ext2");
-            if (r == 0) {
-                KLOG_INFO("storage-init: ext2 root mounted at / from %s\n",
-                          parts[i].blkdev->name);
+            if (vfs_mount("/", parts[i].blkdev, "ext2") == 0) {
+                KLOG_INFO("storage-init: ext2 root at / from %s\n", parts[i].blkdev->name);
                 root_mounted = true;
                 break;
             }
         }
     }
     if (!root_mounted) {
-        /* Fallback: try every partition as ext2 */
         for (int i = 0; i < found_parts; i++) {
             if (!parts[i].blkdev) continue;
             if (vfs_mount("/", parts[i].blkdev, "ext2") == 0) {
-                KLOG_INFO("storage-init: ext2 root mounted at / from %s (fallback)\n",
-                          parts[i].blkdev->name);
+                KLOG_INFO("storage-init: ext2 root at / from %s (fallback)\n", parts[i].blkdev->name);
                 root_mounted = true;
                 break;
             }
@@ -152,46 +154,85 @@ static void storage_init_task(void *arg) {
     if (!root_mounted)
         KLOG_WARN("storage-init: no ext2 root filesystem found!\n");
 
-    /* Mount EFI System Partition (FAT32) at /boot */
-    bool boot_mounted = false;
+    /* Mount EFI partition (FAT32) at /boot */
     for (int i = 0; i < found_parts; i++) {
         if (!parts[i].blkdev) continue;
         if (gpt_guid_equal(&parts[i].type_guid, &GPT_GUID_EFI_SYSTEM)) {
-            int r = vfs_mount("/boot", parts[i].blkdev, "fat32");
-            if (r == 0) {
-                KLOG_INFO("storage-init: fat32 (EFI) mounted at /boot from %s\n",
-                          parts[i].blkdev->name);
-                boot_mounted = true;
+            if (vfs_mount("/boot", parts[i].blkdev, "fat32") == 0) {
+                KLOG_INFO("storage-init: fat32 EFI at /boot from %s\n", parts[i].blkdev->name);
                 break;
             }
         }
     }
-    if (!boot_mounted)
-        KLOG_WARN("storage-init: no EFI partition found for /boot\n");
-
     KLOG_INFO("storage-init: done\n");
 }
 
-/* ── USB + HID init task ─────────────────────────────────────────────────── */
-/* Runs after cpu_sti() so that xHCI control transfers can use sched_sleep  */
+/* ── USB + HID init task ────────────────────────────────────────────────── */
 static void usb_init_task(void *arg) {
     (void)arg;
-    /* Register HID boot-protocol driver before enumeration starts           */
     hid_init();
-    /* Discover xHCI controller, enumerate ports, bind class drivers.        */
-    /* usb_init() also spawns the persistent "usb-evt" task internally.      */
     if (!usb_init())
         KLOG_WARN("usb-init: USB stack unavailable\n");
-    /* Task exits cleanly — usb-evt task continues in the background         */
 }
+
+/* ── Shell task ─────────────────────────────────────────────────────────── */
+/* Reads from the global input ring and feeds characters to the shell.
+ *
+ * CRITICAL: sched_sleep(1) is called on EVERY iteration — not just when
+ * the ring is empty.  A busy-loop here starves the "usb-evt" task, which
+ * is the only task that calls hid_transfer_done() → input_push_key().
+ * Without yielding every ms, no further HID events reach the ring.        */
+static void shell_task(void *arg) {
+    (void)arg;
+
+    fbcon_t *con = fbcon_get();
+    if (!con) {
+        KLOG_ERR("shell: no framebuffer console — bailing\n");
+        return;
+    }
+
+    shell_t *sh = shell_create(con);
+    if (!sh) {
+        KLOG_ERR("shell: failed to allocate shell instance\n");
+        return;
+    }
+
+    KLOG_INFO("shell: running (USB HID keyboard input)\n");
+
+    uint64_t next_blink = sched_get_ticks() + 500;  /* first blink in 500 ms */
+
+    for (;;) {
+        /* Drain all pending key events from the HID ring */
+        input_event_t ev;
+        while (input_poll(&ev)) {
+            if (ev.type  == INPUT_EV_KEY &&
+                ev.state == INPUT_KEY_PRESS) {
+                char c = input_keycode_to_ascii(ev.keycode, ev.modifiers);
+                if (c) shell_on_char_inst(sh, c);
+            }
+        }
+
+        /* Cursor blink (500 ms interval using real jiffy clock) */
+        uint64_t now = sched_get_ticks();
+        if (now >= next_blink) {
+            fbcon_tick(con);
+            next_blink = now + 500;
+        }
+
+        /* Yield every iteration — gives usb-evt time to push the next
+         * keyboard HID report into the ring before we poll again.         */
+        sched_sleep(1);
+    }
+}
+
 /* ── Kernel entry point ─────────────────────────────────────────────────── */
 __attribute__((noreturn))
 void kmain(void) {
-    /* ── 1. Serial / logging ─────────────────────────────────────────────── */
+    /* ── 1. Serial / logging ──────────────────────────────────────────────── */
     klog_init();
     KLOG_INFO("\n=== EXO_OS kernel starting ===\n");
 
-    /* ── 2. Validate Limine responses ────────────────────────────────────── */
+    /* ── 2. Validate Limine responses ─────────────────────────────────────── */
     if (!LIMINE_BASE_REVISION_SUPPORTED) {
         KLOG_ERR("Limine base revision not supported\n");
         goto halt;
@@ -201,18 +242,14 @@ void kmain(void) {
         goto halt;
     }
 
-    KLOG_INFO("Limine: HHDM offset  = %p\n",
-              (void *)hhdm_req.response->offset);
+    KLOG_INFO("Limine: HHDM offset  = %p\n",  (void *)hhdm_req.response->offset);
     KLOG_INFO("Limine: kernel virt  = %p  phys = %p\n",
               (void *)kaddr_req.response->virtual_base,
               (void *)kaddr_req.response->physical_base);
 
-    /* ── 3. GDT + IDT on BSP ─────────────────────────────────────────────── */
-    /* Temporary stack top; will be replaced per-CPU by smp_init */
-    /* Linker-defined end of kernel */
+    /* ── 3. GDT + IDT on BSP ──────────────────────────────────────────────── */
     extern char kernel_end[];
     uintptr_t bsp_stack = (uintptr_t)kernel_end + 0x4000;
-
     gdt_init(0, bsp_stack);
     gdt_load_tss(0);
     idt_init();
@@ -232,90 +269,80 @@ void kmain(void) {
     pmm_print_stats();
 
     /* ── 5. VMM ───────────────────────────────────────────────────────────── */
-    /* Use the actual PML4 from CR3 (Limine's page tables), NOT the kernel
-     * physical load address — those are completely different things. */
     vmm_init(hhdm_req.response->offset, read_cr3());
 
-    /* ── 5a. Kernel heap (slab allocator) ────────────────────────────────── */
+    /* ── 5a. Kernel heap ──────────────────────────────────────────────────── */
     kmalloc_init();
 
-    
-
-    /* ── 5b. Filesystem stack (VFS + pseudo-root via tmpfs) ──────────────── */
+    /* ── 5b. Filesystem stack ─────────────────────────────────────────────── */
     bcache_init();
     vfs_init();
     tmpfs_register();
     fat32_register();
     ext2_register();
-    /* Mount tmpfs as / so the kernel has a working VFS from the start */
     if (vfs_mount("/", NULL, "tmpfs") < 0)
         KLOG_WARN("vfs: failed to mount tmpfs as root\n");
     else
         KLOG_INFO("vfs: tmpfs mounted as root\n");
-    /* Create standard top-level directories on initial tmpfs root.
-     * storage_init_task will later mount ext2 at / (replacing tmpfs)
-     * and FAT32 at /boot.  The ext2 image has these dirs pre-created. */
     vfs_mkdir("/dev",  0755);
     vfs_mkdir("/tmp",  01777);
     vfs_mkdir("/boot", 0755);
     vfs_mkdir("/proc", 0555);
-    /* Install INT 0x80 syscall gate */
     syscall_init();
 
-    /* ── 5c. Input event subsystem (lock-free SPSC rings, safe pre-IRQ) ────── */
+    /* ── 5c. Input event subsystem ────────────────────────────────────────── */
     input_init();
-    /* ── 5b. PCI enumeration ─────────────────────────────────────────────── */
+
+    /* ── 5d. PCI enumeration ──────────────────────────────────────────────── */
     static pci_device_t s_pci_buf[64];
     int pci_count = pci_enumerate(s_pci_buf, 64);
     KLOG_INFO("pci: found %d device(s)\n", pci_count);
 
-    /* ── 5c. Graphics stack (VirtIO GPU only) ───────────────────────────── */
+    /* ── 6. GOP framebuffer console ───────────────────────────────────────── */
+    if (!fb_req.response || fb_req.response->framebuffer_count == 0) {
+        KLOG_ERR("gfx: no Limine framebuffer — halting\n");
+        goto halt;
+    }
     {
-        gfx_surface_t *screen = NULL;
-        if (!virtio_gpu_init(&screen)) {
-            KLOG_ERR("gfx: VirtIO GPU required but not found — halting\n");
-            goto halt;
-        }
-        KLOG_INFO("gfx: VirtIO GPU %dx%d ready\n", screen->w, screen->h);
-        compositor_init(screen, virtio_gpu_flush);
-        compositor_set_bg(GFX_DESKTOP_BG);
-        wm_init(screen->w, screen->h);
-        /* Desktop task will create all windows (terminals, sysinfo, taskmgr) */
+        struct limine_framebuffer *lfb = fb_req.response->framebuffers[0];
+        KLOG_INFO("gfx: GOP framebuffer %lux%lu bpp=%u pitch=%lu\n",
+                  lfb->width, lfb->height, lfb->bpp, lfb->pitch);
+
+        fbcon_fb_t fbdesc = {
+            .fb    = (uint32_t *)lfb->address,
+            .width  = (uint32_t)lfb->width,
+            .height = (uint32_t)lfb->height,
+            .pitch  = (uint32_t)lfb->pitch,
+        };
+        fbcon_init(&fbdesc);
+        KLOG_INFO("gfx: fbcon initialised (%ux%u px)\n",
+                  fbdesc.width, fbdesc.height);
     }
 
-    /* ── 6. ACPI / MADT ──────────────────────────────────────────────────── */
+    /* ── 7. ACPI / MADT ───────────────────────────────────────────────────── */
     acpi_init((uintptr_t)rsdp_req.response->address);
 
-    /* ── 7. APIC ─────────────────────────────────────────────────────────── */
+    /* ── 8. APIC ──────────────────────────────────────────────────────────── */
     madt_info_t *madt = acpi_get_madt_info();
     apic_init(madt->lapic_base);
-
-    /* Calibrate LAPIC timer using PIT */
     g_apic_ticks_per_ms = apic_timer_calibrate();
-
-    /* Start periodic 1 ms timer on BSP */
     apic_timer_init(g_apic_ticks_per_ms);
 
-    /* ── 8. Scheduler init on BSP (CPU 0) ────────────────────────────────── */
+    /* ── 9. Scheduler init on BSP ─────────────────────────────────────────── */
     sched_init(0);
 
-    /* ── 9. SMP: bring up AP cores ───────────────────────────────────────── */
+    /* ── 10. SMP: bring up AP cores ───────────────────────────────────────── */
     smp_init();
 
-    /* ── 10. Spawn desktop (cursor + shell + input loop) ─────────────────── */
-    sched_spawn("desktop", desktop_task, NULL);
-
-    /* ── 11. Spawn USB stack (as task — needs sched_sleep for xHCI cmds) ── */
-    sched_spawn("usb-init", usb_init_task, NULL);
-
-    /* ── 12. Spawn storage + filesystem init task ────────────────────────── */
+    /* ── 11. Spawn tasks ──────────────────────────────────────────────────── */
+    sched_spawn("shell",        shell_task,        NULL);
+    sched_spawn("usb-init",     usb_init_task,     NULL);
     sched_spawn("storage-init", storage_init_task, NULL);
+
     KLOG_INFO("Kernel init complete. Entering idle.\n");
 
-    /* ── 11. Enable interrupts — scheduler takes over from here ─────────── */
+    /* ── 12. Enable interrupts — scheduler takes over ─────────────────────── */
     cpu_sti();
-
-    /* BSP falls into idle — scheduler timer will preempt as needed */
     sched_idle_loop();
 
 halt:

@@ -75,9 +75,12 @@ void vmm_unmap_page(uintptr_t virt) {
     __asm__ volatile("invlpg (%0)" : : "r"(virt) : "memory");
 }
 
-/* MMIO: identity-map HHDM virtual region with cache-disable flags */
+/* MMIO: identity-map HHDM virtual region with cache-disable flags.
+ * If size is 0 (BAR size-probe failure or unknown), map 64 KiB as a
+ * safe minimum — the xHCI operational registers fit comfortably.        */
 uintptr_t vmm_mmio_map(uintptr_t phys, size_t size) {
     uintptr_t virt = vmm_phys_to_virt(phys);
+    if (size == 0) size = 0x10000;  /* 64 KiB default */
     size_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
     for (size_t i = 0; i < pages; i++) {
         vmm_map_page(virt + i * PAGE_SIZE,

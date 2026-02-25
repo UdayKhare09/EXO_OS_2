@@ -250,7 +250,11 @@ bool xhci_init(void) {
         KLOG_ERR("xhci: BAR0 not MMIO\n");
         return false;
     }
-    uintptr_t mmio_virt = vmm_mmio_map(pdev->bars[0].base, pdev->bars[0].size);
+    size_t mmio_size = pdev->bars[0].size;
+    if (mmio_size < 0x10000) mmio_size = 0x10000;  /* at least 64 KiB */
+    KLOG_INFO("xhci: BAR0 phys=%p size=%lu\n",
+              (void *)pdev->bars[0].base, (unsigned long)mmio_size);
+    uintptr_t mmio_virt = vmm_mmio_map(pdev->bars[0].base, mmio_size);
     g_xhci.cap_base = (volatile uint8_t *)mmio_virt;
 
     /* Decode capability registers */
