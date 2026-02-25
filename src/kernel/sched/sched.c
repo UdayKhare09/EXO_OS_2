@@ -100,6 +100,13 @@ static void idle_entry(void *arg) {
 static void sched_timer_isr(cpu_regs_t *regs) {
     (void)regs;
     apic_send_eoi();
+    /* Advance the shared ms clock ONLY from the hardware timer ISR.
+     * sched_tick() is also called directly from sched_sleep / sched_task_exit;
+     * if those calls also incremented g_jiffies the clock would run orders of
+     * magnitude faster than 1 tick/ms, breaking all timing.                */
+    cpu_info_t *ci = smp_self();
+    if (ci && ci->id == 0)
+        __atomic_add_fetch(&g_jiffies, 1, __ATOMIC_RELAXED);
     sched_tick();
 }
 
@@ -143,31 +150,39 @@ void sched_tick(void) {
     uint32_t     cpu_id = ci->id;
     cpu_sched_t *cs     = &cpu_scheds[cpu_id];
 
-    /* Advance jiffy counter on CPU 0 (shared millisecond clock) */
-    if (cpu_id == 0)
-        __atomic_add_fetch(&g_jiffies, 1, __ATOMIC_RELAXED);
-
+    /* NOTE: g_jiffies is advanced ONLY by sched_timer_isr(), never here.
+     * Direct callers (sched_sleep, sched_task_exit) must NOT modify it.   */
     uint64_t now = __atomic_load_n(&g_jiffies, __ATOMIC_RELAXED);
 
     task_t *prev = cs->current;
 
-    /* MLFQ: increment timeslice counter for running task */
-    if (prev && prev != cs->idle && prev->state == TASK_RUNNING) {
+    /* MLFQ: increment timeslice for the running task (including idle so it
+     * yields after 1 tick and gives queued workers a chance to run).       */
+    if (prev && prev->state == TASK_RUNNING) {
         prev->timeslice_ticks++;
     }
 
     rq_lock(cs);
-    /* Re-enqueue previous task if still runnable (with priority adjustment) */
-    if (prev && prev != cs->idle && prev->state == TASK_RUNNING) {
-        prev->state = TASK_RUNNABLE;
 
-        /* MLFQ feedback: if task used full timeslice, drop priority */
-        if (prev->timeslice_ticks >= TIMESLICE_TICKS) {
-            if (prev->priority < NPRIO - 1) prev->priority++;
+    /* Re-enqueue previous task if it has used its timeslice (or is idle).  */
+    if (prev && prev->state == TASK_RUNNING) {
+        /* Idle gets a 1-tick timeslice so it never starves queued workers.  */
+        uint32_t max_ticks = (prev == cs->idle) ? 1 : TIMESLICE_TICKS;
+
+        if (prev->timeslice_ticks >= max_ticks) {
+            prev->state = TASK_RUNNABLE;
             prev->timeslice_ticks = 0;
-        }
 
-        rq_enqueue(cs, prev);
+            if (prev != cs->idle) {
+                /* MLFQ feedback: used full timeslice → drop priority */
+                if (prev->priority < NPRIO - 1) prev->priority++;
+            }
+            /* Idle goes to the lowest-priority queue so real tasks preempt it */
+            if (prev == cs->idle)
+                prev->priority = NPRIO - 1;
+
+            rq_enqueue(cs, prev);
+        }
     }
 
     /* Wake sleeping tasks whose deadline has passed */
@@ -220,10 +235,8 @@ void sched_tick(void) {
         next = cs->idle;
     }
 
-    /* Reset timeslice counter when task starts running */
-    if (next != cs->idle) {
-        next->timeslice_ticks = 0;
-    }
+    /* Reset timeslice counter when a task starts a fresh run */
+    next->timeslice_ticks = 0;
 
     next->state = TASK_RUNNING;
     cs->current = next;
@@ -296,18 +309,30 @@ void sched_idle_loop(void) {
     for (;;) cpu_halt();
 }
 
-/* ── sched_pick_cpu: return CPU index with fewest queued tasks ────────────── */
+/* ── sched_pick_cpu: return CPU with fewest queued tasks ─────────────────── */
+/* Round-robin tiebreaker ensures tasks spread across all CPUs when equal    */
+static uint32_t g_rr_cpu = 0;   /* round-robin counter (relaxed, approx OK) */
+
 uint32_t sched_pick_cpu(void) {
-    uint32_t ncpus   = smp_cpu_count();
-    uint32_t best    = 0;
-    uint32_t min_len = cpu_scheds[0].queue_len;
-    for (uint32_t i = 1; i < ncpus; i++) {
-        if (cpu_scheds[i].queue_len < min_len) {
+    uint32_t ncpus = smp_cpu_count();
+    if (ncpus == 1) return 0;
+
+    /* Find the minimum queue length across all CPUs */
+    uint32_t min_len = (uint32_t)-1;
+    for (uint32_t i = 0; i < ncpus; i++) {
+        if (cpu_scheds[i].queue_len < min_len)
             min_len = cpu_scheds[i].queue_len;
-            best    = i;
-        }
     }
-    return best;
+
+    /* Among CPUs at min_len, pick the next one in round-robin order so that
+     * tasks are distributed evenly even when all CPUs are equally idle.    */
+    uint32_t start = __atomic_add_fetch(&g_rr_cpu, 1, __ATOMIC_RELAXED) % ncpus;
+    for (uint32_t j = 0; j < ncpus; j++) {
+        uint32_t i = (start + j) % ncpus;
+        if (cpu_scheds[i].queue_len == min_len)
+            return i;
+    }
+    return 0;   /* unreachable */
 }
 
 /* ── sched_spawn: create a task on the least-loaded CPU ──────────────────── */

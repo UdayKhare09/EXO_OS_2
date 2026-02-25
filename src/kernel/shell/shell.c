@@ -4,12 +4,14 @@
  * One instance lives for the lifetime of the kernel.
  */
 #include "shell.h"
+#include "cputest.h"
 #include "gfx/fbcon.h"
 #include "lib/string.h"
 #include "mm/pmm.h"
 #include "mm/kmalloc.h"
 #include "sched/sched.h"
 #include "arch/x86_64/smp.h"
+#include "arch/x86_64/cpu.h"
 #include "fs/vfs.h"
 
 /* ── Line buffer ──────────────────────────────────────────────────────────── */
@@ -41,20 +43,23 @@ static void resolve_path(shell_t *sh, const char *arg, char *out) {
 static void cmd_help(fbcon_t *c) {
     fbcon_puts_inst(c,
         A_CYAN "  Built-in commands:" A_RESET "\n"
-        "    " A_BOLD "help"         A_RESET "           show this help\n"
-        "    " A_BOLD "clear"        A_RESET "          clear the terminal\n"
-        "    " A_BOLD "echo <text>"  A_RESET "    print text to screen\n"
-        "    " A_BOLD "ver"          A_RESET "            show OS version\n"
-        "    " A_BOLD "mem"          A_RESET "            physical memory stats\n"
-        "    " A_BOLD "uname"        A_RESET "          alias for ver\n"
+        "    " A_BOLD "help"          A_RESET "           show this help\n"
+        "    " A_BOLD "clear"         A_RESET "          clear the terminal\n"
+        "    " A_BOLD "echo <text>"   A_RESET "    print text to screen\n"
+        "    " A_BOLD "ver"           A_RESET "            show OS version\n"
+        "    " A_BOLD "mem"           A_RESET "            physical memory stats\n"
+        "    " A_BOLD "uname"         A_RESET "          alias for ver\n"
+        "    " A_BOLD "sysinfo"       A_RESET "        CPU / SMP / feature scan\n"
+        "    " A_BOLD "tasks"         A_RESET "          list all scheduler tasks\n"
+        "    " A_BOLD "cputest"       A_RESET "        run CPU/SMP/sched test suite\n"
         A_CYAN "  Filesystem:" A_RESET "\n"
-        "    " A_BOLD "ls [path]"    A_RESET "      list directory\n"
-        "    " A_BOLD "cd <path>"    A_RESET "      change directory\n"
-        "    " A_BOLD "pwd"          A_RESET "            print working directory\n"
-        "    " A_BOLD "cat <file>"   A_RESET "     display file contents\n"
-        "    " A_BOLD "stat <path>"  A_RESET "    show file/dir info\n"
-        "    " A_BOLD "mkdir <path>" A_RESET "   create directory\n"
-        "    " A_BOLD "touch <file>" A_RESET "   create empty file\n"
+        "    " A_BOLD "ls [path]"     A_RESET "      list directory\n"
+        "    " A_BOLD "cd <path>"     A_RESET "      change directory\n"
+        "    " A_BOLD "pwd"           A_RESET "            print working directory\n"
+        "    " A_BOLD "cat <file>"    A_RESET "     display file contents\n"
+        "    " A_BOLD "stat <path>"   A_RESET "    show file/dir info\n"
+        "    " A_BOLD "mkdir <path>"  A_RESET "   create directory\n"
+        "    " A_BOLD "touch <file>"  A_RESET "   create empty file\n"
         "\n"
     );
 }
@@ -80,6 +85,161 @@ static void cmd_ver(fbcon_t *c) {
 static void cmd_mem(fbcon_t *c) {
     (void)c;
     pmm_print_stats();
+}
+
+/* ── sysinfo — full CPU / SMP scan ───────────────────────────────────────── */
+static void cmd_sysinfo(fbcon_t *c) {
+    uint32_t eax, ebx, ecx, edx;
+
+    /* ── Vendor string ────────────────────────────────────────────────────── */
+    char vendor[13];
+    cpuid(0, &eax, &ebx, &ecx, &edx);
+    uint32_t max_leaf = eax;
+    /* EBX:EDX:ECX in order */
+    ((uint32_t *)vendor)[0] = ebx;
+    ((uint32_t *)vendor)[1] = edx;
+    ((uint32_t *)vendor)[2] = ecx;
+    vendor[12] = '\0';
+
+    /* ── Brand string (leaves 0x80000002-4) ─────────────────────────────── */
+    char brand[49];
+    cpuid(0x80000000, &eax, &ebx, &ecx, &edx);
+    uint32_t max_ext = eax;
+    if (max_ext >= 0x80000004) {
+        uint32_t *bp = (uint32_t *)brand;
+        cpuid(0x80000002, &bp[0],  &bp[1],  &bp[2],  &bp[3]);
+        cpuid(0x80000003, &bp[4],  &bp[5],  &bp[6],  &bp[7]);
+        cpuid(0x80000004, &bp[8],  &bp[9],  &bp[10], &bp[11]);
+        brand[48] = '\0';
+        /* trim leading spaces */
+        char *b = brand;
+        while (*b == ' ') b++;
+        fbcon_printf_inst(c, "\n  " A_WHITE "CPU" A_RESET ":  %s\n", b);
+    } else {
+        fbcon_printf_inst(c, "\n  " A_WHITE "CPU" A_RESET ":  %s (no brand string)\n", vendor);
+    }
+    fbcon_printf_inst(c, "  " A_WHITE "Vendor" A_RESET ": %s   CPUID max leaf: 0x%x\n",
+                      vendor, max_leaf);
+
+    /* ── Signature + feature flags ───────────────────────────────────────── */
+    if (max_leaf >= 1) {
+        cpuid(1, &eax, &ebx, &ecx, &edx);
+        uint32_t family  = ((eax >> 8) & 0xF) + ((eax >> 20) & 0xFF);
+        uint32_t model   = ((eax >> 4) & 0xF) | (((eax >> 16) & 0xF) << 4);
+        uint32_t step    = eax & 0xF;
+        uint32_t logical = (ebx >> 16) & 0xFF;   /* HTT logical CPUs per pkg */
+
+        fbcon_printf_inst(c,
+            "  " A_WHITE "Family" A_RESET ": %u  "
+            A_WHITE "Model" A_RESET ": %u  "
+            A_WHITE "Step" A_RESET ": %u\n",
+            family, model, step);
+
+        /* Feature bits */
+        fbcon_puts_inst(c, "  " A_WHITE "Features" A_RESET ": ");
+        if (edx & (1<<0))  fbcon_puts_inst(c, "FPU ");
+        if (edx & (1<<4))  fbcon_puts_inst(c, "TSC ");
+        if (edx & (1<<5))  fbcon_puts_inst(c, "MSR ");
+        if (edx & (1<<9))  fbcon_puts_inst(c, "APIC ");
+        if (edx & (1<<15)) fbcon_puts_inst(c, "CMOV ");
+        if (edx & (1<<19)) fbcon_puts_inst(c, "CLFL ");
+        if (edx & (1<<23)) fbcon_puts_inst(c, "MMX ");
+        if (edx & (1<<25)) fbcon_puts_inst(c, "SSE ");
+        if (edx & (1<<26)) fbcon_puts_inst(c, "SSE2 ");
+        if (edx & (1<<28)) fbcon_puts_inst(c, "HTT ");
+        if (ecx & (1<<0))  fbcon_puts_inst(c, "SSE3 ");
+        if (ecx & (1<<9))  fbcon_puts_inst(c, "SSSE3 ");
+        if (ecx & (1<<19)) fbcon_puts_inst(c, "SSE4.1 ");
+        if (ecx & (1<<20)) fbcon_puts_inst(c, "SSE4.2 ");
+        if (ecx & (1<<21)) fbcon_puts_inst(c, "x2APIC ");
+        if (ecx & (1<<28)) fbcon_puts_inst(c, "AVX ");
+        if (ecx & (1<<30)) fbcon_puts_inst(c, "RDRND ");
+        fbcon_putchar_inst(c, '\n');
+
+        bool htt = !!(edx & (1 << 28));
+        fbcon_printf_inst(c,
+            "  " A_WHITE "HTT" A_RESET ": %s  "
+            A_WHITE "Logical CPUs/pkg" A_RESET ": %u\n",
+            htt ? A_GREEN "yes" A_RESET : A_YELLOW "no" A_RESET,
+            logical);
+    }
+
+    /* ── Physical core count (leaf 4 / 0xB / extended) ─────────────────── */
+    if (max_leaf >= 4) {
+        cpuid(4, &eax, &ebx, &ecx, &edx);
+        uint32_t phys_cores = ((eax >> 26) & 0x3F) + 1;
+        fbcon_printf_inst(c,
+            "  " A_WHITE "Physical cores/pkg" A_RESET ": %u\n", phys_cores);
+    }
+
+    /* ── L1/L2 cache info (leaf 0x80000005/6) ───────────────────────────── */
+    if (max_ext >= 0x80000006) {
+        cpuid(0x80000006, &eax, &ebx, &ecx, &edx);
+        uint32_t l2_kb   = (ecx >> 16) & 0xFFFF;
+        uint32_t l2_ways = (ecx >> 12) & 0xF;
+        fbcon_printf_inst(c,
+            "  " A_WHITE "L2 cache" A_RESET ": %u KiB  assoc=%u-way\n",
+            l2_kb, l2_ways);
+    }
+
+    /* ── APIC timer calibration ──────────────────────────────────────────── */
+    extern uint32_t g_apic_ticks_per_ms;
+    uint32_t tpm = g_apic_ticks_per_ms;
+    /* Estimate CPU MHz: tpm * 1000 / timer_divisor (divisor=16 in apic.c)  */
+    /* We just report ticks/ms as proxy for LAPIC bus frequency             */
+    fbcon_printf_inst(c,
+        "  " A_WHITE "APIC timer" A_RESET ": %lu ticks/ms (~%lu MHz bus)\n",
+        (unsigned long)tpm, (unsigned long)(tpm / 1000UL));
+
+    /* ── SMP / per-CPU status ────────────────────────────────────────────── */
+    uint32_t ncpus = smp_cpu_count();
+    fbcon_printf_inst(c,
+        "\n  " A_CYAN "SMP" A_RESET ": %u CPU(s) online\n", ncpus);
+    fbcon_puts_inst(c,
+        "  " A_WHITE "CPU" A_RESET "  "
+        A_WHITE "LAPIC" A_RESET "  "
+        A_WHITE "Status" A_RESET "\n"
+        "  " A_YELLOW "---  -----  ------" A_RESET "\n");
+    for (uint32_t i = 0; i < ncpus && i < MAX_CPUS; i++) {
+        /* We don't have a smp_get_cpu_info(i) accessor, so print what we   */
+        /* know: CPU index + running status (all online since boot)         */
+        fbcon_printf_inst(c,
+            "  %3u  %5u  " A_GREEN "online" A_RESET "\n",
+            i, i /* LAPIC id matched seq on QEMU */);
+    }
+    fbcon_putchar_inst(c, '\n');
+}
+
+/* ── tasks — live scheduler task snapshot ────────────────────────────────── */
+static void cmd_tasks(fbcon_t *c) {
+    #define MAX_SNAP 32
+    sched_task_info_t snap[MAX_SNAP];
+    int n = sched_snapshot_tasks(snap, MAX_SNAP);
+
+    static const char *state_str[] = {
+        "RUNNABLE", "RUNNING ", "BLOCKED ", "DEAD    ", "SLEEPING"
+    };
+    static const char *state_col[] = {
+        A_CYAN, A_GREEN, A_YELLOW, A_RED, A_YELLOW
+    };
+
+    fbcon_printf_inst(c, "\n  " A_WHITE "%-5s  %-4s  %-4s  %-8s  %s" A_RESET "\n",
+                      "TID", "CPU", "PRI", "STATE", "NAME");
+    fbcon_puts_inst(c, "  " A_YELLOW
+                    "-----  ----  ----  --------  ----------------" A_RESET "\n");
+
+    for (int i = 0; i < n; i++) {
+        uint8_t st = snap[i].state;
+        if (st > 4) st = 4;
+        fbcon_printf_inst(c,
+            "  %5u  %4u  %4u  %s%s" A_RESET "  %s\n",
+            snap[i].tid,
+            snap[i].cpu_id,
+            snap[i].priority,
+            state_col[st], state_str[st],
+            snap[i].name);
+    }
+    fbcon_printf_inst(c, "\n  %d task(s) total\n\n", n);
 }
 
 /* ── Filesystem commands ──────────────────────────────────────────────────── */
@@ -263,6 +423,14 @@ static void run_line(shell_t *sh) {
         cmd_mkdir_shell(sh, p + 6);
     } else if (strncmp(p, "touch ", 6) == 0) {
         cmd_touch(sh, p + 6);
+    } else if (strcmp(p, "cputest") == 0) {
+        cmd_sysinfo(c);   /* always show sysinfo context first */
+        fbcon_putchar_inst(c, '\n');
+        cputest_run(c);
+    } else if (strcmp(p, "sysinfo") == 0) {
+        cmd_sysinfo(c);
+    } else if (strcmp(p, "tasks") == 0) {
+        cmd_tasks(c);
     } else {
         fbcon_puts_inst(c, A_RED "  error:" A_RESET " unknown command '");
         fbcon_puts_inst(c, p);
