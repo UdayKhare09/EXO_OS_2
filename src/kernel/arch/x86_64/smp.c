@@ -103,6 +103,12 @@ static void smp_boot_ap(uint32_t cpu_idx, uint8_t lapic_id) {
     info->lapic_id  = lapic_id;
     info->online    = 0;
 
+    /* Allocate per-CPU ISR XSAVE buffer for this AP */
+    uintptr_t ap_xsave_phys = pmm_alloc_pages(1);
+    if (!ap_xsave_phys) kpanic("SMP: cannot allocate AP ISR XSAVE buffer\n");
+    info->isr_xsave_buf = (uint8_t *)vmm_phys_to_virt(ap_xsave_phys);
+    memset(info->isr_xsave_buf, 0, PAGE_SIZE);
+
     /* Fill mailbox */
     smp_mailbox_t *mb = (smp_mailbox_t *)vmm_phys_to_virt(SMP_MAILBOX_PHYS);
     mb->cr3_val       = read_cr3();
@@ -180,6 +186,13 @@ void smp_init(void) {
     cpus[bsp_idx].id        = bsp_idx;
     cpus[bsp_idx].lapic_id  = bsp_lapic_id;
     cpus[bsp_idx].online    = 1;
+
+    /* Allocate per-CPU ISR XSAVE buffer (page-aligned ≥ 64-byte XSAVE alignment) */
+    uintptr_t bsp_xsave_phys = pmm_alloc_pages(1);
+    if (!bsp_xsave_phys) kpanic("SMP: cannot allocate BSP ISR XSAVE buffer\n");
+    cpus[bsp_idx].isr_xsave_buf = (uint8_t *)vmm_phys_to_virt(bsp_xsave_phys);
+    memset(cpus[bsp_idx].isr_xsave_buf, 0, PAGE_SIZE);
+
     smp_set_gs(&cpus[bsp_idx]);
 
     smp_install_trampoline();

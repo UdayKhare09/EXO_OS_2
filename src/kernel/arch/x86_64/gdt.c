@@ -1,4 +1,5 @@
 #include "gdt.h"
+#include "cpu.h"
 #include "lib/string.h"
 #include "lib/klog.h"
 
@@ -27,6 +28,10 @@ static void gdt_set_tss_desc(tss_desc_t *d, uintptr_t base, uint32_t limit) {
 }
 
 void gdt_init(uint32_t cpu_id, uintptr_t kernel_stack_top) {
+    /* Enable x87 FPU / SSE / AVX on this CPU before any SIMD instruction.
+     * Must be first — the compiler may emit SSE in the code below. */
+    cpu_enable_fpu();
+
     gdt_table_t *gdt = &gdt_tables[cpu_id];
     tss_t       *tss = &tss_entries[cpu_id];
 

@@ -331,3 +331,13 @@ void *usb_dma_alloc(uintptr_t *phys_out) {
 void usb_dma_free(uintptr_t phys) {
     pmm_free_pages(phys, 1);
 }
+
+/* ── Enumerated device query (for lsusb) ─────────────────────────────────── */
+const usb_device_t *usb_get_device(int n) {
+    if (n < 0 || n >= g_dev_count) return NULL;
+    return &g_devices[n];
+}
+
+int usb_device_count(void) {
+    return g_dev_count;
+}

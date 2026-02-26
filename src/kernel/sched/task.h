@@ -27,6 +27,7 @@ struct ipc_mailbox;   /* defined in ipc/ipc.c */
 typedef struct task {
     uint64_t      rsp;              /* saved stack pointer (top of regs frame)  */
     uint64_t      cr3;              /* page table root (kernel addr space share) */
+    uint8_t      *fpu_state;        /* 4 KiB page-aligned XSAVE buffer          */
     task_state_t  state;
     uint32_t      tid;              /* task ID                                  */
     uint32_t      cpu_id;           /* CPU this task is pinned/running on       */

@@ -1,12 +1,17 @@
-/* shell/shell.c — Simple interactive kernel shell
+/* shell/shell.c — Interactive kernel shell with command registration
  *
  * Bound to the global fbcon text console.
  * One instance lives for the lifetime of the kernel.
+ *
+ * Commands are registered via shell_register_cmd() from any subsystem
+ * init function.  The table is sorted once before the REPL loop starts,
+ * and dispatched via binary search.
  */
 #include "shell.h"
 #include "cputest.h"
 #include "gfx/fbcon.h"
 #include "lib/string.h"
+#include "lib/spinlock.h"
 #include "mm/pmm.h"
 #include "mm/kmalloc.h"
 #include "sched/sched.h"
@@ -21,16 +26,6 @@
 #include "net/udp.h"
 #include "net/tcp.h"
 
-/* ── Line buffer ──────────────────────────────────────────────────────────── */
-#define LINE_MAX 256
-
-struct shell {
-    fbcon_t *con;
-    char     line[LINE_MAX];
-    int      len;
-    char     cwd[VFS_MOUNT_PATH_MAX];
-};
-
 /* ── ANSI helpers ─────────────────────────────────────────────────────────── */
 #define A_RESET  "\033[0m"
 #define A_BOLD   "\033[1m"
@@ -40,6 +35,57 @@ struct shell {
 #define A_YELLOW "\033[1;33m"
 #define A_WHITE  "\033[1;37m"
 
+/* ── Command registration table ───────────────────────────────────────────── */
+#define SHELL_MAX_CMDS 128
+
+static shell_cmd_t g_cmds[SHELL_MAX_CMDS];
+static int         g_cmd_count = 0;
+static spinlock_t  g_cmd_lock;
+
+void shell_register_cmd(const char *name, const char *help, shell_cmd_fn_t fn) {
+    spinlock_acquire(&g_cmd_lock);
+    /* check for duplicate */
+    for (int i = 0; i < g_cmd_count; i++) {
+        if (strcmp(g_cmds[i].name, name) == 0) {
+            spinlock_release(&g_cmd_lock);
+            return;
+        }
+    }
+    if (g_cmd_count < SHELL_MAX_CMDS) {
+        g_cmds[g_cmd_count].name = name;
+        g_cmds[g_cmd_count].help = help;
+        g_cmds[g_cmd_count].fn   = fn;
+        g_cmd_count++;
+    }
+    spinlock_release(&g_cmd_lock);
+}
+
+void shell_sort_commands(void) {
+    /* simple insertion sort — called once with ~20 items */
+    for (int i = 1; i < g_cmd_count; i++) {
+        shell_cmd_t tmp = g_cmds[i];
+        int j = i - 1;
+        while (j >= 0 && strcmp(g_cmds[j].name, tmp.name) > 0) {
+            g_cmds[j + 1] = g_cmds[j];
+            j--;
+        }
+        g_cmds[j + 1] = tmp;
+    }
+}
+
+static shell_cmd_t *shell_find_cmd(const char *name) {
+    /* binary search on sorted table */
+    int lo = 0, hi = g_cmd_count - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        int cmp = strcmp(g_cmds[mid].name, name);
+        if (cmp == 0) return &g_cmds[mid];
+        if (cmp < 0)  lo = mid + 1;
+        else           hi = mid - 1;
+    }
+    return NULL;
+}
+
 /* ── Path helpers ─────────────────────────────────────────────────────────── */
 static void resolve_path(shell_t *sh, const char *arg, char *out) {
     if (arg[0] == '/') path_normalize(arg, out);
@@ -47,46 +93,30 @@ static void resolve_path(shell_t *sh, const char *arg, char *out) {
 }
 
 /* ── Built-in commands ────────────────────────────────────────────────────── */
-static void cmd_help(fbcon_t *c) {
-    fbcon_puts_inst(c,
-        A_CYAN "  Built-in commands:" A_RESET "\n"
-        "    " A_BOLD "help"          A_RESET "           show this help\n"
-        "    " A_BOLD "clear"         A_RESET "          clear the terminal\n"
-        "    " A_BOLD "echo <text>"   A_RESET "    print text to screen\n"
-        "    " A_BOLD "ver"           A_RESET "            show OS version\n"
-        "    " A_BOLD "mem"           A_RESET "            physical memory stats\n"
-        "    " A_BOLD "uname"         A_RESET "          alias for ver\n"
-        "    " A_BOLD "sysinfo"       A_RESET "        CPU / SMP / feature scan\n"
-        "    " A_BOLD "tasks"         A_RESET "          list all scheduler tasks\n"
-        "    " A_BOLD "cputest"       A_RESET "        run CPU/SMP/sched test suite\n"
-        A_CYAN "  Filesystem:" A_RESET "\n"
-        "    " A_BOLD "ls [path]"     A_RESET "      list directory\n"
-        "    " A_BOLD "cd <path>"     A_RESET "      change directory\n"
-        "    " A_BOLD "pwd"           A_RESET "            print working directory\n"
-        "    " A_BOLD "cat <file>"    A_RESET "     display file contents\n"
-        "    " A_BOLD "stat <path>"   A_RESET "    show file/dir info\n"
-        "    " A_BOLD "mkdir <path>"  A_RESET "   create directory\n"
-        "    " A_BOLD "touch <file>"  A_RESET "   create empty file\n"
-        A_CYAN "  Networking:" A_RESET "\n"
-        "    " A_BOLD "ifconfig"                  A_RESET "  show network interfaces\n"
-        "    " A_BOLD "ping <ip>"                 A_RESET "  send ICMP echo request\n"
-        "    " A_BOLD "arp"                        A_RESET "  show ARP cache\n"
-        "    " A_BOLD "udptest <ip> <port> [msg]" A_RESET "  send a UDP datagram and print reply\n"
-        "    " A_BOLD "tcpconn <ip> <port>"       A_RESET "  open a TCP connection and exchange data\n"
-        "\n"
-    );
-}
-
-static void cmd_clear(fbcon_t *c) {
-    fbcon_puts_inst(c, "\033[2J\033[H");
-}
-
-static void cmd_echo(fbcon_t *c, const char *args) {
-    fbcon_puts_inst(c, args);
+static void cmd_help(shell_t *sh, const char *args) {
+    (void)args;
+    fbcon_t *c = sh->con;
+    fbcon_puts_inst(c, A_CYAN "\n  Available commands:" A_RESET "\n");
+    for (int i = 0; i < g_cmd_count; i++) {
+        fbcon_printf_inst(c, "    " A_BOLD "%-14s" A_RESET " %s\n",
+                          g_cmds[i].name, g_cmds[i].help);
+    }
     fbcon_putchar_inst(c, '\n');
 }
 
-static void cmd_ver(fbcon_t *c) {
+static void cmd_clear(shell_t *sh, const char *args) {
+    (void)args;
+    fbcon_puts_inst(sh->con, "\033[2J\033[H");
+}
+
+static void cmd_echo(shell_t *sh, const char *args) {
+    fbcon_puts_inst(sh->con, args ? args : "");
+    fbcon_putchar_inst(sh->con, '\n');
+}
+
+static void cmd_ver(shell_t *sh, const char *args) {
+    (void)args;
+    fbcon_t *c = sh->con;
     fbcon_printf_inst(c,
         A_WHITE "  EXO_OS" A_RESET " 0.1.0  "
         A_CYAN  "x86_64" A_RESET "  "
@@ -95,20 +125,22 @@ static void cmd_ver(fbcon_t *c) {
         (uint64_t)smp_cpu_count());
 }
 
-static void cmd_mem(fbcon_t *c) {
-    (void)c;
+static void cmd_mem(shell_t *sh, const char *args) {
+    (void)args;
+    (void)sh;
     pmm_print_stats();
 }
 
 /* ── sysinfo — full CPU / SMP scan ───────────────────────────────────────── */
-static void cmd_sysinfo(fbcon_t *c) {
+static void cmd_sysinfo(shell_t *sh, const char *args) {
+    (void)args;
+    fbcon_t *c = sh->con;
     uint32_t eax, ebx, ecx, edx;
 
     /* ── Vendor string ────────────────────────────────────────────────────── */
     char vendor[13];
     cpuid(0, &eax, &ebx, &ecx, &edx);
     uint32_t max_leaf = eax;
-    /* EBX:EDX:ECX in order */
     ((uint32_t *)vendor)[0] = ebx;
     ((uint32_t *)vendor)[1] = edx;
     ((uint32_t *)vendor)[2] = ecx;
@@ -124,7 +156,6 @@ static void cmd_sysinfo(fbcon_t *c) {
         cpuid(0x80000003, &bp[4],  &bp[5],  &bp[6],  &bp[7]);
         cpuid(0x80000004, &bp[8],  &bp[9],  &bp[10], &bp[11]);
         brand[48] = '\0';
-        /* trim leading spaces */
         char *b = brand;
         while (*b == ' ') b++;
         fbcon_printf_inst(c, "\n  " A_WHITE "CPU" A_RESET ":  %s\n", b);
@@ -140,7 +171,7 @@ static void cmd_sysinfo(fbcon_t *c) {
         uint32_t family  = ((eax >> 8) & 0xF) + ((eax >> 20) & 0xFF);
         uint32_t model   = ((eax >> 4) & 0xF) | (((eax >> 16) & 0xF) << 4);
         uint32_t step    = eax & 0xF;
-        uint32_t logical = (ebx >> 16) & 0xFF;   /* HTT logical CPUs per pkg */
+        uint32_t logical = (ebx >> 16) & 0xFF;
 
         fbcon_printf_inst(c,
             "  " A_WHITE "Family" A_RESET ": %u  "
@@ -148,7 +179,6 @@ static void cmd_sysinfo(fbcon_t *c) {
             A_WHITE "Step" A_RESET ": %u\n",
             family, model, step);
 
-        /* Feature bits */
         fbcon_puts_inst(c, "  " A_WHITE "Features" A_RESET ": ");
         if (edx & (1<<0))  fbcon_puts_inst(c, "FPU ");
         if (edx & (1<<4))  fbcon_puts_inst(c, "TSC ");
@@ -177,7 +207,6 @@ static void cmd_sysinfo(fbcon_t *c) {
             logical);
     }
 
-    /* ── Physical core count (leaf 4 / 0xB / extended) ─────────────────── */
     if (max_leaf >= 4) {
         cpuid(4, &eax, &ebx, &ecx, &edx);
         uint32_t phys_cores = ((eax >> 26) & 0x3F) + 1;
@@ -185,7 +214,6 @@ static void cmd_sysinfo(fbcon_t *c) {
             "  " A_WHITE "Physical cores/pkg" A_RESET ": %u\n", phys_cores);
     }
 
-    /* ── L1/L2 cache info (leaf 0x80000005/6) ───────────────────────────── */
     if (max_ext >= 0x80000006) {
         cpuid(0x80000006, &eax, &ebx, &ecx, &edx);
         uint32_t l2_kb   = (ecx >> 16) & 0xFFFF;
@@ -195,16 +223,12 @@ static void cmd_sysinfo(fbcon_t *c) {
             l2_kb, l2_ways);
     }
 
-    /* ── APIC timer calibration ──────────────────────────────────────────── */
     extern uint32_t g_apic_ticks_per_ms;
     uint32_t tpm = g_apic_ticks_per_ms;
-    /* Estimate CPU MHz: tpm * 1000 / timer_divisor (divisor=16 in apic.c)  */
-    /* We just report ticks/ms as proxy for LAPIC bus frequency             */
     fbcon_printf_inst(c,
         "  " A_WHITE "APIC timer" A_RESET ": %lu ticks/ms (~%lu MHz bus)\n",
         (unsigned long)tpm, (unsigned long)(tpm / 1000UL));
 
-    /* ── SMP / per-CPU status ────────────────────────────────────────────── */
     uint32_t ncpus = smp_cpu_count();
     fbcon_printf_inst(c,
         "\n  " A_CYAN "SMP" A_RESET ": %u CPU(s) online\n", ncpus);
@@ -214,17 +238,17 @@ static void cmd_sysinfo(fbcon_t *c) {
         A_WHITE "Status" A_RESET "\n"
         "  " A_YELLOW "---  -----  ------" A_RESET "\n");
     for (uint32_t i = 0; i < ncpus && i < MAX_CPUS; i++) {
-        /* We don't have a smp_get_cpu_info(i) accessor, so print what we   */
-        /* know: CPU index + running status (all online since boot)         */
         fbcon_printf_inst(c,
             "  %3u  %5u  " A_GREEN "online" A_RESET "\n",
-            i, i /* LAPIC id matched seq on QEMU */);
+            i, i);
     }
     fbcon_putchar_inst(c, '\n');
 }
 
 /* ── tasks — live scheduler task snapshot ────────────────────────────────── */
-static void cmd_tasks(fbcon_t *c) {
+static void cmd_tasks(shell_t *sh, const char *args) {
+    (void)args;
+    fbcon_t *c = sh->con;
     #define MAX_SNAP 32
     sched_task_info_t snap[MAX_SNAP];
     int n = sched_snapshot_tasks(snap, MAX_SNAP);
@@ -255,13 +279,21 @@ static void cmd_tasks(fbcon_t *c) {
     fbcon_printf_inst(c, "\n  %d task(s) total\n\n", n);
 }
 
+static void cmd_cputest(shell_t *sh, const char *args) {
+    (void)args;
+    cmd_sysinfo(sh, NULL);
+    fbcon_putchar_inst(sh->con, '\n');
+    cputest_run(sh->con);
+}
+
 /* ── Filesystem commands ──────────────────────────────────────────────────── */
-static void cmd_pwd(shell_t *sh) {
+static void cmd_pwd(shell_t *sh, const char *args) {
+    (void)args;
     fbcon_printf_inst(sh->con, "  %s\n", sh->cwd);
 }
 
-static void cmd_cd(shell_t *sh, const char *arg) {
-    if (!arg || !*arg) arg = "/";
+static void cmd_cd(shell_t *sh, const char *args) {
+    const char *arg = (args && *args) ? args : "/";
     char path[VFS_MOUNT_PATH_MAX];
     resolve_path(sh, arg, path);
 
@@ -280,10 +312,10 @@ static void cmd_cd(shell_t *sh, const char *arg) {
     strncpy(sh->cwd, path, VFS_MOUNT_PATH_MAX - 1);
 }
 
-static void cmd_ls(shell_t *sh, const char *arg) {
+static void cmd_ls(shell_t *sh, const char *args) {
     char path[VFS_MOUNT_PATH_MAX];
-    if (!arg || !*arg) strncpy(path, sh->cwd, VFS_MOUNT_PATH_MAX);
-    else               resolve_path(sh, arg, path);
+    if (!args || !*args) strncpy(path, sh->cwd, VFS_MOUNT_PATH_MAX);
+    else                 resolve_path(sh, args, path);
 
     int err = 0;
     vnode_t *dir = vfs_lookup(path, true, &err);
@@ -314,10 +346,10 @@ static void cmd_ls(shell_t *sh, const char *arg) {
     vfs_vnode_put(dir);
 }
 
-static void cmd_cat(shell_t *sh, const char *arg) {
-    if (!arg || !*arg) { fbcon_puts_inst(sh->con, A_RED "  cat: missing filename\n" A_RESET); return; }
+static void cmd_cat(shell_t *sh, const char *args) {
+    if (!args || !*args) { fbcon_puts_inst(sh->con, A_RED "  cat: missing filename\n" A_RESET); return; }
     char path[VFS_MOUNT_PATH_MAX];
-    resolve_path(sh, arg, path);
+    resolve_path(sh, args, path);
 
     int err = 0;
     vnode_t *v = vfs_lookup(path, true, &err);
@@ -343,10 +375,10 @@ static void cmd_cat(shell_t *sh, const char *arg) {
     vfs_vnode_put(v);
 }
 
-static void cmd_stat(shell_t *sh, const char *arg) {
-    if (!arg || !*arg) { fbcon_puts_inst(sh->con, A_RED "  stat: missing path\n" A_RESET); return; }
+static void cmd_stat(shell_t *sh, const char *args) {
+    if (!args || !*args) { fbcon_puts_inst(sh->con, A_RED "  stat: missing path\n" A_RESET); return; }
     char path[VFS_MOUNT_PATH_MAX];
-    resolve_path(sh, arg, path);
+    resolve_path(sh, args, path);
 
     vfs_stat_t st;
     int r = vfs_stat(path, &st);
@@ -365,18 +397,18 @@ static void cmd_stat(shell_t *sh, const char *arg) {
         (unsigned)(st.mode & 07777), (unsigned)st.nlink);
 }
 
-static void cmd_mkdir_shell(shell_t *sh, const char *arg) {
-    if (!arg || !*arg) { fbcon_puts_inst(sh->con, A_RED "  mkdir: missing path\n" A_RESET); return; }
+static void cmd_mkdir_shell(shell_t *sh, const char *args) {
+    if (!args || !*args) { fbcon_puts_inst(sh->con, A_RED "  mkdir: missing path\n" A_RESET); return; }
     char path[VFS_MOUNT_PATH_MAX];
-    resolve_path(sh, arg, path);
+    resolve_path(sh, args, path);
     int r = vfs_mkdir(path, 0755);
     if (r < 0) fbcon_printf_inst(sh->con, A_RED "  mkdir: %s: error %d\n" A_RESET, path, r);
 }
 
-static void cmd_touch(shell_t *sh, const char *arg) {
-    if (!arg || !*arg) { fbcon_puts_inst(sh->con, A_RED "  touch: missing filename\n" A_RESET); return; }
+static void cmd_touch(shell_t *sh, const char *args) {
+    if (!args || !*args) { fbcon_puts_inst(sh->con, A_RED "  touch: missing filename\n" A_RESET); return; }
     char path[VFS_MOUNT_PATH_MAX];
-    resolve_path(sh, arg, path);
+    resolve_path(sh, args, path);
 
     int err = 0;
     vnode_t *v = vfs_lookup(path, true, &err);
@@ -398,8 +430,24 @@ static void cmd_touch(shell_t *sh, const char *arg) {
 
 /* ── Networking commands ──────────────────────────────────────────────────── */
 
-/* forward declaration — defined below with the ping helpers */
-static uint32_t parse_ipv4(const char *s);
+static uint32_t parse_ipv4(const char *s) {
+    uint32_t a = 0, b = 0, c2 = 0, d = 0;
+    int pos = 0;
+    uint32_t *cur = &a;
+    while (s[pos]) {
+        if (s[pos] >= '0' && s[pos] <= '9') {
+            *cur = *cur * 10 + (s[pos] - '0');
+        } else if (s[pos] == '.') {
+            if (cur == &a) cur = &b;
+            else if (cur == &b) cur = &c2;
+            else if (cur == &c2) cur = &d;
+        } else {
+            break;
+        }
+        pos++;
+    }
+    return IP4_ADDR((uint8_t)a, (uint8_t)b, (uint8_t)c2, (uint8_t)d);
+}
 
 /* ---- UDP test ------------------------------------------------------------- */
 static volatile int g_udp_got = 0;
@@ -422,18 +470,17 @@ static void udp_reply_cb(skbuff_t *skb,
     __atomic_store_n(&g_udp_got, 1, __ATOMIC_RELEASE);
 }
 
-static void cmd_udptest(shell_t *sh, const char *arg)
+static void cmd_udptest(shell_t *sh, const char *args)
 {
     fbcon_t *c = sh->con;
-    if (!arg || !*arg) {
+    if (!args || !*args) {
         fbcon_puts_inst(c, A_RED "  udptest: usage: udptest <ip> <port> [msg]\n" A_RESET);
         return;
     }
 
-    uint32_t dst_ip = parse_ipv4(arg);
+    uint32_t dst_ip = parse_ipv4(args);
 
-    /* skip to port */
-    const char *p = arg;
+    const char *p = args;
     while (*p && *p != ' ') p++;
     while (*p == ' ')        p++;
     if (!*p) {
@@ -474,7 +521,6 @@ static void cmd_udptest(shell_t *sh, const char *arg)
         return;
     }
 
-    /* wait up to 2 s for a reply (20 × 100 ms) */
     for (int i = 0; i < 20; i++) {
         sched_sleep(100);
         if (__atomic_load_n(&g_udp_got, __ATOMIC_ACQUIRE)) break;
@@ -490,17 +536,17 @@ static void cmd_udptest(shell_t *sh, const char *arg)
 }
 
 /* ---- TCP connect test ----------------------------------------------------- */
-static void cmd_tcpconn(shell_t *sh, const char *arg)
+static void cmd_tcpconn(shell_t *sh, const char *args)
 {
     fbcon_t *c = sh->con;
-    if (!arg || !*arg) {
+    if (!args || !*args) {
         fbcon_puts_inst(c, A_RED "  tcpconn: usage: tcpconn <ip> <port>\n" A_RESET);
         return;
     }
 
-    uint32_t dst_ip = parse_ipv4(arg);
+    uint32_t dst_ip = parse_ipv4(args);
 
-    const char *p = arg;
+    const char *p = args;
     while (*p && *p != ' ') p++;
     while (*p == ' ')        p++;
     if (!*p) {
@@ -540,7 +586,6 @@ static void cmd_tcpconn(shell_t *sh, const char *arg)
     tcp_send_segment(tcb, TCP_SYN, NULL, 0);
     tcp_rexmit_timer_reset(tcb);
 
-    /* wait up to 5 s for ESTABLISHED (50 × 100 ms) */
     for (int i = 0; i < 50; i++) {
         sched_sleep(100);
         tcp_state_t s = __atomic_load_n(&tcb->state, __ATOMIC_ACQUIRE);
@@ -560,7 +605,6 @@ static void cmd_tcpconn(shell_t *sh, const char *arg)
     static const char greeting[] = "Hello from EXO_OS!\r\n";
     tcp_send_segment(tcb, TCP_PSH | TCP_ACK, greeting, sizeof(greeting) - 1);
 
-    /* wait up to 3 s for incoming data (30 × 100 ms) */
     for (int i = 0; i < 30; i++) {
         sched_sleep(100);
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
@@ -586,13 +630,14 @@ static void cmd_tcpconn(shell_t *sh, const char *arg)
         fbcon_puts_inst(c, "  (no data received)\n");
     }
 
-    /* graceful close */
     tcp_send_segment(tcb, TCP_FIN | TCP_ACK, NULL, 0);
     sched_sleep(500);
     tcp_tcb_free(tcb);
 }
 
-static void cmd_ifconfig(fbcon_t *c) {
+static void cmd_ifconfig(shell_t *sh, const char *args) {
+    (void)args;
+    fbcon_t *c = sh->con;
     int count = netdev_count();
     if (count == 0) {
         fbcon_puts_inst(c, "  No network interfaces.\n");
@@ -620,33 +665,13 @@ static void cmd_ifconfig(fbcon_t *c) {
     }
 }
 
-/* simple IP parser: "A.B.C.D" → host-order uint32 */
-static uint32_t parse_ipv4(const char *s) {
-    uint32_t a = 0, b = 0, c2 = 0, d = 0;
-    int pos = 0;
-    uint32_t *cur = &a;
-    while (s[pos]) {
-        if (s[pos] >= '0' && s[pos] <= '9') {
-            *cur = *cur * 10 + (s[pos] - '0');
-        } else if (s[pos] == '.') {
-            if (cur == &a) cur = &b;
-            else if (cur == &b) cur = &c2;
-            else if (cur == &c2) cur = &d;
-        } else {
-            break;  /* stop at space, NUL, or any non-IP character */
-        }
-        pos++;
-    }
-    return IP4_ADDR((uint8_t)a, (uint8_t)b, (uint8_t)c2, (uint8_t)d);
-}
-
-static void cmd_ping(shell_t *sh, const char *arg) {
+static void cmd_ping(shell_t *sh, const char *args) {
     fbcon_t *c = sh->con;
-    if (!arg || !*arg) {
+    if (!args || !*args) {
         fbcon_puts_inst(c, A_RED "  ping: missing IP address\n" A_RESET);
         return;
     }
-    uint32_t dst = parse_ipv4(arg);
+    uint32_t dst = parse_ipv4(args);
     netdev_t *dev = netdev_get_nth(0);
     if (!dev) {
         fbcon_puts_inst(c, A_RED "  ping: no network interface\n" A_RESET);
@@ -663,7 +688,6 @@ static void cmd_ping(shell_t *sh, const char *arg) {
             fbcon_puts_inst(c, "  send failed\n");
             continue;
         }
-        /* wait up to 2 seconds for reply */
         for (int w = 0; w < 20; w++) {
             sched_sleep(100);
             if (g_ping_state.reply_received) break;
@@ -678,7 +702,9 @@ static void cmd_ping(shell_t *sh, const char *arg) {
     }
 }
 
-static void cmd_arp_show(fbcon_t *c) {
+static void cmd_arp_show(shell_t *sh, const char *args) {
+    (void)args;
+    fbcon_t *c = sh->con;
     arp_entry_t table[64];
     int count = arp_get_table(table, 64);
     if (count == 0) {
@@ -695,6 +721,41 @@ static void cmd_arp_show(fbcon_t *c) {
     }
 }
 
+/* ── Register all built-in commands ───────────────────────────────────────── */
+void shell_register_builtins(void) {
+    spinlock_init(&g_cmd_lock);
+
+    shell_register_cmd("help",     "show this help",                cmd_help);
+    shell_register_cmd("clear",    "clear the terminal",            cmd_clear);
+    shell_register_cmd("echo",     "print text to screen",          cmd_echo);
+    shell_register_cmd("ver",      "show OS version",               cmd_ver);
+    shell_register_cmd("uname",    "alias for ver",                 cmd_ver);
+    shell_register_cmd("mem",      "physical memory stats",         cmd_mem);
+    shell_register_cmd("sysinfo",  "CPU / SMP / feature scan",      cmd_sysinfo);
+    shell_register_cmd("tasks",    "list all scheduler tasks",       cmd_tasks);
+    shell_register_cmd("cputest",  "run CPU/SMP/sched test suite",   cmd_cputest);
+
+    /* Filesystem */
+    shell_register_cmd("ls",       "list directory",                 cmd_ls);
+    shell_register_cmd("cd",       "change directory",               cmd_cd);
+    shell_register_cmd("pwd",      "print working directory",        cmd_pwd);
+    shell_register_cmd("cat",      "display file contents",          cmd_cat);
+    shell_register_cmd("stat",     "show file/dir info",             cmd_stat);
+    shell_register_cmd("mkdir",    "create directory",               cmd_mkdir_shell);
+    shell_register_cmd("touch",    "create empty file",              cmd_touch);
+
+    /* Networking */
+    shell_register_cmd("ifconfig", "show network interfaces",        cmd_ifconfig);
+    shell_register_cmd("ping",     "send ICMP echo request",         cmd_ping);
+    shell_register_cmd("arp",      "show ARP cache",                 cmd_arp_show);
+    shell_register_cmd("udptest",  "send a UDP datagram",            cmd_udptest);
+    shell_register_cmd("tcpconn",  "open a TCP connection",          cmd_tcpconn);
+
+    /* Phase 6: Monitoring & power commands (cmd_monitor.c) */
+    extern void cmd_monitor_register(void);
+    cmd_monitor_register();
+}
+
 /* ── Command dispatcher ───────────────────────────────────────────────────── */
 static void run_line(shell_t *sh) {
     fbcon_t *c = sh->con;
@@ -708,58 +769,30 @@ static void run_line(shell_t *sh) {
     fbcon_putchar_inst(c, '\n');
 
     if (*p == '\0') {
-        /* empty */
-    } else if (strcmp(p, "help") == 0) {
-        fbcon_putchar_inst(c, '\n');
-        cmd_help(c);
-    } else if (strcmp(p, "clear") == 0) {
-        cmd_clear(c);
-        goto reprompt;
-    } else if (strncmp(p, "echo", 4) == 0 && (p[4] == ' ' || p[4] == '\0')) {
-        cmd_echo(c, p[4] == ' ' ? p + 5 : "");
-    } else if (strcmp(p, "ver") == 0 || strcmp(p, "uname") == 0) {
-        fbcon_putchar_inst(c, '\n'); cmd_ver(c); fbcon_putchar_inst(c, '\n');
-    } else if (strcmp(p, "mem") == 0) {
-        fbcon_putchar_inst(c, '\n'); cmd_mem(c); fbcon_putchar_inst(c, '\n');
-    } else if (strcmp(p, "pwd") == 0) {
-        cmd_pwd(sh);
-    } else if (strncmp(p, "cd", 2) == 0 && (p[2] == ' ' || p[2] == '\0')) {
-        cmd_cd(sh, p[2] == ' ' ? p + 3 : NULL);
-    } else if (strncmp(p, "ls", 2) == 0 && (p[2] == ' ' || p[2] == '\0')) {
-        cmd_ls(sh, p[2] == ' ' ? p + 3 : NULL);
-    } else if (strncmp(p, "cat ", 4) == 0) {
-        cmd_cat(sh, p + 4);
-    } else if (strncmp(p, "stat ", 5) == 0) {
-        cmd_stat(sh, p + 5);
-    } else if (strncmp(p, "mkdir ", 6) == 0) {
-        cmd_mkdir_shell(sh, p + 6);
-    } else if (strncmp(p, "touch ", 6) == 0) {
-        cmd_touch(sh, p + 6);
-    } else if (strcmp(p, "cputest") == 0) {
-        cmd_sysinfo(c);   /* always show sysinfo context first */
-        fbcon_putchar_inst(c, '\n');
-        cputest_run(c);
-    } else if (strcmp(p, "sysinfo") == 0) {
-        cmd_sysinfo(c);
-    } else if (strcmp(p, "tasks") == 0) {
-        cmd_tasks(c);
-    } else if (strcmp(p, "ifconfig") == 0) {
-        cmd_ifconfig(c);
-    } else if (strncmp(p, "ping ", 5) == 0) {
-        cmd_ping(sh, p + 5);
-    } else if (strcmp(p, "arp") == 0) {
-        cmd_arp_show(c);
-    } else if (strncmp(p, "udptest ", 8) == 0) {
-        cmd_udptest(sh, p + 8);
-    } else if (strncmp(p, "tcpconn ", 8) == 0) {
-        cmd_tcpconn(sh, p + 8);
+        /* empty line */
     } else {
-        fbcon_puts_inst(c, A_RED "  error:" A_RESET " unknown command '");
-        fbcon_puts_inst(c, p);
-        fbcon_puts_inst(c, "' -- try " A_BOLD "help" A_RESET "\n\n");
+        /* Extract command name (first word) */
+        char cmd_name[64];
+        int ci = 0;
+        const char *q = p;
+        while (*q && *q != ' ' && ci < 63) cmd_name[ci++] = *q++;
+        cmd_name[ci] = '\0';
+
+        /* Skip space after command to get args */
+        while (*q == ' ') q++;
+        const char *args = (*q) ? q : NULL;
+
+        shell_cmd_t *cmd = shell_find_cmd(cmd_name);
+        if (cmd) {
+            cmd->fn(sh, args);
+        } else {
+            fbcon_puts_inst(c, A_RED "  error:" A_RESET " unknown command '");
+            fbcon_puts_inst(c, p);
+            fbcon_puts_inst(c, "' -- try " A_BOLD "help" A_RESET "\n\n");
+        }
     }
 
-reprompt:
+    /* Handle 'clear' specially: don't re-print prompt prefix if screen was cleared */
     fbcon_printf_inst(c, A_GREEN "exo" A_RESET ":" A_CYAN "%s" A_RESET "> ", sh->cwd);
     fbcon_show_cursor_inst(c);
 }
@@ -799,7 +832,7 @@ void shell_on_char_inst(shell_t *sh, char c) {
     else if (c == '\n') { run_line(sh); return; }
     else if (c == '\b') {
         if (sh->len > 0) { sh->len--; fbcon_putchar_inst(sh->con, '\b'); }
-    } else if ((unsigned char)c >= 0x20 && sh->len < LINE_MAX - 1) {
+    } else if ((unsigned char)c >= 0x20 && sh->len < SHELL_LINE_MAX - 1) {
         sh->line[sh->len++] = c;
         fbcon_putchar_inst(sh->con, c);
     }

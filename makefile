@@ -55,10 +55,13 @@ CFLAGS          :=                      \
     -fno-PIC                            \
     -m64                                \
     -march=x86-64                       \
-    -mno-80387                          \
-    -mno-mmx                            \
-    -mno-sse                            \
-    -mno-sse2                           \
+    -msse -msse2 -msse3 -mssse3         \
+    -msse4.1 -msse4.2                   \
+    -mavx -mavx2                        \
+    -mf16c -mfma                        \
+    -maes -mpclmul -mpopcnt             \
+    -mbmi -mbmi2 -mlzcnt                \
+    -mfpmath=sse                        \
     -mno-red-zone                       \
     -mcmodel=kernel                     \
     -O2 -g                              \
@@ -206,6 +209,7 @@ $(OVMF_VARS): $(OVMF_VARS_TMPL)
 run: $(DISK_IMG) $(OVMF_VARS)
 	qemu-system-x86_64                                                  \
 	    -machine q35                                                    \
+	    -cpu host                                                       \
 	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE)       \
 	    -drive if=pflash,format=raw,file=$(OVMF_VARS)                   \
 	    -drive id=hd0,file=$(DISK_IMG),format=raw,if=none               \
@@ -225,6 +229,7 @@ run: $(DISK_IMG) $(OVMF_VARS)
 run-debug: $(DISK_IMG) $(OVMF_VARS)
 	qemu-system-x86_64                                                  \
 	    -machine q35                                                    \
+	    -cpu host                                                       \
 	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE)       \
 	    -drive if=pflash,format=raw,file=$(OVMF_VARS)                   \
 	    -drive id=hd0,file=$(DISK_IMG),format=raw,if=none               \

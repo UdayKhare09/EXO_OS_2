@@ -1,5 +1,6 @@
 #include "apic.h"
 #include "cpu.h"
+#include "hpet.h"
 #include "lib/klog.h"
 #include "lib/panic.h"
 #include "mm/vmm.h"
@@ -136,7 +137,14 @@ uint32_t apic_timer_calibrate(void) {
     lapic_write(APIC_REG_TIMER_DIV,  0x03);   /* divide by 16 */
     lapic_write(APIC_REG_TIMER_INIT, 0xFFFFFFFF);
 
-    pit_sleep_ms(10);
+    /* Use HPET for precision calibration if available, else fall back to PIT */
+    if (hpet_is_available()) {
+        hpet_sleep_ms(10);
+        KLOG_INFO("APIC timer: calibrated via HPET\n");
+    } else {
+        pit_sleep_ms(10);
+        KLOG_INFO("APIC timer: calibrated via PIT\n");
+    }
 
     uint32_t elapsed = 0xFFFFFFFF - lapic_read(APIC_REG_TIMER_CURR);
     timer_ticks_per_ms = elapsed / 10;

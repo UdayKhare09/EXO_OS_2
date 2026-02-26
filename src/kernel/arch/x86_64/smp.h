@@ -7,12 +7,17 @@
 
 /* Per-CPU structure — stored in GS base */
 typedef struct cpu_info {
-    struct cpu_info *self;       /* pointer to self (for GS-relative access)  */
-    uint32_t         id;         /* sequential CPU index (0 = BSP)             */
-    uint8_t          lapic_id;   /* hardware LAPIC ID                          */
-    uint8_t          online;     /* 1 = boot complete                          */
-    uintptr_t        kernel_stack_top;
+    struct cpu_info *self;       /* offset  0: GS:0 = self for fast access    */
+    uint32_t         id;         /* offset  8: sequential CPU index           */
+    uint8_t          lapic_id;   /* offset 12: hardware LAPIC ID              */
+    uint8_t          online;     /* offset 13: 1 = boot complete              */
+    uint8_t          _pad[2];    /* offset 14: explicit padding               */
+    uintptr_t        kernel_stack_top;  /* offset 16                          */
+    uint8_t         *isr_xsave_buf;    /* offset 24: per-CPU 4 KiB XSAVE buf */
 } cpu_info_t;
+
+/* Byte offset of isr_xsave_buf in cpu_info_t — referenced by isr.asm */
+#define CPU_INFO_ISR_XSAVE_BUF_OFF  24
 
 void smp_init(void);              /* BSP: discover and boot all APs           */
 cpu_info_t *smp_self(void);       /* returns current CPU info via GS base     */

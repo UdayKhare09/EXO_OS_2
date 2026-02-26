@@ -353,84 +353,16 @@ void fbcon_puts_inst(fbcon_t *c, const char *s) {
 
 /* ── Minimal printf ──────────────────────────────────────────────────────── */
 
-static void puts_n(fbcon_t *c, const char *s, int n) {
-    for (int i = 0; i < n && s[i]; i++) emit_char(c, s[i]);
-}
-
-static void put_uint(fbcon_t *c, unsigned long long v, int base, bool upper) {
-    const char *digs = upper ? "0123456789ABCDEF" : "0123456789abcdef";
-    char buf[64];
-    int  len = 0;
-    if (v == 0) { emit_char(c, '0'); return; }
-    while (v) { buf[len++] = digs[v % (unsigned)base]; v /= (unsigned)base; }
-    for (int i = len - 1; i >= 0; i--) emit_char(c, buf[i]);
-}
-
 void fbcon_printf_inst(fbcon_t *c, const char *fmt, ...) {
     if (!c || !fmt) return;
+    char buf[1024];
     va_list ap;
     va_start(ap, fmt);
+    kvsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
 
     bool was_drawn = c->cursor_drawn;
     if (was_drawn) cursor_erase(c);
-
-    while (*fmt) {
-        if (*fmt != '%') { emit_char(c, *fmt++); continue; }
-        fmt++; /* skip '%' */
-
-        /* Flags / width (minimal) */
-        bool alt   = false;
-        int  width = 0;
-        if (*fmt == '#') { alt = true; fmt++; }
-        if (*fmt == '0') { fmt++; }   /* zero-padding: recorded but not yet implemented */
-        while (*fmt >= '1' && *fmt <= '9') { width = width * 10 + (*fmt++ - '0'); }
-
-        /* Length modifier */
-        bool is_long  = false;
-        bool is_llong = false;
-        if (*fmt == 'l') { is_long = true;  fmt++;
-            if (*fmt == 'l') { is_llong = true; fmt++; } }
-        else if (*fmt == 'z') { is_llong = (sizeof(size_t) == 8); fmt++; }
-
-        char spec = *fmt++;
-        switch (spec) {
-        case 'c': emit_char(c, (char)va_arg(ap, int)); break;
-        case 's': { const char *s = va_arg(ap, const char *); if (!s) s = "(null)";
-                    puts_n(c, s, 65536); break; }
-        case 'd': case 'i': {
-            long long v;
-            if (is_llong) v = va_arg(ap, long long);
-            else if (is_long) v = va_arg(ap, long);
-            else v = va_arg(ap, int);
-            if (v < 0) { emit_char(c, '-'); v = -v; }
-            put_uint(c, (unsigned long long)v, 10, false);
-            break; }
-        case 'u': {
-            unsigned long long v;
-            if (is_llong) v = va_arg(ap, unsigned long long);
-            else if (is_long) v = va_arg(ap, unsigned long);
-            else v = va_arg(ap, unsigned int);
-            put_uint(c, v, 10, false);
-            break; }
-        case 'x': case 'X': {
-            unsigned long long v;
-            if (is_llong) v = va_arg(ap, unsigned long long);
-            else if (is_long) v = va_arg(ap, unsigned long);
-            else v = va_arg(ap, unsigned int);
-            if (alt) { emit_char(c, '0'); emit_char(c, spec == 'X' ? 'X' : 'x'); }
-            put_uint(c, v, 16, spec == 'X');
-            break; }
-        case 'p': {
-            uintptr_t v = (uintptr_t)va_arg(ap, void *);
-            emit_char(c, '0'); emit_char(c, 'x');
-            put_uint(c, (unsigned long long)v, 16, false);
-            break; }
-        case '%': emit_char(c, '%'); break;
-        default:  emit_char(c, '%'); emit_char(c, spec); break;
-        }
-        (void)width; /* width formatting not implemented; avoid warning */
-    }
-
+    for (const char *p = buf; *p; p++) emit_char(c, *p);
     if (was_drawn) cursor_draw(c);
-    va_end(ap);
 }

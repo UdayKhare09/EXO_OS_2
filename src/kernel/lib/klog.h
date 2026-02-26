@@ -23,3 +23,10 @@ void serial_puts(const char *s);
 /* Optional secondary write callback (e.g., framebuffer console).
  * Set to NULL to disable. Called with the formatted string after serial. */
 void klog_set_write_fn(void (*fn)(const char *s));
+
+/* ── Ring buffer (dmesg) ─────────────────────────────────────────────────── */
+/* Returns a pointer to the internal ring buffer and its size.
+ * The caller must not free the pointer.
+ * *out_total = total bytes written since boot (may exceed buf_size, meaning
+ *              the oldest entries have been overwritten). */
+const char *klog_get_ring(uint32_t *out_total, uint32_t *out_buf_size);

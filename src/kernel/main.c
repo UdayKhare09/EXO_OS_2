@@ -36,6 +36,8 @@
 #include "arch/x86_64/acpi.h"
 #include "arch/x86_64/smp.h"
 #include "arch/x86_64/ioapic.h"
+#include "arch/x86_64/hpet.h"
+#include "arch/x86_64/rtc.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "sched/sched.h"
@@ -57,6 +59,7 @@
 #include "drivers/storage/blkdev.h"
 #include "drivers/storage/virtio_blk.h"
 #include "drivers/storage/ahci.h"
+#include "drivers/bus/smbus.h"
 #include "fs/gpt.h"
 #include "syscall/syscall.h"
 
@@ -302,6 +305,9 @@ void kmain(void) {
     int pci_count = pci_enumerate(s_pci_buf, 64);
     KLOG_INFO("pci: found %d device(s)\n", pci_count);
 
+    /* ── 5e. SMBus / I2C (depends on PCI scan) ───────────────────────────── */
+    smbus_init();
+
     /* ── 6. GOP framebuffer console ───────────────────────────────────────── */
     if (!fb_req.response || fb_req.response->framebuffer_count == 0) {
         KLOG_ERR("gfx: no Limine framebuffer — halting\n");
@@ -326,6 +332,12 @@ void kmain(void) {
     /* ── 7. ACPI / MADT ───────────────────────────────────────────────────── */
     acpi_init((uintptr_t)rsdp_req.response->address);
 
+    /* ── 7b. HPET — precision timer (depends on ACPI tables) ─────────────── */
+    hpet_init();
+
+    /* ── 7c. RTC — wall-clock time (uses ACPI FADT + HPET if available) ──── */
+    rtc_init();
+
     /* ── 8. APIC ──────────────────────────────────────────────────────────── */
     madt_info_t *madt = acpi_get_madt_info();
     apic_init(madt->lapic_base);
@@ -346,6 +358,11 @@ void kmain(void) {
     smp_init();
 
     /* ── 11. Spawn tasks ──────────────────────────────────────────────────── */
+    /* Register all built-in shell commands before spawning the shell */
+    extern void shell_register_builtins(void);
+    shell_register_builtins();
+    shell_sort_commands();
+
     sched_spawn("shell",        shell_task,        NULL);
     sched_spawn("usb-init",     usb_init_task,     NULL);
     sched_spawn("storage-init", storage_init_task, NULL);

@@ -182,3 +182,10 @@ void  usb_dma_free (uintptr_t phys);
 
 /* Top-level: find xHCI, enumerate devices, bind class drivers              */
 bool usb_init(void);
+
+/* ── Enumerated device query (for lsusb) ────────────────────────────────── */
+/* Return the n-th enumerated USB device (0-based).  Returns NULL if oob. */
+const usb_device_t *usb_get_device(int n);
+
+/* Return total number of enumerated USB devices. */
+int usb_device_count(void);

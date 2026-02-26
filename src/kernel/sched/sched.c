@@ -39,7 +39,9 @@ static cpu_sched_t cpu_scheds[MAX_CPUS];
 /* Defined in context_switch.asm */
 extern void task_switch_asm(uint64_t *old_rsp_ptr,
                             uint64_t  new_rsp,
-                            uint64_t  new_cr3);
+                            uint64_t  new_cr3,
+                            uint8_t  *old_fpu,
+                            uint8_t  *new_fpu);
 
 /* ── Run-queue lock helpers ──────────────────────────────────────────────── */
 
@@ -247,7 +249,8 @@ void sched_tick(void) {
     if (prev == next) return;     /* same task: no switch needed */
 
     /* Perform context switch */
-    task_switch_asm(&prev->rsp, next->rsp, next->cr3);
+    task_switch_asm(&prev->rsp, next->rsp, next->cr3,
+                    prev->fpu_state, next->fpu_state);
 }
 
 /* ── sched_task_exit ─────────────────────────────────────────────────────── */

@@ -56,6 +56,19 @@ task_t *task_create(const char *name, task_entry_t entry, void *arg,
     t->stack_phys = stack_phys;
     uintptr_t stack_virt_top = vmm_phys_to_virt(stack_phys) + TASK_STACK_SIZE;
 
+    /* FPU/SSE/AVX state buffer — must be 64-byte aligned for XSAVE/XRSTOR.
+     * pmm_alloc_pages returns 4096-byte aligned addresses (>= 64 bytes). */
+    uintptr_t fpu_phys = pmm_alloc_pages(1);
+    if (!fpu_phys) {
+        pmm_free_pages(stack_phys, TASK_STACK_SIZE / PAGE_SIZE);
+        pmm_free_pages(task_page, 1);
+        return NULL;
+    }
+    t->fpu_state = (uint8_t *)vmm_phys_to_virt(fpu_phys);
+    memset(t->fpu_state, 0, PAGE_SIZE);
+    /* Zeroed XSTATE_BV (offset 512) means XRSTOR uses initial FPU state:
+     * FCW=0x037F, MXCSR=0x1F80, all ST/XMM/YMM regs zeroed. */
+
     /* Push initial frame onto the stack */
     stack_virt_top -= sizeof(init_frame_t);
     init_frame_t *frame = (init_frame_t *)stack_virt_top;
@@ -96,9 +109,13 @@ task_t *task_create(const char *name, task_entry_t entry, void *arg,
 void task_destroy(task_t *t) {
     if (!t) return;
     task_unregister(t);
-    fd_close_all(t);                         /* close all open file descriptors  */
+    fd_close_all(t);
     signal_table_free(t->sig_handlers);  t->sig_handlers = NULL;
     ipc_mailbox_destroy(t->mailbox);     t->mailbox      = NULL;
+    if (t->fpu_state) {
+        pmm_free_pages(vmm_virt_to_phys((uintptr_t)t->fpu_state), 1);
+        t->fpu_state = NULL;
+    }
     pmm_free_pages(t->stack_phys, TASK_STACK_SIZE / PAGE_SIZE);
     uintptr_t task_phys = vmm_virt_to_phys((uintptr_t)t);
     pmm_free_pages(task_phys, 1);

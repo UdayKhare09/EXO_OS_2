@@ -6,9 +6,14 @@ section .text
 
 extern isr_dispatch
 
-; Common handler: all registers already saved by the stub macro
+; Common handler: full GP save + per-CPU XSAVE64 FPU protection
 common_isr_stub_handler:
-    ; Push all GP registers
+    ; Push all GP registers (15 × 8 = 120 bytes).
+    ; Stack alignment proof: CPU pushes 40 bytes (SS/RSP/RFLAGS/CS/RIP) +
+    ; stub pushes 16 bytes (err+vec) = 56 bytes; 56 mod 16 = 8 (misaligned).
+    ; After 15 GP pushes (120 bytes): 56+120=176, 176 mod 16 = 0. RSP is
+    ; 16-byte aligned at this point — safe for XSAVE64 (requires 64-byte
+    ; alignment of the *buffer*, not of RSP itself).
     push rax
     push rbx
     push rcx
@@ -25,9 +30,32 @@ common_isr_stub_handler:
     push r14
     push r15
 
-    mov  rdi, rsp          ; first arg = pointer to cpu_regs_t
+    ; ── Protect FPU / SSE / AVX across C ISR code ────────────────────────
+    ; Per-CPU ISR XSAVE buffer is at offset 24 of cpu_info_t (GS base).
+    ; Using XSAVE64 (component mask 0x7 = x87+SSE+AVX) so full SIMD state is
+    ; preserved even if isr_dispatch C code emits XMM/YMM instructions.
+    ; Skip gracefully if GS is not yet configured (interrupts fire before
+    ; smp_init sets the GS base, e.g. from very early exceptions).
+    mov  rcx, [gs:24]          ; rcx = cpu_info->isr_xsave_buf (page-aligned)
+    test rcx, rcx
+    jz   .call_dispatch
+    mov  eax, 7                ; component mask: x87(1) | SSE(2) | AVX(4)
+    xor  edx, edx
+    xsave64 [rcx]
+
+.call_dispatch:
+    mov  rdi, rsp              ; arg0 = &cpu_regs_t (top of GP frame)
     call isr_dispatch
 
+    ; ── Restore FPU / SSE / AVX state ────────────────────────────────────
+    mov  rcx, [gs:24]
+    test rcx, rcx
+    jz   .restore_gp
+    mov  eax, 7
+    xor  edx, edx
+    xrstor64 [rcx]
+
+.restore_gp:
     pop  r15
     pop  r14
     pop  r13
@@ -44,7 +72,7 @@ common_isr_stub_handler:
     pop  rbx
     pop  rax
 
-    add  rsp, 16           ; pop vec + err
+    add  rsp, 16               ; discard vec + err code
     iretq
 
 ; Macro: exceptions WITH error code already pushed by CPU (vecs 8,10-14,17,21,29,30)

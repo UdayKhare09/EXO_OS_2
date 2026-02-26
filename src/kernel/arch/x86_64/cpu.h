@@ -91,3 +91,63 @@ static inline void write_cr3(uint64_t v) {
 static inline void invlpg(uintptr_t addr) {
     __asm__ volatile("invlpg (%0)" : : "r"(addr) : "memory");
 }
+
+/* ── FPU / SSE / AVX hardware init ─────────────────────────────────────── */
+/*
+ * Must be called on EVERY logical CPU (BSP + each AP) before any
+ * floating-point or SIMD instruction is executed on that CPU.
+ *
+ * Sets up:
+ *   CR0  — clears EM (disable FP emulation), sets MP, clears TS
+ *   CR4  — sets OSFXSR, OSXMMEXCPT, OSXSAVE
+ *   XCR0 — enables x87, SSE/XMM, AVX/YMM state components
+ *   x87  — FNINIT (FCW=0x037F, all exceptions masked)
+ *   SSE  — LDMXCSR 0x1F80 (all exceptions masked, round-to-nearest)
+ */
+static inline void cpu_enable_fpu(void) {
+    uint64_t cr0, cr4;
+    uint32_t eax, ebx, ecx, edx;
+
+    /* CR0: clear EM (no emulation), set MP (monitor FPU), clear TS */
+    __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+    cr0 &= ~(1ULL << 2);   /* clear EM  */
+    cr0 |=  (1ULL << 1);   /* set   MP  */
+    cr0 &= ~(1ULL << 3);   /* clear TS  */
+    __asm__ volatile("mov %0, %%cr0" :: "r"(cr0) : "memory");
+
+    /* Probe CPUID.1 for feature bits */
+    cpuid(1, &eax, &ebx, &ecx, &edx);
+    bool has_fxsr    = (edx >> 24) & 1;  /* bit 24: FXSR      */
+    bool has_sse     = (edx >> 25) & 1;  /* bit 25: SSE       */
+    bool has_xsave   = (ecx >> 26) & 1;  /* bit 26: XSAVE     */
+    bool has_avx     = (ecx >> 28) & 1;  /* bit 28: AVX       */
+
+    /* CR4: conditionally enable OSFXSR, OSXMMEXCPT, OSXSAVE */
+    __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+    if (has_fxsr)
+        cr4 |= (1ULL <<  9);   /* OSFXSR     */
+    if (has_sse)
+        cr4 |= (1ULL << 10);   /* OSXMMEXCPT */
+    if (has_xsave)
+        cr4 |= (1ULL << 18);   /* OSXSAVE    */
+    __asm__ volatile("mov %0, %%cr4" :: "r"(cr4) : "memory");
+
+    /* XCR0: enable state components (requires OSXSAVE set first) */
+    if (has_xsave) {
+        uint32_t xcr0_lo, xcr0_hi;
+        __asm__ volatile("xgetbv" : "=a"(xcr0_lo), "=d"(xcr0_hi) : "c"(0));
+        xcr0_lo |= 0x3u;       /* x87 (bit0) + SSE/XMM (bit1) */
+        if (has_avx)
+            xcr0_lo |= 0x4u;   /* AVX/YMM (bit2) */
+        __asm__ volatile("xsetbv" :: "c"(0), "a"(xcr0_lo), "d"(xcr0_hi));
+    }
+
+    /* Reset x87 FPU to initial state (FCW=0x037F) */
+    __asm__ volatile("fninit");
+
+    /* Set MXCSR: all SSE exceptions masked, round-to-nearest */
+    if (has_sse) {
+        static const uint32_t mxcsr_dflt = 0x1F80;
+        __asm__ volatile("ldmxcsr %0" :: "m"(mxcsr_dflt));
+    }
+}
