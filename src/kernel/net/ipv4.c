@@ -89,6 +89,19 @@ void ip_rx(netdev_t *dev, skbuff_t *skb) {
         return;
     }
 
+    /* Trim skb to IP total_len — Ethernet frames may carry padding beyond
+     * the IP payload (e.g. minimum 64-byte frame), and that padding must
+     * NOT be included in transport-layer checksum calculations. */
+    uint16_t ip_total = ntohs(ip->total_len);
+    if (ip_total < hdr_len || ip_total > skb->len) {
+        skb_free(skb);
+        return;
+    }
+    if (skb->len > ip_total) {
+        skb->len  = ip_total;
+        skb->tail = skb->data + ip_total;
+    }
+
     /* Record addresses in skb for transport layer */
     skb->src_ip = ip->src_ip;
     skb->dst_ip = ip->dst_ip;

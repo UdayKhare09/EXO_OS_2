@@ -3,11 +3,18 @@
 #include "cpu.h"
 #include "mm/vmm.h"
 #include "lib/klog.h"
+#include "lib/spinlock.h"
 #include <stddef.h>
 
 /* Global discovered device table */
 static pci_device_t g_pci_devs[PCI_MAX_DEVICES];
 static int          g_pci_count = 0;
+
+/* Lock protecting the two-step 0xCF8/0xCFC config-space I/O.
+ * Without this, concurrent PCI accesses from different CPUs can
+ * interleave the address-write and data-read/write, causing
+ * corrupted config space reads. */
+static spinlock_t g_pci_lock;
 
 /* ── Config space I/O ─────────────────────────────────────────────────────── */
 static inline uint32_t pci_addr(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off) {
@@ -19,28 +26,43 @@ static inline uint32_t pci_addr(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t of
 }
 
 uint8_t pci_read8(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off) {
+    spinlock_acquire(&g_pci_lock);
     outl(0xCF8, pci_addr(bus, dev, fn, off));
-    return inb(0xCFC + (off & 3));
+    uint8_t v = inb(0xCFC + (off & 3));
+    spinlock_release(&g_pci_lock);
+    return v;
 }
 uint16_t pci_read16(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off) {
+    spinlock_acquire(&g_pci_lock);
     outl(0xCF8, pci_addr(bus, dev, fn, off));
-    return inw(0xCFC + (off & 2));
+    uint16_t v = inw(0xCFC + (off & 2));
+    spinlock_release(&g_pci_lock);
+    return v;
 }
 uint32_t pci_read32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off) {
+    spinlock_acquire(&g_pci_lock);
     outl(0xCF8, pci_addr(bus, dev, fn, off));
-    return inl(0xCFC);
+    uint32_t v = inl(0xCFC);
+    spinlock_release(&g_pci_lock);
+    return v;
 }
 void pci_write8(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off, uint8_t v) {
+    spinlock_acquire(&g_pci_lock);
     outl(0xCF8, pci_addr(bus, dev, fn, off));
     outb(0xCFC + (off & 3), v);
+    spinlock_release(&g_pci_lock);
 }
 void pci_write16(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off, uint16_t v) {
+    spinlock_acquire(&g_pci_lock);
     outl(0xCF8, pci_addr(bus, dev, fn, off));
     outw(0xCFC + (off & 2), v);
+    spinlock_release(&g_pci_lock);
 }
 void pci_write32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off, uint32_t v) {
+    spinlock_acquire(&g_pci_lock);
     outl(0xCF8, pci_addr(bus, dev, fn, off));
     outl(0xCFC, v);
+    spinlock_release(&g_pci_lock);
 }
 
 /* ── BAR decode ───────────────────────────────────────────────────────────── */
@@ -108,7 +130,10 @@ static int probe_fn(uint8_t bus, uint8_t dev, uint8_t fn) {
     return 1;
 }
 
-int pci_enumerate(pci_device_t *out, int max) {
+static int g_pci_scanned = 0;
+
+static void pci_do_scan(void) {
+    if (g_pci_scanned) return;
     g_pci_count = 0;
     for (int bus = 0; bus < 256; bus++) {
         for (int dev = 0; dev < 32; dev++) {
@@ -120,6 +145,11 @@ int pci_enumerate(pci_device_t *out, int max) {
             }
         }
     }
+    g_pci_scanned = 1;
+}
+
+int pci_enumerate(pci_device_t *out, int max) {
+    pci_do_scan();
     int n = g_pci_count < max ? g_pci_count : max;
     for (int i = 0; i < n; i++) out[i] = g_pci_devs[i];
     return n;
@@ -141,6 +171,7 @@ pci_device_t *pci_find(uint16_t vendor, uint16_t device) {
 }
 
 int pci_get_devices(pci_device_t **out) {
+    pci_do_scan();
     *out = g_pci_devs;
     return g_pci_count;
 }

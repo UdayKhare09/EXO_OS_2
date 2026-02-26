@@ -222,9 +222,9 @@ halted:
 
 /* ─── xhci_init ──────────────────────────────────────────────────────────── */
 bool xhci_init(void) {
-    /* Find xHCI controller via PCI class */
-    pci_device_t devs[64];
-    int n = pci_enumerate(devs, 64);
+    /* Find xHCI controller from the already-scanned PCI device table */
+    pci_device_t *devs;
+    int n = pci_get_devices(&devs);
     pci_device_t *pdev = NULL;
     for (int i = 0; i < n; i++) {
         if (devs[i].class    == PCI_CLASS_SERIAL_BUS &&

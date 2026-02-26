@@ -397,18 +397,13 @@ int ahci_init(void) {
     int n = 0;
     blkdev_t *tmp; (void)tmp; /* just to avoid unused-var */
 
-    /* We need to enumerate PCI devices manually here as pci_find only returns
-     * one device. Walk the PCI table via known API. */
-    /* Use pci_find with class-based scan: loop by trying to find AHCI HBA */
-    /* EXO_OS pci_enumerate fills a static table; we iterate all 64 slots. */
-    extern int pci_enumerate(pci_device_t *out, int max);
     #define AHCI_MAX_HBA 4
     pci_device_t ahci_devs[AHCI_MAX_HBA];
     int found = 0;
 
-    /* We can't easily re-enumerate, so use a small re-scan */
-    pci_device_t scan_buf[64];
-    int cnt = pci_enumerate(scan_buf, 64);
+    /* Use the already-scanned PCI device table (no re-enumeration) */
+    pci_device_t *scan_buf;
+    int cnt = pci_get_devices(&scan_buf);
     for (int i = 0; i < cnt; i++) {
         pci_device_t *d = &scan_buf[i];
         if (d->class == PCI_CLASS_STORAGE && d->subclass == PCI_SUBCLASS_SATA) {
