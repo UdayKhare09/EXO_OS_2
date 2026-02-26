@@ -41,7 +41,11 @@ int64_t sys_read(int fd, void *buf, uint64_t count) {
     file_t *f = fd_get(t, fd);
     if (!f) return -EBADF;
     if ((f->flags & O_ACCMODE) == O_WRONLY) return -EACCES;
-
+    /* Generic file ops path (sockets, pipes, etc.) */
+    if (f->f_ops) {
+        if (!f->f_ops->read) return -EINVAL;
+        return (int64_t)f->f_ops->read(f, buf, (size_t)count);
+    }
     vnode_t *v = f->vnode;
     if (!v || !v->ops->read) return -EINVAL;
 
@@ -61,7 +65,11 @@ int64_t sys_write(int fd, const void *buf, uint64_t count) {
     file_t *f = fd_get(t, fd);
     if (!f) return -EBADF;
     if ((f->flags & O_ACCMODE) == O_RDONLY) return -EACCES;
-
+    /* Generic file ops path (sockets, pipes, etc.) */
+    if (f->f_ops) {
+        if (!f->f_ops->write) return -EINVAL;
+        return (int64_t)f->f_ops->write(f, buf, (size_t)count);
+    }
     vnode_t *v = f->vnode;
     if (!v || !v->ops->write) return -EINVAL;
     if (VFS_S_ISDIR(v->mode)) return -EISDIR;
@@ -174,8 +182,12 @@ int64_t sys_stat(const char *upath, linux_stat_t *buf) {
 int64_t sys_fstat(int fd, linux_stat_t *buf) {
     if (!buf) return -EINVAL;
     file_t *f = fd_get(cur_task(), fd);
-    if (!f) return -EBADF;
-    vfs_stat_t st;
+    if (!f) return -EBADF;    /* Non-vnode fds (sockets etc.) return a minimal stat */
+    if (!f->vnode) {
+        __builtin_memset(buf, 0, sizeof(*buf));
+        buf->st_mode = 0140666;  /* S_IFSOCK | rw-rw-rw- */
+        return 0;
+    }    vfs_stat_t st;
     int r = f->vnode->ops->stat(f->vnode, &st);
     if (r < 0) return r;
     fill_linux_stat(buf, &st);

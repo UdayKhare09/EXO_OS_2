@@ -15,13 +15,31 @@
 #define FD_TABLE_SIZE  256   /* max open files per task                      */
 #define FD_MAX         (FD_TABLE_SIZE - 1)
 
+/* ── Generic file operations vtable ─────────────────────────────────────── */
+/* When f_ops is non-NULL, syscalls (read/write/close/poll/ioctl) delegate
+ * to these callbacks instead of going through vnode->ops.  This is how
+ * sockets (and future pipes, eventfds, etc.) integrate with the fd layer
+ * while remaining invisible to the VFS.  Key for mlibc compat.            */
+struct file;
+typedef struct file_ops {
+    ssize_t (*read)(struct file *f, void *buf, size_t count);
+    ssize_t (*write)(struct file *f, const void *buf, size_t count);
+    int     (*close)(struct file *f);
+    int     (*poll)(struct file *f, int events);  /* returns ready-event mask */
+    int     (*ioctl)(struct file *f, unsigned long cmd, unsigned long arg);
+} file_ops_t;
+
 /* ── Open file object ────────────────────────────────────────────────────── */
 typedef struct file {
-    vnode_t  *vnode;          /* underlying vnode (refcount managed by file) */
-    uint64_t  offset;         /* current file position                       */
-    int       flags;          /* O_RDONLY / O_WRONLY / O_RDWR etc.           */
-    int       fd_flags;       /* FD_CLOEXEC, etc.                            */
-    uint32_t  refcount;       /* number of fds pointing at this file         */
+    vnode_t    *vnode;          /* underlying vnode (NULL for sockets etc.)   */
+    uint64_t    offset;         /* current file position                      */
+    int         flags;          /* O_RDONLY / O_WRONLY / O_RDWR etc.          */
+    int         fd_flags;       /* FD_CLOEXEC, etc.                           */
+    uint32_t    refcount;       /* number of fds pointing at this file        */
+
+    /* ── Generic file ops (sockets, pipes, eventfds) ────────────────────── */
+    file_ops_t *f_ops;          /* non-NULL → delegate read/write/close here  */
+    void       *private_data;   /* driver / socket private state              */
 } file_t;
 
 #define FD_CLOEXEC 1
@@ -31,6 +49,7 @@ struct task;
 
 /* ── Allocate / free a file_t ────────────────────────────────────────────── */
 file_t *file_alloc(vnode_t *vnode, int flags);
+file_t *file_alloc_generic(file_ops_t *ops, void *priv, int flags);
 void    file_get(file_t *f);     /* increment refcount */
 void    file_put(file_t *f);     /* decrement refcount; frees when 0 */
 

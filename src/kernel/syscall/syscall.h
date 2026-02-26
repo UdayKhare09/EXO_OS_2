@@ -24,6 +24,22 @@
 #define SYS_UNLINK      87
 #define SYS_GETDENTS64  217
 
+/* ── Network syscall numbers (Linux x86-64 ABI) ─────────────────────────── */
+#define SYS_POLL        7
+#define SYS_IOCTL       16
+#define SYS_SOCKET      41
+#define SYS_CONNECT     42
+#define SYS_ACCEPT      43
+#define SYS_SENDTO      44
+#define SYS_RECVFROM    45
+#define SYS_SHUTDOWN    48
+#define SYS_BIND        49
+#define SYS_LISTEN      50
+#define SYS_GETSOCKNAME 51
+#define SYS_GETPEERNAME 52
+#define SYS_SETSOCKOPT  54
+#define SYS_GETSOCKOPT  55
+
 /* Linux open flags */
 #define SYS_O_RDONLY    0
 #define SYS_O_WRONLY    1

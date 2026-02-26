@@ -42,6 +42,10 @@ void pci_enable_device(const pci_device_t *dev);
 /* Find first device with given vendor/device IDs; returns NULL if not found */
 pci_device_t *pci_find(uint16_t vendor, uint16_t device);
 
+/* Return the already-scanned device array and count.
+ * Does NOT re-enumerate — safe to call from any context. */
+int pci_get_devices(pci_device_t **out);
+
 /* Walk PCI capability list; type = PCI cap ID;
  * returns config offset of the capability or 0 if not found */
 uint8_t pci_find_cap(const pci_device_t *d, uint8_t cap_id);

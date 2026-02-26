@@ -140,6 +140,11 @@ pci_device_t *pci_find(uint16_t vendor, uint16_t device) {
     return NULL;
 }
 
+int pci_get_devices(pci_device_t **out) {
+    *out = g_pci_devs;
+    return g_pci_count;
+}
+
 uint8_t pci_find_cap(const pci_device_t *d, uint8_t cap_id) {
     uint16_t status = pci_read16(d->bus, d->dev, d->fn, 0x06);
     if (!(status & (1 << 4))) return 0;              /* no cap list */

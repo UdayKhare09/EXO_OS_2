@@ -91,6 +91,12 @@ static void parse_madt(madt_t *madt) {
             KLOG_INFO("MADT: I/O APIC id=%u base=%p gsi=%u\n",
                       io->ioapic_id, (void*)(uintptr_t)io->ioapic_addr,
                       io->gsi_base);
+            /* Store first IOAPIC for the kernel to programme */
+            if (!madt_info.ioapic_found) {
+                madt_info.ioapic_addr     = io->ioapic_addr;
+                madt_info.ioapic_gsi_base = io->gsi_base;
+                madt_info.ioapic_found    = 1;
+            }
         }
         if (rec->len == 0) break; /* guard */
         ptr += rec->len;

@@ -1,0 +1,1 @@
+Good. Now I'll create the UDP layer. UDP needs to reference sockets for port binding lookups, but since the socket layer doesn't exist yet, I'll use a simple UDP port binding table internal to UDP. This gets replaced by proper socket lookup later

@@ -35,6 +35,7 @@
 #include "arch/x86_64/apic.h"
 #include "arch/x86_64/acpi.h"
 #include "arch/x86_64/smp.h"
+#include "arch/x86_64/ioapic.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "sched/sched.h"
@@ -58,6 +59,9 @@
 #include "drivers/storage/ahci.h"
 #include "fs/gpt.h"
 #include "syscall/syscall.h"
+
+/* ── Networking ─────────────────────────────────────────────────────────── */
+extern void net_init_task(void *arg);
 
 /* ── Limine protocol: start marker ────────────────────────────────────── */
 __attribute__((used, section(".limine_requests_start_marker")))
@@ -328,6 +332,13 @@ void kmain(void) {
     g_apic_ticks_per_ms = apic_timer_calibrate();
     apic_timer_init(g_apic_ticks_per_ms);
 
+    /* ── 8b. I/O APIC — route external interrupts ────────────────────────── */
+    if (madt->ioapic_found) {
+        ioapic_init((uintptr_t)madt->ioapic_addr, madt->ioapic_gsi_base);
+    } else {
+        KLOG_WARN("IOAPIC: not found in MADT — external IRQs unavailable\n");
+    }
+
     /* ── 9. Scheduler init on BSP ─────────────────────────────────────────── */
     sched_init(0);
 
@@ -338,6 +349,7 @@ void kmain(void) {
     sched_spawn("shell",        shell_task,        NULL);
     sched_spawn("usb-init",     usb_init_task,     NULL);
     sched_spawn("storage-init", storage_init_task, NULL);
+    sched_spawn("net-init",     net_init_task,     NULL);
 
     KLOG_INFO("Kernel init complete. Entering idle.\n");
 

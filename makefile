@@ -218,6 +218,8 @@ run: $(DISK_IMG) $(OVMF_VARS)
 	    -device nec-usb-xhci,id=xhci                                   \
 	    -device usb-kbd,bus=xhci.0                                      \
 	    -device usb-mouse,bus=xhci.0                                    \
+	    -netdev user,id=net0                                             \
+	    -device virtio-net-pci,netdev=net0                              \
 	    -no-reboot
 
 run-debug: $(DISK_IMG) $(OVMF_VARS)
@@ -231,6 +233,8 @@ run-debug: $(DISK_IMG) $(OVMF_VARS)
 	    -smp 4                                                          \
 	    -serial stdio                                                   \
 	    -vga std                                                        \
+	    -netdev user,id=net0                                             \
+	    -device virtio-net-pci,netdev=net0                              \
 	    -no-reboot                                                      \
 	    -s -S
 

@@ -37,6 +37,29 @@ int64_t sys_rename(const char *old, const char *newp);
 int64_t sys_getdents64(int fd, void *dirp, uint64_t count);
 int64_t sys_brk(uint64_t addr);
 
+/* ── Forward declarations to net_syscalls.c ─────────────────────────────── */
+struct sockaddr;
+struct pollfd;
+typedef uint32_t socklen_t;
+int64_t sys_socket(int domain, int type, int protocol);
+int64_t sys_connect(int fd, const struct sockaddr *addr, socklen_t addrlen);
+int64_t sys_accept(int fd, struct sockaddr *addr, socklen_t *addrlen);
+int64_t sys_sendto(int fd, const void *buf, uint64_t len, int flags,
+                   const struct sockaddr *dest_addr, socklen_t addrlen);
+int64_t sys_recvfrom(int fd, void *buf, uint64_t len, int flags,
+                     struct sockaddr *src_addr, socklen_t *addrlen);
+int64_t sys_shutdown(int fd, int how);
+int64_t sys_bind(int fd, const struct sockaddr *addr, socklen_t addrlen);
+int64_t sys_listen(int fd, int backlog);
+int64_t sys_getsockname(int fd, struct sockaddr *addr, socklen_t *addrlen);
+int64_t sys_getpeername(int fd, struct sockaddr *addr, socklen_t *addrlen);
+int64_t sys_setsockopt(int fd, int level, int optname,
+                       const void *optval, socklen_t optlen);
+int64_t sys_getsockopt(int fd, int level, int optname,
+                       void *optval, socklen_t *optlen);
+int64_t sys_poll(struct pollfd *fds, uint64_t nfds, int timeout);
+int64_t sys_ioctl(int fd, unsigned long cmd, unsigned long arg);
+
 /* ── Syscall table ───────────────────────────────────────────────────────── */
 typedef int64_t (*syscall_fn_t)(uint64_t, uint64_t, uint64_t,
                                  uint64_t, uint64_t, uint64_t);
@@ -85,6 +108,36 @@ static int64_t sc_unlink(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,
 static int64_t sc_getdents64(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { (void)d;(void)e;(void)f; return sys_getdents64((int)a,(void*)b,c); }
 
+/* ── Network syscall wrappers ────────────────────────────────────────────── */
+static int64_t sc_poll(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)d;(void)e;(void)f; return sys_poll((struct pollfd*)a,b,(int)c); }
+static int64_t sc_ioctl(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)d;(void)e;(void)f; return sys_ioctl((int)a,b,c); }
+static int64_t sc_socket(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)d;(void)e;(void)f; return sys_socket((int)a,(int)b,(int)c); }
+static int64_t sc_connect(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)d;(void)e;(void)f; return sys_connect((int)a,(const struct sockaddr*)b,(socklen_t)c); }
+static int64_t sc_accept(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)d;(void)e;(void)f; return sys_accept((int)a,(struct sockaddr*)b,(socklen_t*)c); }
+static int64_t sc_sendto(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { return sys_sendto((int)a,(const void*)b,c,(int)d,(const struct sockaddr*)e,(socklen_t)f); }
+static int64_t sc_recvfrom(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { return sys_recvfrom((int)a,(void*)b,c,(int)d,(struct sockaddr*)e,(socklen_t*)f); }
+static int64_t sc_shutdown(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)c;(void)d;(void)e;(void)f; return sys_shutdown((int)a,(int)b); }
+static int64_t sc_bind(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)d;(void)e;(void)f; return sys_bind((int)a,(const struct sockaddr*)b,(socklen_t)c); }
+static int64_t sc_listen(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)c;(void)d;(void)e;(void)f; return sys_listen((int)a,(int)b); }
+static int64_t sc_getsockname(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)d;(void)e;(void)f; return sys_getsockname((int)a,(struct sockaddr*)b,(socklen_t*)c); }
+static int64_t sc_getpeername(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)d;(void)e;(void)f; return sys_getpeername((int)a,(struct sockaddr*)b,(socklen_t*)c); }
+static int64_t sc_setsockopt(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)f; return sys_setsockopt((int)a,(int)b,(int)c,(const void*)d,(socklen_t)e); }
+static int64_t sc_getsockopt(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)f; return sys_getsockopt((int)a,(int)b,(int)c,(void*)d,(socklen_t*)e); }
+
 /* Sparse dispatch table indexed by syscall number */
 static syscall_fn_t g_syscall_table[256] = {
     [SYS_READ]      = sc_read,
@@ -106,6 +159,20 @@ static syscall_fn_t g_syscall_table[256] = {
     [SYS_RMDIR]     = sc_rmdir,
     [SYS_UNLINK]    = sc_unlink,
     [SYS_GETDENTS64]= sc_getdents64,
+    [SYS_POLL]      = sc_poll,
+    [SYS_IOCTL]     = sc_ioctl,
+    [SYS_SOCKET]    = sc_socket,
+    [SYS_CONNECT]   = sc_connect,
+    [SYS_ACCEPT]    = sc_accept,
+    [SYS_SENDTO]    = sc_sendto,
+    [SYS_RECVFROM]  = sc_recvfrom,
+    [SYS_SHUTDOWN]  = sc_shutdown,
+    [SYS_BIND]      = sc_bind,
+    [SYS_LISTEN]    = sc_listen,
+    [SYS_GETSOCKNAME] = sc_getsockname,
+    [SYS_GETPEERNAME]  = sc_getpeername,
+    [SYS_SETSOCKOPT]   = sc_setsockopt,
+    [SYS_GETSOCKOPT]   = sc_getsockopt,
 };
 
 /* ── INT 0x80 handler ─────────────────────────────────────────────────────── */

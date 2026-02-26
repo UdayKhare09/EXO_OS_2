@@ -11,11 +11,26 @@
 file_t *file_alloc(vnode_t *vnode, int flags) {
     file_t *f = kzalloc(sizeof(file_t));
     if (!f) return NULL;
-    f->vnode    = vnode;
-    f->flags    = flags;
-    f->offset   = (flags & O_APPEND) ? vnode->size : 0;
-    f->refcount = 1;
+    f->vnode        = vnode;
+    f->flags        = flags;
+    f->offset       = (flags & O_APPEND) ? vnode->size : 0;
+    f->refcount     = 1;
+    f->f_ops        = NULL;
+    f->private_data = NULL;
     vfs_vnode_get(vnode);
+    return f;
+}
+
+/* Allocate a generic (non-vnode) file_t — used for sockets, pipes, etc. */
+file_t *file_alloc_generic(file_ops_t *ops, void *priv, int flags) {
+    file_t *f = kzalloc(sizeof(file_t));
+    if (!f) return NULL;
+    f->vnode        = NULL;
+    f->flags        = flags;
+    f->offset       = 0;
+    f->refcount     = 1;
+    f->f_ops        = ops;
+    f->private_data = priv;
     return f;
 }
 
@@ -28,9 +43,16 @@ void file_put(file_t *f) {
     if (f->refcount == 0) return;
     f->refcount--;
     if (f->refcount == 0) {
-        if (f->vnode && f->vnode->ops && f->vnode->ops->close)
-            f->vnode->ops->close(f->vnode);
-        vfs_vnode_put(f->vnode);
+        /* Generic file ops path (sockets, pipes, etc.) */
+        if (f->f_ops) {
+            if (f->f_ops->close)
+                f->f_ops->close(f);
+        } else if (f->vnode) {
+            /* VFS-backed file */
+            if (f->vnode->ops && f->vnode->ops->close)
+                f->vnode->ops->close(f->vnode);
+            vfs_vnode_put(f->vnode);
+        }
         kfree(f);
     }
 }

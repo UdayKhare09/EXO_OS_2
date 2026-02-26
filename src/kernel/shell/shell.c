@@ -13,6 +13,13 @@
 #include "arch/x86_64/smp.h"
 #include "arch/x86_64/cpu.h"
 #include "fs/vfs.h"
+#include "drivers/net/netdev.h"
+#include "net/netutil.h"
+#include "net/arp.h"
+#include "net/icmp.h"
+#include "net/ipv4.h"
+#include "net/udp.h"
+#include "net/tcp.h"
 
 /* ── Line buffer ──────────────────────────────────────────────────────────── */
 #define LINE_MAX 256
@@ -60,6 +67,12 @@ static void cmd_help(fbcon_t *c) {
         "    " A_BOLD "stat <path>"   A_RESET "    show file/dir info\n"
         "    " A_BOLD "mkdir <path>"  A_RESET "   create directory\n"
         "    " A_BOLD "touch <file>"  A_RESET "   create empty file\n"
+        A_CYAN "  Networking:" A_RESET "\n"
+        "    " A_BOLD "ifconfig"                  A_RESET "  show network interfaces\n"
+        "    " A_BOLD "ping <ip>"                 A_RESET "  send ICMP echo request\n"
+        "    " A_BOLD "arp"                        A_RESET "  show ARP cache\n"
+        "    " A_BOLD "udptest <ip> <port> [msg]" A_RESET "  send a UDP datagram and print reply\n"
+        "    " A_BOLD "tcpconn <ip> <port>"       A_RESET "  open a TCP connection and exchange data\n"
         "\n"
     );
 }
@@ -383,6 +396,305 @@ static void cmd_touch(shell_t *sh, const char *arg) {
     vfs_vnode_put(parent);
 }
 
+/* ── Networking commands ──────────────────────────────────────────────────── */
+
+/* forward declaration — defined below with the ping helpers */
+static uint32_t parse_ipv4(const char *s);
+
+/* ---- UDP test ------------------------------------------------------------- */
+static volatile int g_udp_got = 0;
+static char         g_udp_rx_buf[512];
+static size_t       g_udp_rx_len = 0;
+
+static void udp_reply_cb(skbuff_t *skb,
+                          uint32_t src_ip, uint16_t src_port,
+                          uint32_t dst_ip, uint16_t dst_port,
+                          const void *payload, size_t payload_len,
+                          void *ctx)
+{
+    (void)skb; (void)src_ip; (void)src_port;
+    (void)dst_ip; (void)dst_port; (void)ctx;
+    size_t n = payload_len < sizeof(g_udp_rx_buf) - 1
+               ? payload_len : sizeof(g_udp_rx_buf) - 1;
+    memcpy(g_udp_rx_buf, payload, n);
+    g_udp_rx_buf[n] = '\0';
+    g_udp_rx_len = n;
+    __atomic_store_n(&g_udp_got, 1, __ATOMIC_RELEASE);
+}
+
+static void cmd_udptest(shell_t *sh, const char *arg)
+{
+    fbcon_t *c = sh->con;
+    if (!arg || !*arg) {
+        fbcon_puts_inst(c, A_RED "  udptest: usage: udptest <ip> <port> [msg]\n" A_RESET);
+        return;
+    }
+
+    uint32_t dst_ip = parse_ipv4(arg);
+
+    /* skip to port */
+    const char *p = arg;
+    while (*p && *p != ' ') p++;
+    while (*p == ' ')        p++;
+    if (!*p) {
+        fbcon_puts_inst(c, A_RED "  udptest: missing port\n" A_RESET);
+        return;
+    }
+    uint16_t dst_port = 0;
+    while (*p >= '0' && *p <= '9') dst_port = (uint16_t)(dst_port * 10 + (*p++ - '0'));
+    while (*p == ' ') p++;
+
+    const char *msg  = *p ? p : "EXO ping";
+    size_t      mlen = strlen(msg);
+
+    netdev_t *dev = netdev_get_nth(0);
+    if (!dev) {
+        fbcon_puts_inst(c, A_RED "  udptest: no network interface\n" A_RESET);
+        return;
+    }
+
+    uint16_t src_port = udp_alloc_ephemeral();
+    __atomic_store_n(&g_udp_got, 0, __ATOMIC_RELEASE);
+    g_udp_rx_len = 0;
+
+    if (udp_bind_port(src_port, 0, udp_reply_cb, NULL) < 0) {
+        fbcon_puts_inst(c, A_RED "  udptest: bind failed\n" A_RESET);
+        return;
+    }
+
+    fbcon_printf_inst(c, "  UDP → %d.%d.%d.%d:%u  src_port=%u  msg=\"%s\"\n",
+                      IP4_A(dst_ip), IP4_B(dst_ip),
+                      IP4_C(dst_ip), IP4_D(dst_ip),
+                      dst_port, src_port, msg);
+
+    int rc = udp_tx(dev, dst_ip, src_port, dst_port, msg, mlen);
+    if (rc < 0) {
+        fbcon_printf_inst(c, A_RED "  udp_tx failed: %d\n" A_RESET, rc);
+        udp_unbind_port(src_port);
+        return;
+    }
+
+    /* wait up to 2 s for a reply (20 × 100 ms) */
+    for (int i = 0; i < 20; i++) {
+        sched_sleep(100);
+        if (__atomic_load_n(&g_udp_got, __ATOMIC_ACQUIRE)) break;
+    }
+
+    if (__atomic_load_n(&g_udp_got, __ATOMIC_ACQUIRE))
+        fbcon_printf_inst(c, "  reply (%zu bytes): %s\n",
+                          g_udp_rx_len, g_udp_rx_buf);
+    else
+        fbcon_puts_inst(c, "  no reply (timeout)\n");
+
+    udp_unbind_port(src_port);
+}
+
+/* ---- TCP connect test ----------------------------------------------------- */
+static void cmd_tcpconn(shell_t *sh, const char *arg)
+{
+    fbcon_t *c = sh->con;
+    if (!arg || !*arg) {
+        fbcon_puts_inst(c, A_RED "  tcpconn: usage: tcpconn <ip> <port>\n" A_RESET);
+        return;
+    }
+
+    uint32_t dst_ip = parse_ipv4(arg);
+
+    const char *p = arg;
+    while (*p && *p != ' ') p++;
+    while (*p == ' ')        p++;
+    if (!*p) {
+        fbcon_puts_inst(c, A_RED "  tcpconn: missing port\n" A_RESET);
+        return;
+    }
+    uint16_t dst_port = 0;
+    while (*p >= '0' && *p <= '9') dst_port = (uint16_t)(dst_port * 10 + (*p++ - '0'));
+
+    uint32_t  next_hop = 0;
+    netdev_t *dev      = ip_route(dst_ip, &next_hop);
+    if (!dev) {
+        fbcon_puts_inst(c, A_RED "  tcpconn: no route to host\n" A_RESET);
+        return;
+    }
+
+    tcp_tcb_t *tcb = tcp_tcb_alloc();
+    if (!tcb) {
+        fbcon_puts_inst(c, A_RED "  tcpconn: no free TCBs\n" A_RESET);
+        return;
+    }
+
+    tcb->dev         = dev;
+    tcb->local_ip    = dev->ip_addr;
+    tcb->local_port  = tcp_alloc_ephemeral();
+    tcb->remote_ip   = dst_ip;
+    tcb->remote_port = dst_port;
+    tcb->snd_nxt     = tcb->iss;
+    tcb->snd_una     = tcb->iss;
+    tcb->state       = TCP_SYN_SENT;
+
+    fbcon_printf_inst(c, "  TCP → %d.%d.%d.%d:%u  (src_port=%u)  SYN sent ...\n",
+                      IP4_A(dst_ip), IP4_B(dst_ip),
+                      IP4_C(dst_ip), IP4_D(dst_ip),
+                      dst_port, tcb->local_port);
+
+    tcp_send_segment(tcb, TCP_SYN, NULL, 0);
+    tcp_rexmit_timer_reset(tcb);
+
+    /* wait up to 5 s for ESTABLISHED (50 × 100 ms) */
+    for (int i = 0; i < 50; i++) {
+        sched_sleep(100);
+        tcp_state_t s = __atomic_load_n(&tcb->state, __ATOMIC_ACQUIRE);
+        if (s == TCP_ESTABLISHED || s == TCP_CLOSED)
+            break;
+    }
+
+    if (__atomic_load_n(&tcb->state, __ATOMIC_ACQUIRE) != TCP_ESTABLISHED) {
+        fbcon_printf_inst(c, A_RED "  connect timeout (state=%s)\n" A_RESET,
+                          tcp_state_name(tcb->state));
+        tcp_tcb_free(tcb);
+        return;
+    }
+
+    fbcon_puts_inst(c, "  " A_GREEN "ESTABLISHED" A_RESET " — sending greeting\n");
+
+    static const char greeting[] = "Hello from EXO_OS!\r\n";
+    tcp_send_segment(tcb, TCP_PSH | TCP_ACK, greeting, sizeof(greeting) - 1);
+
+    /* wait up to 3 s for incoming data (30 × 100 ms) */
+    for (int i = 0; i < 30; i++) {
+        sched_sleep(100);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        tcp_state_t s = __atomic_load_n(&tcb->state, __ATOMIC_ACQUIRE);
+        if (tcp_rx_available(tcb) > 0 ||
+            s == TCP_CLOSE_WAIT ||
+            s == TCP_CLOSED)
+            break;
+    }
+
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    uint32_t avail = tcp_rx_available(tcb);
+    if (avail > 0) {
+        char buf[256];
+        uint32_t n = avail > 255 ? 255 : avail;
+        for (uint32_t i = 0; i < n; i++) {
+            buf[i] = (char)tcb->rx_buf[tcb->rx_tail % tcb->rx_size];
+            tcb->rx_tail++;
+        }
+        buf[n] = '\0';
+        fbcon_printf_inst(c, "  data (%u bytes): %s\n", n, buf);
+    } else {
+        fbcon_puts_inst(c, "  (no data received)\n");
+    }
+
+    /* graceful close */
+    tcp_send_segment(tcb, TCP_FIN | TCP_ACK, NULL, 0);
+    sched_sleep(500);
+    tcp_tcb_free(tcb);
+}
+
+static void cmd_ifconfig(fbcon_t *c) {
+    int count = netdev_count();
+    if (count == 0) {
+        fbcon_puts_inst(c, "  No network interfaces.\n");
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        netdev_t *dev = netdev_get_nth(i);
+        if (!dev) continue;
+        fbcon_printf_inst(c,
+            "  %s: link=%s mtu=%u\n"
+            "    HWaddr %02x:%02x:%02x:%02x:%02x:%02x\n"
+            "    inet %d.%d.%d.%d  mask %d.%d.%d.%d  gw %d.%d.%d.%d\n"
+            "    dns %d.%d.%d.%d\n\n",
+            dev->name, dev->link ? "up" : "down", dev->mtu,
+            dev->mac[0], dev->mac[1], dev->mac[2],
+            dev->mac[3], dev->mac[4], dev->mac[5],
+            IP4_A(dev->ip_addr), IP4_B(dev->ip_addr),
+            IP4_C(dev->ip_addr), IP4_D(dev->ip_addr),
+            IP4_A(dev->netmask), IP4_B(dev->netmask),
+            IP4_C(dev->netmask), IP4_D(dev->netmask),
+            IP4_A(dev->gateway), IP4_B(dev->gateway),
+            IP4_C(dev->gateway), IP4_D(dev->gateway),
+            IP4_A(dev->dns), IP4_B(dev->dns),
+            IP4_C(dev->dns), IP4_D(dev->dns));
+    }
+}
+
+/* simple IP parser: "A.B.C.D" → host-order uint32 */
+static uint32_t parse_ipv4(const char *s) {
+    uint32_t a = 0, b = 0, c2 = 0, d = 0;
+    int pos = 0;
+    uint32_t *cur = &a;
+    while (s[pos]) {
+        if (s[pos] >= '0' && s[pos] <= '9') {
+            *cur = *cur * 10 + (s[pos] - '0');
+        } else if (s[pos] == '.') {
+            if (cur == &a) cur = &b;
+            else if (cur == &b) cur = &c2;
+            else if (cur == &c2) cur = &d;
+        } else {
+            break;  /* stop at space, NUL, or any non-IP character */
+        }
+        pos++;
+    }
+    return IP4_ADDR((uint8_t)a, (uint8_t)b, (uint8_t)c2, (uint8_t)d);
+}
+
+static void cmd_ping(shell_t *sh, const char *arg) {
+    fbcon_t *c = sh->con;
+    if (!arg || !*arg) {
+        fbcon_puts_inst(c, A_RED "  ping: missing IP address\n" A_RESET);
+        return;
+    }
+    uint32_t dst = parse_ipv4(arg);
+    netdev_t *dev = netdev_get_nth(0);
+    if (!dev) {
+        fbcon_puts_inst(c, A_RED "  ping: no network interface\n" A_RESET);
+        return;
+    }
+
+    fbcon_printf_inst(c, "  PING %d.%d.%d.%d ...\n",
+                     IP4_A(dst), IP4_B(dst), IP4_C(dst), IP4_D(dst));
+
+    for (int i = 0; i < 4; i++) {
+        int rc = icmp_send_echo(dev, dst, 0x1234, (uint16_t)(i + 1),
+                                "exo", 3);
+        if (rc < 0) {
+            fbcon_puts_inst(c, "  send failed\n");
+            continue;
+        }
+        /* wait up to 2 seconds for reply */
+        for (int w = 0; w < 20; w++) {
+            sched_sleep(100);
+            if (g_ping_state.reply_received) break;
+        }
+        if (g_ping_state.reply_received) {
+            fbcon_printf_inst(c, "  reply from %d.%d.%d.%d seq=%u\n",
+                             IP4_A(dst), IP4_B(dst),
+                             IP4_C(dst), IP4_D(dst), i + 1);
+        } else {
+            fbcon_printf_inst(c, "  request timeout seq=%u\n", i + 1);
+        }
+    }
+}
+
+static void cmd_arp_show(fbcon_t *c) {
+    arp_entry_t table[64];
+    int count = arp_get_table(table, 64);
+    if (count == 0) {
+        fbcon_puts_inst(c, "  ARP cache is empty.\n");
+        return;
+    }
+    fbcon_puts_inst(c, "  IP Address        HW Address\n");
+    for (int i = 0; i < count; i++) {
+        fbcon_printf_inst(c, "  %d.%d.%d.%d     %02x:%02x:%02x:%02x:%02x:%02x\n",
+                         IP4_A(table[i].ip), IP4_B(table[i].ip),
+                         IP4_C(table[i].ip), IP4_D(table[i].ip),
+                         table[i].mac[0], table[i].mac[1], table[i].mac[2],
+                         table[i].mac[3], table[i].mac[4], table[i].mac[5]);
+    }
+}
+
 /* ── Command dispatcher ───────────────────────────────────────────────────── */
 static void run_line(shell_t *sh) {
     fbcon_t *c = sh->con;
@@ -431,6 +743,16 @@ static void run_line(shell_t *sh) {
         cmd_sysinfo(c);
     } else if (strcmp(p, "tasks") == 0) {
         cmd_tasks(c);
+    } else if (strcmp(p, "ifconfig") == 0) {
+        cmd_ifconfig(c);
+    } else if (strncmp(p, "ping ", 5) == 0) {
+        cmd_ping(sh, p + 5);
+    } else if (strcmp(p, "arp") == 0) {
+        cmd_arp_show(c);
+    } else if (strncmp(p, "udptest ", 8) == 0) {
+        cmd_udptest(sh, p + 8);
+    } else if (strncmp(p, "tcpconn ", 8) == 0) {
+        cmd_tcpconn(sh, p + 8);
     } else {
         fbcon_puts_inst(c, A_RED "  error:" A_RESET " unknown command '");
         fbcon_puts_inst(c, p);

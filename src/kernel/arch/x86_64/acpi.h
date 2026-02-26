@@ -75,6 +75,10 @@ typedef struct {
     uint32_t  cpu_count;
     uint8_t   lapic_ids[MAX_CPUS];
     uint8_t   acpi_ids[MAX_CPUS];
+    /* I/O APIC info (first IOAPIC found) */
+    uint32_t  ioapic_addr;
+    uint32_t  ioapic_gsi_base;
+    int       ioapic_found;
 } madt_info_t;
 
 void       acpi_init(uintptr_t rsdp_addr);

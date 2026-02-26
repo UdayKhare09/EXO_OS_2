@@ -9,6 +9,7 @@
 #include "lib/klog.h"
 #include "lib/panic.h"
 #include "lib/string.h"
+#include "lib/timer.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -105,8 +106,10 @@ static void sched_timer_isr(cpu_regs_t *regs) {
      * if those calls also incremented g_jiffies the clock would run orders of
      * magnitude faster than 1 tick/ms, breaking all timing.                */
     cpu_info_t *ci = smp_self();
-    if (ci && ci->id == 0)
-        __atomic_add_fetch(&g_jiffies, 1, __ATOMIC_RELAXED);
+    if (ci && ci->id == 0) {
+        uint64_t now = __atomic_add_fetch(&g_jiffies, 1, __ATOMIC_RELAXED);
+        ktimer_tick(now);
+    }
     sched_tick();
 }
 
