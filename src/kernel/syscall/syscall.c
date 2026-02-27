@@ -173,6 +173,8 @@ static int64_t sc_unlinkat(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t 
     { (void)d;(void)e;(void)f; return sys_unlinkat((int)a,(const char*)b,(int)c); }
 static int64_t sc_symlinkat(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { (void)d;(void)e;(void)f; return sys_symlinkat((const char*)a,(int)b,(const char*)c); }
+static int64_t sc_symlink(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)c;(void)d;(void)e;(void)f; return sys_symlinkat((const char*)a, AT_FDCWD, (const char*)b); }
 static int64_t sc_getdents64(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { (void)d;(void)e;(void)f; return sys_getdents64((int)a,(void*)b,c); }
 
@@ -219,6 +221,54 @@ static int64_t sc_getuid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,
     { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; return 0; }
 static int64_t sc_getgid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; return 0; }
+
+static int64_t sc_getpgid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+{
+    (void)b;(void)c;(void)d;(void)e;(void)f;
+    int pid = (int)a;
+    task_t *cur = sched_current();
+    if (pid == 0) return cur ? (int64_t)cur->pgid : -ESRCH;
+    task_t *t = task_lookup((uint32_t)pid);
+    if (!t) return -ESRCH;
+    return (int64_t)t->pgid;
+}
+
+static int64_t sc_setpgid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+{
+    (void)c;(void)d;(void)e;(void)f;
+    int pid = (int)a;
+    int pgid = (int)b;
+    task_t *cur = sched_current();
+    task_t *t = (pid == 0) ? cur : task_lookup((uint32_t)pid);
+    if (!t) return -ESRCH;
+    if (pgid == 0) pgid = (int)t->pid;
+    t->pgid = (uint32_t)pgid;
+    return 0;
+}
+
+static int64_t sc_setsid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+{
+    (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;
+    task_t *cur = sched_current();
+    if (!cur) return -ESRCH;
+    /* Fail if already a session leader */
+    if (cur->pgid == cur->pid && cur->sid == cur->pid)
+        return -EPERM;
+    cur->sid  = cur->pid;
+    cur->pgid = cur->pid;
+    return (int64_t)cur->sid;
+}
+
+static int64_t sc_getsid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+{
+    (void)b;(void)c;(void)d;(void)e;(void)f;
+    int pid = (int)a;
+    task_t *cur = sched_current();
+    if (pid == 0) return cur ? (int64_t)cur->sid : -ESRCH;
+    task_t *t = task_lookup((uint32_t)pid);
+    if (!t) return -ESRCH;
+    return (int64_t)t->sid;
+}
 
 static int64_t sc_mmap(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { return sys_mmap(a,b,(int)c,(int)d,(int)e,(int64_t)f); }
@@ -289,6 +339,11 @@ typedef struct {
 } kernel_timeval_t;
 
 typedef struct {
+    kernel_timeval_t it_interval;
+    kernel_timeval_t it_value;
+} kernel_itimerval_t;
+
+typedef struct {
     int64_t tms_utime;
     int64_t tms_stime;
     int64_t tms_cutime;
@@ -323,6 +378,34 @@ static int64_t sc_nanosleep(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t
         rem->tv_sec = 0;
         rem->tv_nsec = 0;
     }
+    return 0;
+}
+
+static int64_t sc_getitimer(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)a;(void)c;(void)d;(void)e;(void)f;
+    kernel_itimerval_t *curr = (kernel_itimerval_t *)b;
+    if (!curr) return -EFAULT;
+    curr->it_interval.tv_sec = 0;
+    curr->it_interval.tv_usec = 0;
+    curr->it_value.tv_sec = 0;
+    curr->it_value.tv_usec = 0;
+    return 0;
+}
+
+static int64_t sc_setitimer(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)a;(void)b;(void)d;(void)e;(void)f;
+    kernel_itimerval_t *oldv = (kernel_itimerval_t *)c;
+    if (oldv) {
+        oldv->it_interval.tv_sec = 0;
+        oldv->it_interval.tv_usec = 0;
+        oldv->it_value.tv_sec = 0;
+        oldv->it_value.tv_usec = 0;
+    }
+    return 0;
+}
+
+static int64_t sc_alarm(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;
     return 0;
 }
 
@@ -685,12 +768,45 @@ static int64_t sc_fcntl(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,u
     file_t *fp = fd_get(cur, fd_num);
     if (!fp) return -EBADF;
     switch (cmd) {
-        case 1: /* F_GETFD */ return fp->fd_flags;
-        case 2: /* F_SETFD */ fp->fd_flags = (int)c; return 0;
-        case 3: /* F_GETFL */ return fp->flags;
-        case 4: /* F_SETFL */ fp->flags = (int)c; return 0;
-        case 0: /* F_DUPFD */ return fd_dup(cur, fd_num);
-        default: return -EINVAL;
+        case 0: { /* F_DUPFD */
+            int min_fd = (int)c;
+            if (min_fd < 0) return -EINVAL;
+            for (int i = min_fd; i < FD_TABLE_SIZE; i++) {
+                if (!cur->fd_table[i]) {
+                    int r = fd_install(cur, i, fp);
+                    return r < 0 ? -EMFILE : r;
+                }
+            }
+            return -EMFILE;
+        }
+        case 1: /* F_GETFD */
+            return fp->fd_flags;
+        case 2: /* F_SETFD */
+            fp->fd_flags = (int)c;
+            return 0;
+        case 3: /* F_GETFL */
+            return fp->flags;
+        case 4: { /* F_SETFL */
+            int keep = fp->flags & O_ACCMODE;
+            int settable = ((int)c) & ~O_ACCMODE;
+            fp->flags = keep | settable;
+            return 0;
+        }
+        case 1030: { /* F_DUPFD_CLOEXEC */
+            int min_fd = (int)c;
+            if (min_fd < 0) return -EINVAL;
+            for (int i = min_fd; i < FD_TABLE_SIZE; i++) {
+                if (!cur->fd_table[i]) {
+                    int r = fd_install(cur, i, fp);
+                    if (r < 0) return -EMFILE;
+                    cur->fd_table[i]->fd_flags |= FD_CLOEXEC;
+                    return r;
+                }
+            }
+            return -EMFILE;
+        }
+        default:
+            return -EINVAL;
     }
 }
 
@@ -725,6 +841,9 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_SCHED_YIELD] = sc_sched_yield,
     [SYS_DUP]       = sc_dup,
     [SYS_DUP2]      = sc_dup2,
+    [SYS_GETITIMER] = sc_getitimer,
+    [SYS_ALARM]     = sc_alarm,
+    [SYS_SETITIMER] = sc_setitimer,
     [SYS_GETPID]    = sc_getpid,
     [SYS_NANOSLEEP] = sc_nanosleep,
     [SYS_GETTID]    = sc_gettid,
@@ -743,6 +862,7 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_MKDIRAT]   = sc_mkdirat,
     [SYS_RMDIR]     = sc_rmdir,
     [SYS_UNLINK]    = sc_unlink,
+    [SYS_SYMLINK]   = sc_symlink,
     [SYS_UNLINKAT]  = sc_unlinkat,
     [SYS_SYMLINKAT] = sc_symlinkat,
     [SYS_UMASK]     = sc_umask,
@@ -753,6 +873,10 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_GETEUID]   = sc_getuid,
     [SYS_GETEGID]   = sc_getgid,
     [SYS_GETPPID]   = sc_getppid,
+    [SYS_SETPGID]   = sc_setpgid,
+    [SYS_SETSID]    = sc_setsid,
+    [SYS_GETPGID]   = sc_getpgid,
+    [SYS_GETSID]    = sc_getsid,
     [SYS_ARCH_PRCTL]= sc_arch_prctl,
     [SYS_GETDENTS64]= sc_getdents64,
     [SYS_SET_TID_ADDRESS] = sc_set_tid_address,

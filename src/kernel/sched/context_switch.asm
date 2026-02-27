@@ -125,6 +125,40 @@ user_mode_trampoline:
 
     iretq
 
+; ── Child return trampoline for fork()/clone() ─────────────────────────────
+; Resumes a child task from a saved cpu_regs_t frame so the child observes
+; the exact post-syscall CPU state (with RAX=0), matching Linux fork semantics.
+; On entry:
+;   r12 = pointer to cpu_regs_t frame on this task's kernel stack
+global user_fork_return_trampoline
+user_fork_return_trampoline:
+    mov  rsp, r12
+
+    ; Restore GP registers from cpu_regs_t order
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  r11
+    pop  r10
+    pop  r9
+    pop  r8
+    pop  rbp
+    pop  rdi
+    pop  rsi
+    pop  rdx
+    pop  rcx
+    pop  rbx
+    pop  rax
+
+    ; Skip vec + err, then iretq to saved user RIP/CS/RFLAGS/RSP/SS
+    add  rsp, 16
+    test qword [rsp + 8], 3
+    jz   .fork_ret_kern
+    swapgs
+.fork_ret_kern:
+    iretq
+
 ; ── SYSCALL entry point ──────────────────────────────────────────────────────
 ; Called via the SYSCALL instruction from user-space.
 ; On entry:  RCX = user RIP, R11 = user RFLAGS

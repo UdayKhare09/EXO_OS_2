@@ -294,10 +294,13 @@ void sched_task_exit(void) {
     cpu_sched_t *cs = &cpu_scheds[ci->id];
     task_t *cur = cs->current;
 
-    /* If this task has a parent, become a zombie so the parent can reap
-     * us via wait4(). Otherwise mark DEAD for immediate cleanup. */
+    /* Threads in the same thread-group (pid == parent->pid) are reaped
+     * immediately; only real child processes become zombies for wait4(). */
     if (cur->parent) {
-        cur->state = TASK_ZOMBIE;
+        if (cur->pid == cur->parent->pid)
+            cur->state = TASK_DEAD;
+        else
+            cur->state = TASK_ZOMBIE;
     } else {
         cur->state = TASK_DEAD;
     }

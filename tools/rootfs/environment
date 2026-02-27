@@ -1,0 +1,8 @@
+PATH=/bin:/usr/bin:/sbin:/usr/sbin
+SHELL=/bin/sh
+HOME=/
+USER=root
+LOGNAME=root
+TERM=linux
+TMPDIR=/tmp
+PS1=#

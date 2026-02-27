@@ -1003,6 +1003,43 @@ static int ext2_stat(vnode_t *v, vfs_stat_t *st) {
     return 0;
 }
 
+static vnode_t *ext2_symlink(vnode_t *parent, const char *name, const char *target) {
+    ext2_sb_t *sb = get_sb(parent);
+    if (!target || !name || !name[0]) return NULL;
+
+    /* Fast symlink only (stored directly in i_block[]). */
+    size_t tlen = strlen(target);
+    if (tlen >= 60) return NULL;
+
+    vnode_t *existing = ext2_lookup(parent, name);
+    if (existing) {
+        existing->ops->evict(existing);
+        kfree(existing);
+        return NULL;
+    }
+
+    uint32_t ino = ext2_alloc_inode(sb);
+    if (!ino) return NULL;
+
+    ext2_inode_t inode = {0};
+    inode.i_mode = EXT2_S_IFLNK | 0777;
+    inode.i_links_count = 1;
+    inode.i_size = (uint32_t)tlen;
+    memcpy(inode.i_block, target, tlen);
+
+    if (ext2_write_inode(sb, ino, &inode) < 0) {
+        ext2_free_inode(sb, ino);
+        return NULL;
+    }
+
+    if (ext2_dir_add_entry(sb, get_ino(parent), ino, name, EXT2_DT_LNK) < 0) {
+        ext2_free_inode(sb, ino);
+        return NULL;
+    }
+
+    return make_vnode(sb, parent->fsi, ino, &inode);
+}
+
 static int ext2_readlink(vnode_t *v, char *buf, size_t sz) {
     ext2_sb_t   *sb = get_sb(v);
     ext2_inode_t inode;
@@ -1127,7 +1164,7 @@ fs_ops_t g_ext2_ops = {
     .rmdir    = ext2_rmdir,
     .rename   = ext2_rename,
     .stat     = ext2_stat,
-    .symlink  = NULL,
+    .symlink  = ext2_symlink,
     .readlink = ext2_readlink,
     .truncate = ext2_truncate,
     .sync     = ext2_sync_v,

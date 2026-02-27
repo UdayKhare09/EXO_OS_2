@@ -1,0 +1,7 @@
+#ifndef _ABIBITS_ABI_H
+#define _ABIBITS_ABI_H
+
+#define __MLIBC_ABI_OPTION_LITTLE_ENDIAN 1
+#define __MLIBC_ABI_OPTION_64BIT 1
+
+#endif

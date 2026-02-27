@@ -1,34 +1,69 @@
-# meson.build — mlibc sysdep layer for EXO_OS
-#
-# To use: symlink or copy this directory into mlibc/sysdeps/exo/
-# Then build mlibc with:
-#   meson setup build --cross-file exo-cross.ini -Dlinux_kernel_headers=disabled
-#
-# This file tells mlibc which sysdeps sources to compile and which
-# mlibc subsystems our OS supports.
+sysdep_supported_options = {
+    'posix': true,
+    'linux': false,
+    'glibc': false,
+    'bsd': false,
+}
 
-# The rtdl (runtime dynamic linker) is not needed for static linking.
-# If you want dynamic linking later, add rtdl sources here.
+exo_include_dirs = [
+    include_directories('include'),
+]
 
-rtdl_sources = []
+rtld_include_dirs += exo_include_dirs
+libc_include_dirs += exo_include_dirs
 
-libc_sources = files(
-    'entry.c',
+rtld_sources += files(
     'generic.c',
+    'syscall_stub.c',
+    'generic_shim.cpp',
 )
 
-# Tell mlibc which optional subsystems we support
-# (mlibc checks these variables to enable POSIX, Linux, etc.)
-# For a minimal port, we need at minimum:
-#   - sys_read/write/open/close
-#   - sys_vm_map/vm_unmap (mmap)
-#   - sys_exit
-#   - sys_tcb_set (TLS)
-#   - sys_anon_allocate/anon_free (for internal allocator)
-#   - sys_clock_gettime
+libc_sources += files(
+    'generic.c',
+    'syscall_stub.c',
+    'generic_shim.cpp',
+    'entry.cpp',
+    host_machine.cpu_family() / 'spawn_thread.S',
+)
 
-# Headers our sysdep provides
-# install_headers('exo/abi-bits/abi.h', subdir: 'abi-bits')
+if not no_headers
+    install_subdir('include/abi-bits', install_dir: get_option('includedir'))
+    install_headers('include/getopt.h')
+    install_headers('include/mntent.h')
+    install_headers('include/paths.h')
+    install_headers('include/sys/ioctl.h', subdir: 'sys')
+    install_headers('include/sys/sysmacros.h', subdir: 'sys')
+endif
 
-# Disable Linux-specific kernel headers requirement
-# (we provide our own definitions)
+if headers_only
+    subdir_done()
+endif
+
+if not headers_only
+    custom_target('crt1',
+        build_by_default: true,
+        command: c_compiler.cmd_array() + ['-c', '-o', '@OUTPUT@', '@INPUT@'],
+        input: host_machine.cpu_family() / 'crt-src/crt1.S',
+        output: 'crt1.o',
+        install: true,
+        install_dir: get_option('libdir')
+    )
+
+    custom_target('crti',
+        build_by_default: true,
+        command: c_compiler.cmd_array() + ['-c', '-o', '@OUTPUT@', '@INPUT@'],
+        input: host_machine.cpu_family() / 'crt-src/crti.S',
+        output: 'crti.o',
+        install: true,
+        install_dir: get_option('libdir')
+    )
+
+    custom_target('crtn',
+        build_by_default: true,
+        command: c_compiler.cmd_array() + ['-c', '-o', '@OUTPUT@', '@INPUT@'],
+        input: host_machine.cpu_family() / 'crt-src/crtn.S',
+        output: 'crtn.o',
+        install: true,
+        install_dir: get_option('libdir')
+    )
+endif

@@ -137,6 +137,11 @@ static void free_pt_level(uintptr_t table_phys, int level) {
             /* Level 1 = PT: entries are leaf 4 KiB pages.
              * Validate physical address before freeing — a corrupt or stale
              * PTE might contain garbage that would trip the PMM bounds check. */
+            if (table[i] & VMM_COW) {
+                /* Shared COW leaf: without per-page refcounts we must not free
+                 * here, otherwise sibling address spaces keep dangling PTEs. */
+                continue;
+            }
             if (!pmm_phys_valid(child_phys, 1)) {
                 KLOG_WARN("VMM: free_pt_level: skipping bad leaf PTE phys=0x%lx\n",
                           (unsigned long)child_phys);
@@ -148,6 +153,9 @@ static void free_pt_level(uintptr_t table_phys, int level) {
              * not a page table.  Free the underlying pages directly.
              *   level 2 (PD)   → 2 MiB = 512 × 4 KiB pages
              *   level 3 (PDPT) → 1 GiB = 512 × 512 × 4 KiB pages        */
+            if (table[i] & VMM_COW) {
+                continue;
+            }
             size_t npages = (level == 2) ? 512 : (512 * 512);
             pmm_free_pages(child_phys, npages);
         } else {

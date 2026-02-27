@@ -83,3 +83,6 @@ extern file_ops_t g_socket_file_ops;
 
 /* ── init ────────────────────────────────────────────────────────────────── */
 void socket_init(void);
+
+/* Deliver a received ICMP payload to raw ICMP sockets (used by icmp_rx). */
+void socket_deliver_icmp_rx(skbuff_t *skb);

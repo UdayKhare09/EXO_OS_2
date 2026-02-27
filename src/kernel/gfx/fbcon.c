@@ -225,8 +225,47 @@ static void csi_dispatch(fbcon_t *c, char cmd) {
         apply_sgr(c);
         break;
     case 'J':
-        /* ESC[2J: clear screen */
-        fill_rect(c, 0, 0, (int)c->fb_w, (int)c->fb_h, c->bg);
+        /* ED — Erase in Display:
+         *   ESC[J / ESC[0J : cursor -> end of screen
+         *   ESC[1J          : start of screen -> cursor
+         *   ESC[2J          : whole screen */
+        {
+            int mode = (c->csi_nparams > 0) ? c->csi_params[0] : 0;
+            int cx = c->col * c->cw;
+            int cy = c->row * c->ch;
+            if (mode == 0) {
+                fill_rect(c, cx, cy, (int)c->fb_w - cx, c->ch, c->bg);
+                if (c->row + 1 < c->rows) {
+                    fill_rect(c, 0, (c->row + 1) * c->ch,
+                              (int)c->fb_w, (c->rows - (c->row + 1)) * c->ch, c->bg);
+                }
+            } else if (mode == 1) {
+                if (c->row > 0) {
+                    fill_rect(c, 0, 0, (int)c->fb_w, c->row * c->ch, c->bg);
+                }
+                fill_rect(c, 0, cy, cx + c->cw, c->ch, c->bg);
+            } else if (mode == 2) {
+                fill_rect(c, 0, 0, (int)c->fb_w, (int)c->fb_h, c->bg);
+            }
+        }
+        break;
+    case 'K':
+        /* EL — Erase in Line:
+         *   ESC[K / ESC[0K : cursor -> end of line
+         *   ESC[1K          : start of line -> cursor
+         *   ESC[2K          : whole line */
+        {
+            int mode = (c->csi_nparams > 0) ? c->csi_params[0] : 0;
+            int cx = c->col * c->cw;
+            int cy = c->row * c->ch;
+            if (mode == 0) {
+                fill_rect(c, cx, cy, (int)c->fb_w - cx, c->ch, c->bg);
+            } else if (mode == 1) {
+                fill_rect(c, 0, cy, cx + c->cw, c->ch, c->bg);
+            } else if (mode == 2) {
+                fill_rect(c, 0, cy, (int)c->fb_w, c->ch, c->bg);
+            }
+        }
         break;
     case 'H':
         /* ESC[H or ESC[row;colH: move cursor */

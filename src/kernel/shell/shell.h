@@ -43,6 +43,12 @@ void shell_sort_commands(void);
 /* Create a shell attached to an fbcon console */
 shell_t *shell_create(fbcon_t *con);
 
+/* Create a shell without printing the banner */
+shell_t *shell_create_quiet(fbcon_t *con);
+
+/* Launch a binary as a user process (blocks until it exits) */
+void cmd_exec_path(shell_t *sh, const char *path);
+
 /* Destroy shell */
 void shell_destroy(shell_t *sh);
 

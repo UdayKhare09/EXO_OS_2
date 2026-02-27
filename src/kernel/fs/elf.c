@@ -167,6 +167,25 @@ int elf_load(const void *data, uint64_t data_size,
     /* brk starts at page-aligned end of loaded segments */
     out->brk_start = (brk_end + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
 
+    /* Many static binaries (including BusyBox/musl) omit PT_PHDR.
+     * In that case, derive AT_PHDR from the load segment that contains
+     * e_phoff in the file image. */
+    if (!out->phdr_vaddr) {
+        for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+            const Elf64_Phdr *phdr = (const Elf64_Phdr *)(raw + ehdr->e_phoff
+                                                           + i * ehdr->e_phentsize);
+            if (phdr->p_type != PT_LOAD)
+                continue;
+            if (ehdr->e_phoff < phdr->p_offset)
+                continue;
+            uint64_t delta = ehdr->e_phoff - phdr->p_offset;
+            if (delta >= phdr->p_filesz)
+                continue;
+            out->phdr_vaddr = phdr->p_vaddr + delta;
+            break;
+        }
+    }
+
     KLOG_INFO("elf: loaded entry=%p brk_start=%p phnum=%u\n",
               (void *)out->entry, (void *)out->brk_start, ehdr->e_phnum);
     return 0;

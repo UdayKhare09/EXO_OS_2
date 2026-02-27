@@ -14,7 +14,7 @@
  *  10.  APIC (disable PIC, enable LAPIC, calibrate timer)
  *  11.  SMP (bring up AP cores)
  *  12.  Scheduler
- *  13.  Spawn: shell task, USB stack task, storage-init task
+ *  13.  Spawn: init task, USB stack task, storage-init task
  *  14.  Enable interrupts → idle loop
  */
 
@@ -184,53 +184,106 @@ static void usb_init_task(void *arg) {
         KLOG_WARN("usb-init: USB stack unavailable\n");
 }
 
-/* ── Shell task ─────────────────────────────────────────────────────────── */
-/* Reads from the global input ring and feeds characters to the shell.
- *
- * CRITICAL: sched_sleep(1) is called on EVERY iteration — not just when
- * the ring is empty.  A busy-loop here starves the "usb-evt" task, which
- * is the only task that calls hid_transfer_done() → input_push_key().
- * Without yielding every ms, no further HID events reach the ring.        */
-static void shell_task(void *arg) {
+static bool vfs_path_exists(const char *path) {
+    int err = 0;
+    vnode_t *vn = vfs_lookup(path, true, &err);
+    if (!vn) return false;
+    vfs_vnode_put(vn);
+    return true;
+}
+
+static bool read_small_text_file(const char *path, char *buf, size_t buf_sz) {
+    if (!buf || buf_sz < 2) return false;
+    int err = 0;
+    vnode_t *vn = vfs_lookup(path, true, &err);
+    if (!vn || !vn->ops || !vn->ops->read) {
+        if (vn) vfs_vnode_put(vn);
+        return false;
+    }
+    size_t to_read = vn->size;
+    if (to_read >= buf_sz) to_read = buf_sz - 1;
+    ssize_t rd = vn->ops->read(vn, buf, to_read, 0);
+    vfs_vnode_put(vn);
+    if (rd < 0) return false;
+    buf[(size_t)rd] = '\0';
+    return true;
+}
+
+static bool parse_shell_from_environment(const char *text, char *out, size_t out_sz) {
+    if (!text || !out || out_sz < 2) return false;
+    const char *p = text;
+    while (*p) {
+        const char *line = p;
+        while (*p && *p != '\n' && *p != '\r') p++;
+        size_t len = (size_t)(p - line);
+        while (*p == '\n' || *p == '\r') p++;
+
+        if (len <= 6 || strncmp(line, "SHELL=", 6) != 0)
+            continue;
+
+        const char *val = line + 6;
+        size_t vlen = len - 6;
+        if (vlen >= 2 &&
+            ((val[0] == '"' && val[vlen - 1] == '"') ||
+             (val[0] == '\'' && val[vlen - 1] == '\''))) {
+            val++;
+            vlen -= 2;
+        }
+        if (!vlen || val[0] != '/')
+            continue;
+        if (vlen >= out_sz) vlen = out_sz - 1;
+        memcpy(out, val, vlen);
+        out[vlen] = '\0';
+        return true;
+    }
+    return false;
+}
+
+static void pick_user_shell_path(char *out, size_t out_sz) {
+    if (!out || out_sz < 2) return;
+    strncpy(out, "/bin/sh", out_sz - 1);
+    out[out_sz - 1] = '\0';
+
+    char envbuf[512];
+    char configured[VFS_MOUNT_PATH_MAX];
+    if (read_small_text_file("/etc/environment", envbuf, sizeof(envbuf)) &&
+        parse_shell_from_environment(envbuf, configured, sizeof(configured))) {
+        strncpy(out, configured, out_sz - 1);
+        out[out_sz - 1] = '\0';
+    }
+}
+
+/* ── Init task: launch configured user-space shell ──────────────────────── */
+static void init_task(void *arg) {
     (void)arg;
 
+    char shell_path[VFS_MOUNT_PATH_MAX];
+    pick_user_shell_path(shell_path, sizeof(shell_path));
+    KLOG_INFO("init: waiting for shell '%s'...\n", shell_path);
+
+    while (!vfs_path_exists(shell_path)) {
+        sched_sleep(10);
+        pick_user_shell_path(shell_path, sizeof(shell_path));
+    }
+
+    /* Small grace period for USB/HID to come up */
+    sched_sleep(200);
+
     fbcon_t *con = fbcon_get();
-    if (!con) {
-        KLOG_ERR("shell: no framebuffer console — bailing\n");
+    shell_t *launcher = shell_create_quiet(con);
+    if (!launcher) {
+        KLOG_ERR("init: failed to create launcher shell context\n");
         return;
     }
 
-    shell_t *sh = shell_create(con);
-    if (!sh) {
-        KLOG_ERR("shell: failed to allocate shell instance\n");
-        return;
-    }
-
-    KLOG_INFO("shell: running (USB HID keyboard input)\n");
-
-    uint64_t next_blink = sched_get_ticks() + 500;  /* first blink in 500 ms */
-
+    extern void cmd_exec_path(shell_t *sh, const char *path);
     for (;;) {
-        /* Drain all pending key events from the HID ring */
-        input_event_t ev;
-        while (input_poll(&ev)) {
-            if (ev.type  == INPUT_EV_KEY &&
-                ev.state == INPUT_KEY_PRESS) {
-                char c = input_keycode_to_ascii(ev.keycode, ev.modifiers);
-                if (c) shell_on_char_inst(sh, c);
-            }
-        }
-
-        /* Cursor blink (500 ms interval using real jiffy clock) */
-        uint64_t now = sched_get_ticks();
-        if (now >= next_blink) {
-            fbcon_tick(con);
-            next_blink = now + 500;
-        }
-
-        /* Yield every iteration — gives usb-evt time to push the next
-         * keyboard HID report into the ring before we poll again.         */
-        sched_sleep(1);
+        if (con)
+            fbcon_printf_inst(con, "\n  EXO_OS — launching %s\n\n", shell_path);
+        cmd_exec_path(launcher, shell_path);
+        KLOG_WARN("init: %s exited; restarting in 1s\n", shell_path);
+        sched_sleep(1000);
+        pick_user_shell_path(shell_path, sizeof(shell_path));
     }
 }
 
@@ -367,7 +420,7 @@ void kmain(void) {
     shell_register_builtins();
     shell_sort_commands();
 
-    sched_spawn("shell",        shell_task,        NULL);
+    sched_spawn("init",         init_task,         NULL);
     sched_spawn("usb-init",     usb_init_task,     NULL);
     sched_spawn("storage-init", storage_init_task, NULL);
     sched_spawn("net-init",     net_init_task,     NULL);

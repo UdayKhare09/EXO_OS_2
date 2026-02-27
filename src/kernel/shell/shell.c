@@ -28,6 +28,9 @@
 #include "fs/fd.h"
 #include "fs/elf.h"
 #include "sched/task.h"
+
+/* Defined in syscall/net_syscalls.c */
+extern void tty_set_fg_pgid(int pgid);
 #include "mm/vmm.h"
 
 /* ── ANSI helpers ─────────────────────────────────────────────────────────── */
@@ -726,6 +729,8 @@ static void cmd_arp_show(shell_t *sh, const char *args) {
 }
 
 /* ── exec: launch an ELF binary as a user-space process ──────────────────── */
+void cmd_exec_path(shell_t *sh, const char *path);  /* forward decl */
+
 static void cmd_exec(shell_t *sh, const char *args) {
     fbcon_t *c = sh->con;
     if (!args || !*args) {
@@ -825,33 +830,79 @@ static void cmd_exec(shell_t *sh, const char *args) {
         }                                                                 \
     } while(0)
 
-    /* Copy path string to top of user stack */
-    size_t pathlen = strlen(fullpath) + 1;
-    sp -= pathlen;
-    sp &= ~0x7ULL; /* align to 8 */
-    uintptr_t argv0_addr = sp;
-    {
-        uint64_t *pte = vmm_get_pte(pml4, sp);
-        if (pte) {
-            uintptr_t ph = (*pte) & 0x000FFFFFFFFFF000ULL;
-            uintptr_t off = sp & (PAGE_SIZE - 1);
-            memcpy((void *)(vmm_phys_to_virt(ph) + off), fullpath, pathlen);
-        }
+    /* Helper: copy a string to user stack, return its user address */
+    #define EXEC_PUSH_STR(str) ({ \
+        size_t _len = strlen(str) + 1; \
+        sp -= _len; \
+        sp &= ~0x7ULL; \
+        uintptr_t _addr = sp; \
+        uint64_t *_pte2 = vmm_get_pte(pml4, sp); \
+        if (_pte2) { \
+            uintptr_t _ph2 = (*_pte2) & 0x000FFFFFFFFFF000ULL; \
+            uintptr_t _of2 = sp & (PAGE_SIZE - 1); \
+            memcpy((void *)(vmm_phys_to_virt(_ph2) + _of2), (str), _len); \
+        } \
+        _addr; \
+    })
+
+    /* argv[0]: use "-sh" for /bin/sh so BusyBox ash treats it as login shell
+     * and sources /etc/profile. */
+    const char *argv0_str = fullpath;
+    if (strcmp(fullpath, "/bin/sh") == 0)
+        argv0_str = "-sh";
+    uintptr_t argv0_addr = EXEC_PUSH_STR(argv0_str);
+
+    char env_pwd[VFS_MOUNT_PATH_MAX + 5];
+    const char *cwd_env = (sh && sh->cwd[0]) ? sh->cwd : "/";
+    size_t cwd_len = strlen(cwd_env);
+    if (cwd_len > VFS_MOUNT_PATH_MAX - 1)
+        cwd_len = VFS_MOUNT_PATH_MAX - 1;
+    memcpy(env_pwd, "PWD=", 4);
+    memcpy(env_pwd + 4, cwd_env, cwd_len);
+    env_pwd[4 + cwd_len] = '\0';
+
+    /* Push environment strings */
+    const char *env_list[] = {
+        "PATH=/bin:/usr/bin:/sbin:/usr/sbin",
+        "HOME=/",
+        "TERM=linux",
+        "SHELL=/bin/sh",
+        "ENV=/etc/profile",
+        "USER=root",
+        "LOGNAME=root",
+        env_pwd,
+        "TMPDIR=/tmp",
+        "PS1=# ",
+    };
+    uintptr_t env_addrs[sizeof(env_list) / sizeof(env_list[0])] = {0};
+    int env_count = 0;
+    for (size_t i = 0; i < sizeof(env_list) / sizeof(env_list[0]); i++) {
+        env_addrs[env_count++] = EXEC_PUSH_STR(env_list[i]);
     }
 
-    /* Align to 16 bytes */
+    /* Align to 16 bytes before the pointer table */
     sp &= ~0xFULL;
 
-    /* Auxiliary vector: AT_NULL */
-    EXEC_PUSH(0);           /* AT_NULL value */
-    EXEC_PUSH(0);           /* AT_NULL type  */
-    EXEC_PUSH(PAGE_SIZE);   /* AT_PAGESZ value */
-    EXEC_PUSH(6);           /* AT_PAGESZ type  */
-    EXEC_PUSH(info.entry);  /* AT_ENTRY value  */
-    EXEC_PUSH(9);           /* AT_ENTRY type   */
+    /* Auxiliary vector (match sys_execve layout) */
+    EXEC_PUSH(0);                  /* AT_NULL value */
+    EXEC_PUSH(0);                  /* AT_NULL type  */
+    EXEC_PUSH(0);                  /* AT_SECURE value */
+    EXEC_PUSH(23);                 /* AT_SECURE type  */
+    EXEC_PUSH(info.entry);         /* AT_ENTRY value  */
+    EXEC_PUSH(9);                  /* AT_ENTRY type   */
+    EXEC_PUSH(PAGE_SIZE);          /* AT_PAGESZ value */
+    EXEC_PUSH(6);                  /* AT_PAGESZ type  */
+    EXEC_PUSH(info.phdr_size);     /* AT_PHENT value  */
+    EXEC_PUSH(4);                  /* AT_PHENT type   */
+    EXEC_PUSH(info.phdr_count);    /* AT_PHNUM value  */
+    EXEC_PUSH(5);                  /* AT_PHNUM type   */
+    EXEC_PUSH(info.phdr_vaddr);    /* AT_PHDR value   */
+    EXEC_PUSH(3);                  /* AT_PHDR type    */
 
-    /* envp: NULL */
+    /* envp: strings + NULL terminator */
     EXEC_PUSH(0);
+    for (int i = env_count - 1; i >= 0; i--)
+        EXEC_PUSH(env_addrs[i]);
 
     /* argv: argv[0]=path, NULL */
     EXEC_PUSH(0);
@@ -860,8 +911,10 @@ static void cmd_exec(shell_t *sh, const char *args) {
     /* argc */
     EXEC_PUSH(1);
 
-    /* Ensure 16-byte alignment */
-    sp &= ~0xFULL;
+    /* Do not adjust SP after argc is pushed: process entry expects
+     * argc at [RSP] followed by argv/envp/auxv contiguously. */
+
+    #undef EXEC_PUSH_STR
 
     #undef EXEC_PUSH
 
@@ -878,7 +931,9 @@ static void cmd_exec(shell_t *sh, const char *args) {
     t->brk_base    = info.brk_start;
     t->brk_current = info.brk_start;
     t->mmap_next   = USER_MMAP_BASE;
-    strncpy(t->cwd, "/", TASK_CWD_MAX);
+    const char *initial_cwd = (sh && sh->cwd[0]) ? sh->cwd : "/";
+    strncpy(t->cwd, initial_cwd, TASK_CWD_MAX - 1);
+    t->cwd[TASK_CWD_MAX - 1] = '\0';
 
     /* Add stack VMA */
     vma_t *stack_vma = kmalloc(sizeof(vma_t));
@@ -899,6 +954,9 @@ static void cmd_exec(shell_t *sh, const char *args) {
     } else {
         fbcon_puts_inst(c, "  exec: warning: could not open /dev/tty for stdio\n");
     }
+
+    /* Make this process the TTY foreground group so shell job control works */
+    tty_set_fg_pgid((int)t->pgid);
 
     /* Set shell as parent so child becomes ZOMBIE (not immediately freed) on exit */
     t->parent = sched_current();
@@ -925,6 +983,11 @@ static void cmd_exec(shell_t *sh, const char *args) {
             task_destroy(ct);
         }
     }
+}
+
+/* ── Public API: launch a binary by path (used by init_task in main.c) ── */
+void cmd_exec_path(shell_t *sh, const char *path) {
+    cmd_exec(sh, path);
 }
 
 /* ── Register all built-in commands ───────────────────────────────────────── */
@@ -1024,6 +1087,15 @@ shell_t *shell_create(fbcon_t *con) {
 
     fbcon_printf_inst(con, A_GREEN "exo" A_RESET ":" A_CYAN "/" A_RESET "> ");
     fbcon_show_cursor_inst(con);
+    return sh;
+}
+
+shell_t *shell_create_quiet(fbcon_t *con) {
+    shell_t *sh = kzalloc(sizeof(*sh));
+    if (!sh) return NULL;
+    sh->con = con;
+    sh->len = 0;
+    strncpy(sh->cwd, "/", VFS_MOUNT_PATH_MAX);
     return sh;
 }
 

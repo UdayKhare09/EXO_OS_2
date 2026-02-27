@@ -22,6 +22,7 @@
 /* ── Internal helpers ────────────────────────────────────────────────────── */
 static void fill_linux_stat(linux_stat_t *lst, const vfs_stat_t *st);
 int64_t sys_read(int fd, void *buf, uint64_t count);
+int64_t sys_fstat(int fd, linux_stat_t *buf);
 int64_t sys_fstatat(int dirfd, const char *upath, linux_stat_t *buf, int flags);
 int64_t sys_mkdirat(int dirfd, const char *upath, uint32_t mode);
 int64_t sys_unlinkat(int dirfd, const char *upath, int flags);
@@ -242,7 +243,14 @@ int64_t sys_openat(int dirfd, const char *upath, int flags, uint32_t mode) {
 
 int64_t sys_fstatat(int dirfd, const char *upath, linux_stat_t *buf, int flags) {
     if (!buf) return -EINVAL;
-    if (flags & ~AT_SYMLINK_NOFOLLOW) return -EINVAL;
+
+    /* AT_EMPTY_PATH: stat the fd itself (used for fstat via fstatat) */
+    #define AT_EMPTY_PATH 0x1000
+    if (flags & AT_EMPTY_PATH) {
+        return sys_fstat(dirfd, buf);
+    }
+
+    if (flags & ~(AT_SYMLINK_NOFOLLOW)) return -EINVAL;
 
     char path[VFS_MOUNT_PATH_MAX];
     int r = resolve_path_at(dirfd, upath, path);

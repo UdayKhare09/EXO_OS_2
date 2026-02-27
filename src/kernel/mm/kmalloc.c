@@ -29,6 +29,23 @@ static const size_t class_sizes[NCLASSES] = {16, 32, 64, 128, 256, 512, 1024, 20
 typedef struct slab_node { struct slab_node *next; } slab_node_t;
 static slab_node_t *freelists[NCLASSES];
 
+/* Validate that a freelist pointer is canonical and currently mapped
+ * in the kernel address space before we dereference it. */
+static inline int km_ptr_sane(const void *ptr) {
+    uintptr_t v = (uintptr_t)ptr;
+    if (!v) return 0;
+
+    /* x86_64 canonical address check */
+    uint64_t hi = (uint64_t)v >> 48;
+    if (!(hi == 0x0000 || hi == 0xFFFF))
+        return 0;
+
+    uint64_t *pte = vmm_get_pte(vmm_get_kernel_pml4(), v);
+    if (!pte || !(*pte & VMM_PRESENT))
+        return 0;
+    return 1;
+}
+
 /* Ticket-less test-and-set spinlock */
 static volatile int kmalloc_lock = 0;
 static inline void km_lock(void) {
@@ -86,8 +103,18 @@ void *kmalloc(size_t size) {
     km_lock();
     if (!freelists[cls]) refill_slab(cls);
     slab_node_t *node = freelists[cls];
+    if (node && !km_ptr_sane(node)) {
+        /* Corrupted freelist head: reset this class and rebuild one slab page. */
+        freelists[cls] = NULL;
+        refill_slab(cls);
+        node = freelists[cls];
+    }
     if (!node) { km_unlock(); return NULL; }
-    freelists[cls] = node->next;
+
+    slab_node_t *next = node->next;
+    if (next && !km_ptr_sane(next))
+        next = NULL;
+    freelists[cls] = next;
     km_unlock();
 
     /* Write class index into the block's header bytes, return user ptr */
@@ -114,6 +141,7 @@ void kfree(void *ptr) {
     if (cls < 0 || cls >= NCLASSES) return;   /* corrupt header guard */
 
     slab_node_t *node = (slab_node_t *)hdr;
+    if (!km_ptr_sane(node)) return;
     km_lock();
     node->next     = freelists[cls];
     freelists[cls] = node;

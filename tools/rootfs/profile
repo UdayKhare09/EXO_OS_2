@@ -1,0 +1,19 @@
+# /etc/profile - EXO_OS defaults
+export PATH="/bin:/usr/bin:/sbin:/usr/sbin"
+export SHELL="/bin/sh"
+export HOME="/"
+export USER="root"
+export LOGNAME="root"
+export TMPDIR="/tmp"
+
+[ -z "$TERM" ] && TERM="linux"
+[ -z "$PWD" ] && PWD="/"
+[ -z "$PS1" ] && PS1="# "
+
+export TERM
+export PWD
+export PS1
+
+if [ -x /bin/busybox ]; then
+    /bin/busybox --install -s /bin >/dev/null 2>&1
+fi

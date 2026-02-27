@@ -11,6 +11,7 @@
 #include "syscall.h"
 #include "net/socket.h"
 #include "net/socket_defs.h"
+#include "drivers/net/netdev.h"
 #include "drivers/input/input.h"
 #include "sched/sched.h"
 #include "lib/klog.h"
@@ -19,8 +20,76 @@
 /* ioctl requests (Linux ABI subset) */
 #define TCGETS      0x5401
 #define TCSETS      0x5402
+#define TCSETSW     0x5403
+#define TCSETSF     0x5404
+#define TIOCGPGRP   0x540F
+#define TIOCSPGRP   0x5410
 #define TIOCGWINSZ  0x5413
 #define FIONBIO     0x5421
+
+/* socket interface ioctls used by ifconfig */
+#define SIOCGIFCONF   0x8912
+#define SIOCGIFFLAGS  0x8913
+#define SIOCSIFFLAGS  0x8914
+#define SIOCGIFADDR   0x8915
+#define SIOCSIFADDR   0x8916
+#define SIOCGIFBRDADDR 0x8919
+#define SIOCGIFHWADDR  0x8927
+
+#define IFF_UP         0x0001
+#define IFF_BROADCAST  0x0002
+#define IFF_RUNNING    0x0040
+
+#define ARPHRD_ETHER   1
+
+typedef struct {
+    char sa_data[14];
+    uint16_t sa_family;
+} __attribute__((packed)) kernel_sockaddr_alt_t;
+
+typedef struct {
+    char ifr_name[16];
+    union {
+        struct sockaddr     ifru_addr;
+        struct sockaddr     ifru_netmask;
+        struct sockaddr     ifru_broadaddr;
+        struct sockaddr     ifru_hwaddr;
+        int16_t             ifru_flags;
+    } ifr_ifru;
+} kernel_ifreq_t;
+
+typedef struct {
+    int ifc_len;
+    union {
+        char          *ifc_buf;
+        kernel_ifreq_t *ifc_req;
+    } ifc_ifcu;
+} kernel_ifconf_t;
+
+#define ifr_addr      ifr_ifru.ifru_addr
+#define ifr_netmask   ifr_ifru.ifru_netmask
+#define ifr_broadaddr ifr_ifru.ifru_broadaddr
+#define ifr_hwaddr    ifr_ifru.ifru_hwaddr
+#define ifr_flags     ifr_ifru.ifru_flags
+
+static netdev_t *ioctl_pick_dev(const char ifname[16]) {
+    if (ifname && ifname[0]) {
+        netdev_t *by_name = netdev_get_by_name(ifname);
+        if (by_name) return by_name;
+    }
+    return netdev_get_nth(0);
+}
+
+static void ioctl_fill_sockaddr_in(struct sockaddr *sa, uint32_t ip_nbo) {
+    struct sockaddr_in *sin = (struct sockaddr_in *)sa;
+    memset(sin, 0, sizeof(*sin));
+    sin->sin_family = AF_INET;
+    sin->sin_addr.s_addr = ip_nbo;
+}
+
+static uint32_t ioctl_ipv4_broadcast(uint32_t ip, uint32_t mask) {
+    return (ip & mask) | ~mask;
+}
 
 typedef uint32_t tcflag_t;
 typedef uint8_t  cc_t;
@@ -57,6 +126,12 @@ static kernel_termios_t g_tty_termios = {
     .c_ospeed = 38400,
 };
 
+static int g_tty_fg_pgid = 1;
+
+void tty_set_fg_pgid(int pgid) {
+    g_tty_fg_pgid = pgid;
+}
+
 static inline bool is_tty_file(const file_t *f) {
     return f && f->path[0] && strcmp(f->path, "/dev/tty") == 0;
 }
@@ -77,9 +152,21 @@ static int tty_ioctl(file_t *f, unsigned long cmd, unsigned long arg) {
         *user_t = g_tty_termios;
         return 0;
     }
-    if (cmd == TCSETS) {
+    if (cmd == TCSETS || cmd == TCSETSW || cmd == TCSETSF) {
         const kernel_termios_t *user_t = (const kernel_termios_t *)(uintptr_t)arg;
         g_tty_termios = *user_t;
+        return 0;
+    }
+    if (cmd == TIOCGPGRP) {
+        int *pgid = (int *)(uintptr_t)arg;
+        *pgid = g_tty_fg_pgid;
+        return 0;
+    }
+    if (cmd == TIOCSPGRP) {
+        int new_pgid = *(int *)(uintptr_t)arg;
+        if (new_pgid <= 0)
+            return -EINVAL;
+        g_tty_fg_pgid = new_pgid;
         return 0;
     }
     if (cmd == TIOCGWINSZ) {
@@ -283,6 +370,88 @@ int64_t sys_ioctl(int fd, unsigned long cmd, unsigned long arg) {
             f->flags &= ~O_NONBLOCK;
         sync_socket_nonblock(f);
         return 0;
+    }
+
+    if (f->f_ops == &g_socket_file_ops) {
+        if (cmd == SIOCGIFCONF) {
+            kernel_ifconf_t *ifc = (kernel_ifconf_t *)(uintptr_t)arg;
+            if (!ifc || !ifc->ifc_ifcu.ifc_req || ifc->ifc_len < (int)sizeof(kernel_ifreq_t))
+                return -EINVAL;
+
+            int total = netdev_count();
+            int max = ifc->ifc_len / (int)sizeof(kernel_ifreq_t);
+            int n = (total < max) ? total : max;
+
+            for (int i = 0; i < n; i++) {
+                netdev_t *dev = netdev_get_nth(i);
+                if (!dev) continue;
+                kernel_ifreq_t *ifr = &ifc->ifc_ifcu.ifc_req[i];
+                memset(ifr, 0, sizeof(*ifr));
+                strncpy(ifr->ifr_name, dev->name, sizeof(ifr->ifr_name) - 1);
+                ioctl_fill_sockaddr_in(&ifr->ifr_addr, dev->ip_addr);
+            }
+            ifc->ifc_len = n * (int)sizeof(kernel_ifreq_t);
+            return 0;
+        }
+
+        if (cmd == SIOCGIFFLAGS || cmd == SIOCSIFFLAGS ||
+            cmd == SIOCGIFADDR || cmd == SIOCSIFADDR ||
+            cmd == SIOCGIFNETMASK || cmd == SIOCSIFNETMASK ||
+            cmd == SIOCGIFBRDADDR || cmd == SIOCGIFHWADDR) {
+            kernel_ifreq_t *ifr = (kernel_ifreq_t *)(uintptr_t)arg;
+            if (!ifr) return -EINVAL;
+
+            netdev_t *dev = ioctl_pick_dev(ifr->ifr_name);
+            if (!dev) return -ENOENT;
+
+            if (cmd == SIOCGIFFLAGS) {
+                int16_t flags = IFF_BROADCAST;
+                if (dev->link) flags |= (IFF_UP | IFF_RUNNING);
+                ifr->ifr_flags = flags;
+                return 0;
+            }
+
+            if (cmd == SIOCSIFFLAGS) {
+                bool up = (ifr->ifr_flags & IFF_UP) != 0;
+                dev->link = up;
+                return 0;
+            }
+
+            if (cmd == SIOCGIFADDR) {
+                ioctl_fill_sockaddr_in(&ifr->ifr_addr, dev->ip_addr);
+                return 0;
+            }
+
+            if (cmd == SIOCSIFADDR) {
+                const struct sockaddr_in *sin = (const struct sockaddr_in *)&ifr->ifr_addr;
+                dev->ip_addr = sin->sin_addr.s_addr;
+                return 0;
+            }
+
+            if (cmd == SIOCGIFNETMASK) {
+                ioctl_fill_sockaddr_in(&ifr->ifr_netmask, dev->netmask);
+                return 0;
+            }
+
+            if (cmd == SIOCSIFNETMASK) {
+                const struct sockaddr_in *sin = (const struct sockaddr_in *)&ifr->ifr_netmask;
+                dev->netmask = sin->sin_addr.s_addr;
+                return 0;
+            }
+
+            if (cmd == SIOCGIFBRDADDR) {
+                ioctl_fill_sockaddr_in(&ifr->ifr_broadaddr,
+                                       ioctl_ipv4_broadcast(dev->ip_addr, dev->netmask));
+                return 0;
+            }
+
+            if (cmd == SIOCGIFHWADDR) {
+                memset(&ifr->ifr_hwaddr, 0, sizeof(ifr->ifr_hwaddr));
+                ifr->ifr_hwaddr.sa_family = ARPHRD_ETHER;
+                memcpy(ifr->ifr_hwaddr.sa_data, dev->mac, ETH_ALEN);
+                return 0;
+            }
+        }
     }
 
     if (f->f_ops && f->f_ops->ioctl)

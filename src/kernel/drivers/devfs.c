@@ -88,11 +88,12 @@ static ssize_t devfs_read(vnode_t *v, void *buf, size_t len, uint64_t off) {
             if (len == 0) return 0;
             char *dst = (char *)buf;
             size_t done = 0;
-
             while (done < len) {
                 char ch = 0;
                 if (input_tty_getchar_nonblock(&ch) == 0) {
+                    if (ch == '\r') ch = '\n';
                     dst[done++] = ch;
+
                     if (ch == '\n') break;
                     continue;
                 }

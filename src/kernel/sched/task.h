@@ -58,6 +58,7 @@ typedef struct task {
     uint32_t      pid;              /* process ID (== tid for main thread)      */
     uint32_t      ppid;             /* parent process ID                        */
     uint32_t      pgid;             /* process group ID                         */
+    uint32_t      sid;              /* session ID                               */
     uint32_t      uid, gid;         /* user/group (always 0 = root for now)     */
     struct task  *parent;           /* parent task pointer                      */
     struct task  *children;         /* first child (linked via child_next)      */

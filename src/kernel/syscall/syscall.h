@@ -30,6 +30,9 @@
 #define SYS_DUP         32
 #define SYS_DUP2        33
 #define SYS_NANOSLEEP   35
+#define SYS_GETITIMER   36
+#define SYS_ALARM       37
+#define SYS_SETITIMER   38
 #define SYS_GETPID      39
 #define SYS_CLONE       56
 #define SYS_FORK        57
@@ -48,6 +51,7 @@
 #define SYS_MKDIR       83
 #define SYS_RMDIR       84
 #define SYS_UNLINK      87
+#define SYS_SYMLINK     88
 #define SYS_READLINK    89
 #define SYS_UMASK       95
 #define SYS_GETRLIMIT   97
@@ -56,7 +60,11 @@
 #define SYS_GETGID      104
 #define SYS_GETEUID     107
 #define SYS_GETEGID     108
+#define SYS_SETPGID     109
 #define SYS_GETPPID     110
+#define SYS_SETSID      112
+#define SYS_GETPGID     121
+#define SYS_GETSID      124
 #define SYS_ARCH_PRCTL  158
 #define SYS_GETTID      186
 #define SYS_FUTEX       202

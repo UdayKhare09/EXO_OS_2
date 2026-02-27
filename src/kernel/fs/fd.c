@@ -2,6 +2,7 @@
 #include "fd.h"
 #include "vfs.h"
 #include "lib/klog.h"
+#include "lib/string.h"
 #include "mm/kmalloc.h"
 #include "sched/task.h"
 
@@ -129,6 +130,8 @@ int fd_setup_stdio(struct task *t, vnode_t *console) {
         int flags = (fd == 1 || fd == 2) ? O_WRONLY : O_RDONLY;
         file_t *f = file_alloc(console, flags);
         if (!f) return -1;
+        strncpy(f->path, "/dev/tty", sizeof(f->path) - 1);
+        f->path[sizeof(f->path) - 1] = '\0';
         if (fd_install(t, fd, f) < 0) { file_put(f); return -1; }
         file_put(f); /* table now holds the last reference */
     }

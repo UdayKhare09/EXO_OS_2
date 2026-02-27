@@ -72,7 +72,8 @@ int64_t sys_fork(cpu_regs_t *regs) {
     if (!child_pml4) return -ENOMEM;
 
     /* Create the child task */
-    task_t *child = task_create_user(parent->name, child_pml4, 0, 0,
+    task_t *child = task_create_user(parent->name, child_pml4,
+                                      regs->rip, regs->rsp,
                                       parent->cpu_id);
     if (!child) {
         vmm_destroy_address_space(child_pml4);
@@ -82,6 +83,7 @@ int64_t sys_fork(cpu_regs_t *regs) {
     /* Set up parent-child relationship */
     child->ppid    = parent->pid;
     child->pgid    = parent->pgid;
+    child->sid     = parent->sid;
     child->uid     = parent->uid;
     child->gid     = parent->gid;
     child->parent  = parent;
@@ -101,58 +103,27 @@ int64_t sys_fork(cpu_regs_t *regs) {
     child->fs_base     = parent->fs_base;
     child->sig_mask    = parent->sig_mask;
 
-    /* Set up child's initial register frame so it returns 0 from fork.
-     * We need to override the rsp/rbx/r12 that task_create_user set up
-     * for the user_mode_trampoline and instead make the child return
-     * directly from the syscall. */
-
-    /* The child should resume exactly where the parent was,
-     * but with rax = 0 (fork return value for child).
-     * We do this by setting up the kernel stack so the scheduler
-     * will return into the syscall return path. */
-
-    /* For now, the child was created with user_mode_trampoline.
-     * We need to re-set up the kernel stack frame so it looks like
-     * the child is returning from the same syscall. We'll make the
-     * user_mode_trampoline use rax=0 by clearing rbx→rax. Actually,
-     * the cleanest approach: set up iretq-style return on child's
-     * kernel stack. */
-
-    /* Override: make child return to user-mode at parent's RIP with rax=0 */
-    /* Rebuild the init_frame on child's kernel stack */
-    extern void fork_child_return(void);
-
+    /* Rebuild child kernel stack so first schedule resumes from a copied
+     * syscall frame (exact parent state, except child sees fork return 0). */
     typedef struct {
         uint64_t r15, r14, r13, r12, rbx, rbp;
         uint64_t rip;
     } __attribute__((packed)) init_frame_t;
 
     uintptr_t child_kstack_top = vmm_phys_to_virt(child->stack_phys) + TASK_STACK_SIZE;
+    child_kstack_top -= sizeof(cpu_regs_t);
+    cpu_regs_t *child_regs = (cpu_regs_t *)child_kstack_top;
+    *child_regs = *regs;
+    child_regs->rax = 0;
 
-    /* Build a larger frame: init_frame + iretq frame */
-    /* We push an iretq frame (SS, RSP, RFLAGS, CS, RIP) then the init_frame
-     * that task_switch_asm will pop. The init_frame RIP points to a small
-     * asm stub that does "pop rax; iretq" to return to user-space with rax=0 */
-
-    /* For simplicity, use the existing user_mode_trampoline approach:
-     * r12 = user RSP (from parent's regs), rbx = user RIP (from parent's regs)
-     * But we need to ensure rax=0 after the trampoline. The existing
-     * user_mode_trampoline xors rax, so rax=0 automatically. Perfect. */
     child_kstack_top -= sizeof(init_frame_t);
     init_frame_t *frame = (init_frame_t *)child_kstack_top;
     memset(frame, 0, sizeof(*frame));
-
-    extern void user_mode_trampoline(void);
-    frame->rip = (uint64_t)user_mode_trampoline;
-    frame->rbx = regs->rip;    /* user RIP (resume at same instruction) */
-    frame->r12 = regs->rsp;    /* user RSP */
+    extern void user_fork_return_trampoline(void);
+    frame->rip = (uint64_t)user_fork_return_trampoline;
+    frame->r12 = (uint64_t)child_regs;
 
     child->rsp = child_kstack_top;
-
-    /* PROBLEM: user_mode_trampoline does `xor eax,eax` so child gets rax=0. Good.
-     * But it clears ALL registers. We want the child to have the same registers
-     * as parent except rax=0. For a basic fork this is fine — most programs
-     * only check the return value. */
 
     /* Enqueue child for scheduling */
     sched_add_task(child, child->cpu_id);
@@ -174,20 +145,57 @@ int64_t sys_fork(cpu_regs_t *regs) {
 #define AT_ENTRY         9
 #define AT_SECURE       23
 
+/* Minimal user-memory copy helpers for execve argument marshaling. */
+static int exec_copy_user_bytes(uintptr_t cr3, const void *user_src, void *dst, size_t len) {
+    if (!user_src || !dst) return -EFAULT;
+
+    uintptr_t up = (uintptr_t)user_src;
+    uint8_t *out = (uint8_t *)dst;
+    for (size_t i = 0; i < len; i++) {
+        uint64_t *pte = vmm_get_pte(cr3, up + i);
+        if (!pte || !(*pte & VMM_PRESENT))
+            return -EFAULT;
+        uintptr_t phys = (*pte) & VMM_PTE_ADDR_MASK;
+        uintptr_t off = (up + i) & (PAGE_SIZE - 1);
+        out[i] = *(uint8_t *)(vmm_phys_to_virt(phys) + off);
+    }
+    return 0;
+}
+
+static int exec_copy_user_cstr(uintptr_t cr3, const char *user_s,
+                               char *dst, size_t dst_sz, size_t *out_len) {
+    if (!user_s || !dst || dst_sz == 0) return -EFAULT;
+
+    for (size_t i = 0; i < dst_sz; i++) {
+        char c = 0;
+        int rc = exec_copy_user_bytes(cr3, user_s + i, &c, 1);
+        if (rc < 0) return rc;
+        dst[i] = c;
+        if (c == '\0') {
+            if (out_len) *out_len = i + 1;
+            return 0;
+        }
+    }
+    return -ENAMETOOLONG;
+}
+
 /* Copy a user-space string array (argv or envp) into a flat kernel buffer.
  * Returns count of strings, or negative errno.
  * strs_out[] is filled with pointers INTO buf_out. */
-static int copy_strings(char *const user_arr[], char *buf, size_t buf_sz,
+static int copy_strings(uintptr_t cr3, char *const user_arr[], char *buf, size_t buf_sz,
                         const char **strs_out, int max_strs) {
     if (!user_arr) return 0;
     int count = 0;
     size_t off = 0;
     for (int i = 0; i < max_strs; i++) {
-        const char *s = user_arr[i];
+        const char *s = NULL;
+        if (exec_copy_user_bytes(cr3, &user_arr[i], &s, sizeof(s)) < 0)
+            return -EFAULT;
         if (!s) break;
-        size_t len = strlen(s) + 1;
-        if (off + len > buf_sz) return -E2BIG;
-        memcpy(buf + off, s, len);
+        size_t len = 0;
+        if (off >= buf_sz) return -E2BIG;
+        int rc = exec_copy_user_cstr(cr3, s, buf + off, buf_sz - off, &len);
+        if (rc < 0) return (rc == -ENAMETOOLONG) ? -E2BIG : rc;
         strs_out[count] = buf + off;
         off += len;
         count++;
@@ -211,14 +219,21 @@ int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
         return -ENOMEM;
     }
 
-    int argc = copy_strings(argv, argv_buf, EXEC_BUF_SIZE, argv_ptrs, EXEC_MAX_STRS);
-    int envc = copy_strings(envp, envp_buf, EXEC_BUF_SIZE, envp_ptrs, EXEC_MAX_STRS);
+    int argc = copy_strings(cur->cr3, argv, argv_buf, EXEC_BUF_SIZE, argv_ptrs, EXEC_MAX_STRS);
+    int envc = copy_strings(cur->cr3, envp, envp_buf, EXEC_BUF_SIZE, envp_ptrs, EXEC_MAX_STRS);
     if (argc < 0) { kfree(argv_buf); kfree(envp_buf); return argc; }
     if (envc < 0) { kfree(argv_buf); kfree(envp_buf); return envc; }
 
+    char kpath[VFS_MOUNT_PATH_MAX];
+    int prc = exec_copy_user_cstr(cur->cr3, path, kpath, sizeof(kpath), NULL);
+    if (prc < 0) {
+        kfree(argv_buf); kfree(envp_buf);
+        return (prc == -ENAMETOOLONG) ? -ENAMETOOLONG : -EFAULT;
+    }
+
     /* Open the ELF file */
     int vfs_err = 0;
-    vnode_t *vn = vfs_lookup(path, true, &vfs_err);
+    vnode_t *vn = vfs_lookup(kpath, true, &vfs_err);
     if (!vn) { kfree(argv_buf); kfree(envp_buf); return vfs_err ? -vfs_err : -ENOENT; }
 
     /* Read ELF into a temporary kernel buffer */
@@ -412,11 +427,10 @@ int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
 
     #undef PUSH_U64
 
-    /* Ensure 16-byte alignment of final RSP (System V ABI) */
-    sp &= ~0xFULL;
+    /* Do not realign after pushing argc; [RSP] must point at argc. */
 
     KLOG_INFO("execve: '%s' entry=%p brk=%p argc=%d envc=%d sp=%p\n",
-              path, (void *)info.entry, (void *)info.brk_start, argc, envc, (void*)sp);
+              kpath, (void *)info.entry, (void *)info.brk_start, argc, envc, (void*)sp);
 
     /* Jump to user-mode at the new entry point via user_mode_trampoline */
     extern void user_mode_trampoline(void);
@@ -742,14 +756,18 @@ int64_t sys_clone(uint64_t flags, uint64_t stack, uint64_t parent_tid_ptr,
     if (share_vm) {
         /* Thread: share the parent's address space */
         child_pml4 = parent->cr3;
-        child = task_create_user(parent->name, child_pml4, 0, 0, parent->cpu_id);
+        child = task_create_user(parent->name, child_pml4,
+                                 regs->rip, stack ? stack : regs->rsp,
+                                 parent->cpu_id);
         if (!child) return -ENOMEM;
         child->owns_address_space = 0;
     } else {
         /* New process: COW clone */
         child_pml4 = vmm_clone_address_space(parent->cr3);
         if (!child_pml4) return -ENOMEM;
-        child = task_create_user(parent->name, child_pml4, 0, 0, parent->cpu_id);
+        child = task_create_user(parent->name, child_pml4,
+                                 regs->rip, stack ? stack : regs->rsp,
+                                 parent->cpu_id);
         if (!child) {
             vmm_destroy_address_space(child_pml4);
             return -ENOMEM;
@@ -815,13 +833,12 @@ int64_t sys_clone(uint64_t flags, uint64_t stack, uint64_t parent_tid_ptr,
         uint64_t rip;
     } __attribute__((packed)) init_frame_t;
 
-    extern void user_mode_trampoline(void);
+    extern void user_fork_return_trampoline(void);
     kstack_child -= sizeof(init_frame_t);
     init_frame_t *frame = (init_frame_t *)kstack_child;
     memset(frame, 0, sizeof(*frame));
-    frame->rip = (uint64_t)user_mode_trampoline;
-    frame->rbx = child_regs->rip;
-    frame->r12 = child_regs->rsp;
+    frame->rip = (uint64_t)user_fork_return_trampoline;
+    frame->r12 = (uint64_t)child_regs;
 
     child->rsp = kstack_child;
 

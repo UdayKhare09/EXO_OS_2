@@ -38,41 +38,6 @@ common_isr_stub_handler:
     push r14
     push r15
 
-    ; ── Debug: trace CPU exceptions (vec < 32) via COM1 ──────────────────
-    ; vec is at [rsp + 120] (15 GP regs × 8 = 120 bytes above current RSP)
-    mov  rcx, [rsp + 120]      ; rcx = vector number
-    cmp  rcx, 32
-    jae  .no_fault_trace
-    ; Emit 'F' then the vector as 2-digit hex on COM1
-    push rax
-    push rdx
-    mov  dx, 0x3F8
-    mov  al, 'F'
-    out  dx, al
-    ; high nibble
-    mov  rax, rcx
-    shr  al, 4
-    add  al, '0'
-    cmp  al, '9'
-    jbe  .fhi_ok
-    add  al, 7
-.fhi_ok:
-    out  dx, al
-    ; low nibble
-    mov  rax, rcx
-    and  al, 0x0F
-    add  al, '0'
-    cmp  al, '9'
-    jbe  .flo_ok
-    add  al, 7
-.flo_ok:
-    out  dx, al
-    mov  al, 10
-    out  dx, al
-    pop  rdx
-    pop  rax
-.no_fault_trace:
-
     ; ── Protect FPU / SSE / AVX across C ISR code ────────────────────────
     ; Per-CPU ISR XSAVE buffer is at offset 24 of cpu_info_t (GS base).
     ; Using XSAVE64 (component mask 0x7 = x87+SSE+AVX) so full SIMD state is

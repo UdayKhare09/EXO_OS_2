@@ -1,6 +1,7 @@
 /* net/icmp.c — ICMP echo + unreachable (RFC 792) */
 #include "net/icmp.h"
 #include "net/ipv4.h"
+#include "net/socket.h"
 #include "net/netutil.h"
 #include "net/skbuff.h"
 #include "lib/klog.h"
@@ -34,6 +35,9 @@ void icmp_rx(netdev_t *dev, skbuff_t *skb) {
         skb_free(skb);
         return;
     }
+
+    /* Feed raw ICMP sockets (e.g. BusyBox ping). */
+    socket_deliver_icmp_rx(skb);
 
     switch (hdr->type) {
     case ICMP_ECHO_REQUEST: {

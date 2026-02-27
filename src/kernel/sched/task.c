@@ -77,6 +77,7 @@ static task_t *task_alloc_common(const char *name, uint32_t cpu_id) {
     /* Process identity defaults */
     t->ppid   = 0;
     t->pgid   = t->pid;
+    t->sid    = t->pid;
     t->uid    = 0;
     t->gid    = 0;
     t->parent = NULL;

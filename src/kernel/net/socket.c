@@ -18,6 +18,29 @@
 /* forward declare protocol ops tables */
 static socket_proto_ops_t tcp_proto_ops;
 static socket_proto_ops_t udp_proto_ops;
+static socket_proto_ops_t raw_icmp_proto_ops;
+
+#define RAW_ICMP_MAX_SOCKS 32
+static socket_t *g_raw_icmp_socks[RAW_ICMP_MAX_SOCKS];
+
+static int raw_icmp_register(socket_t *sk) {
+    for (int i = 0; i < RAW_ICMP_MAX_SOCKS; i++) {
+        if (!g_raw_icmp_socks[i]) {
+            g_raw_icmp_socks[i] = sk;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static void raw_icmp_unregister(socket_t *sk) {
+    for (int i = 0; i < RAW_ICMP_MAX_SOCKS; i++) {
+        if (g_raw_icmp_socks[i] == sk) {
+            g_raw_icmp_socks[i] = NULL;
+            return;
+        }
+    }
+}
 
 /* ══════════════════════════════════════════════════════════════════════════
  *  file_ops_t callbacks (dispatched from sys_read/sys_write/sys_close etc.)
@@ -81,10 +104,11 @@ int socket_create(int domain, int type, int protocol) {
     if (protocol == 0) {
         if (real_type == SOCK_STREAM) protocol = IPPROTO_TCP;
         else if (real_type == SOCK_DGRAM) protocol = IPPROTO_UDP;
+        else if (real_type == SOCK_RAW) protocol = IPPROTO_ICMP;
         else return -1;
     }
 
-    if (real_type != SOCK_STREAM && real_type != SOCK_DGRAM) return -1;
+    if (real_type != SOCK_STREAM && real_type != SOCK_DGRAM && real_type != SOCK_RAW) return -1;
 
     socket_t *sk = kzalloc(sizeof(socket_t));
     if (!sk) return -1;
@@ -100,8 +124,21 @@ int socket_create(int domain, int type, int protocol) {
 
     if (protocol == IPPROTO_TCP)
         sk->proto_ops = &tcp_proto_ops;
-    else
+    else if (protocol == IPPROTO_UDP)
         sk->proto_ops = &udp_proto_ops;
+    else if (real_type == SOCK_RAW && protocol == IPPROTO_ICMP)
+        sk->proto_ops = &raw_icmp_proto_ops;
+    else {
+        kfree(sk);
+        return -1;
+    }
+
+    if (sk->proto_ops == &raw_icmp_proto_ops) {
+        if (raw_icmp_register(sk) < 0) {
+            kfree(sk);
+            return -1;
+        }
+    }
 
     /* allocate file_t and fd */
     int flags = 0; /* O_RDWR */
@@ -119,8 +156,29 @@ int socket_create(int domain, int type, int protocol) {
     }
 
     KLOG_DEBUG("socket: created %s socket fd=%d\n",
-         protocol == IPPROTO_TCP ? "TCP" : "UDP", fd);
+         protocol == IPPROTO_TCP ? "TCP" :
+         (protocol == IPPROTO_UDP ? "UDP" : "RAW-ICMP"), fd);
     return fd;
+}
+
+void socket_deliver_icmp_rx(skbuff_t *skb) {
+    if (!skb || skb->len == 0) return;
+
+    for (int i = 0; i < RAW_ICMP_MAX_SOCKS; i++) {
+        socket_t *sk = g_raw_icmp_socks[i];
+        if (!sk) continue;
+
+        skbuff_t *copy = skb_alloc(skb->len + 64);
+        if (!copy) continue;
+        skb_reserve(copy, 64);
+        memcpy(skb_put(copy, skb->len), skb->data, skb->len);
+        copy->src_ip = skb->src_ip;
+        copy->dst_ip = skb->dst_ip;
+        copy->protocol = IPPROTO_ICMP;
+
+        skb_queue_push(&sk->rx_queue, copy);
+        waitq_wake_one(&sk->wq_rx);
+    }
 }
 
 socket_t *socket_from_fd(int fd) {
@@ -652,4 +710,129 @@ static socket_proto_ops_t udp_proto_ops = {
     .poll       = udp_sock_poll,
     .setsockopt = udp_sock_setsockopt,
     .getsockopt = udp_sock_getsockopt,
+};
+
+/* ══════════════════════════════════════════════════════════════════════════
+ *  RAW ICMP protocol operations
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+static int raw_icmp_sock_bind(socket_t *sk, const struct sockaddr *addr,
+                              socklen_t addrlen)
+{
+    if (addrlen < sizeof(struct sockaddr_in)) return -1;
+    memcpy(&sk->local_addr, addr, sizeof(struct sockaddr_in));
+    sk->bound = 1;
+    return 0;
+}
+
+static int raw_icmp_sock_connect(socket_t *sk, const struct sockaddr *addr,
+                                 socklen_t addrlen)
+{
+    if (addrlen < sizeof(struct sockaddr_in)) return -1;
+    memcpy(&sk->remote_addr, addr, sizeof(struct sockaddr_in));
+    sk->connected = 1;
+    return 0;
+}
+
+static ssize_t raw_icmp_sock_sendto(socket_t *sk, const void *buf, size_t len,
+                                    int flags, const struct sockaddr *dest_addr,
+                                    socklen_t addrlen)
+{
+    (void)flags;
+    struct sockaddr_in dst;
+
+    if (dest_addr && addrlen >= sizeof(struct sockaddr_in)) {
+        memcpy(&dst, dest_addr, sizeof(dst));
+    } else if (sk->connected) {
+        dst = sk->remote_addr;
+    } else {
+        return -1;
+    }
+
+    uint32_t dst_ip = dst.sin_addr.s_addr;
+    uint32_t nh;
+    netdev_t *dev = ip_route(dst_ip, &nh);
+    if (!dev) return -1;
+
+    skbuff_t *skb = skb_alloc(len + 64);
+    if (!skb) return -1;
+    skb_reserve(skb, 64);
+    memcpy(skb_put(skb, len), buf, len);
+    skb->protocol = IPPROTO_ICMP;
+
+    int rc = ip_tx(dev, skb, dev->ip_addr, dst_ip, IPPROTO_ICMP);
+    return rc < 0 ? -1 : (ssize_t)len;
+}
+
+static ssize_t raw_icmp_sock_recvfrom(socket_t *sk, void *buf, size_t len,
+                                      int flags, struct sockaddr *src_addr,
+                                      socklen_t *addrlen)
+{
+    (void)flags;
+    while (skb_queue_empty(&sk->rx_queue)) {
+        if (sk->nonblock) return -1;
+        waitq_wait(&sk->wq_rx);
+    }
+
+    skbuff_t *skb = skb_queue_pop(&sk->rx_queue);
+    if (!skb) return -1;
+
+    size_t copy = (len < skb->len) ? len : skb->len;
+    memcpy(buf, skb->data, copy);
+
+    if (src_addr && addrlen && *addrlen >= sizeof(struct sockaddr_in)) {
+        struct sockaddr_in *sin = (struct sockaddr_in *)src_addr;
+        memset(sin, 0, sizeof(*sin));
+        sin->sin_family = AF_INET;
+        sin->sin_addr.s_addr = skb->src_ip;
+        *addrlen = sizeof(struct sockaddr_in);
+    }
+
+    skb_free(skb);
+    return (ssize_t)copy;
+}
+
+static int raw_icmp_sock_shutdown(socket_t *sk, int how) {
+    (void)sk; (void)how;
+    return 0;
+}
+
+static int raw_icmp_sock_close(socket_t *sk) {
+    raw_icmp_unregister(sk);
+    return 0;
+}
+
+static int raw_icmp_sock_poll(socket_t *sk, int events) {
+    int ready = 0;
+    if ((events & POLLIN) && !skb_queue_empty(&sk->rx_queue))
+        ready |= POLLIN;
+    if (events & POLLOUT)
+        ready |= POLLOUT;
+    return ready;
+}
+
+static int raw_icmp_sock_setsockopt(socket_t *sk, int level, int optname,
+                                    const void *optval, socklen_t optlen) {
+    (void)sk; (void)level; (void)optname; (void)optval; (void)optlen;
+    return 0;
+}
+
+static int raw_icmp_sock_getsockopt(socket_t *sk, int level, int optname,
+                                    void *optval, socklen_t *optlen) {
+    (void)sk; (void)level; (void)optname; (void)optval; (void)optlen;
+    return -1;
+}
+
+static socket_proto_ops_t raw_icmp_proto_ops = {
+    .connect    = raw_icmp_sock_connect,
+    .bind       = raw_icmp_sock_bind,
+    .listen     = NULL,
+    .accept     = NULL,
+    .sendto     = raw_icmp_sock_sendto,
+    .recvfrom   = raw_icmp_sock_recvfrom,
+    .shutdown   = raw_icmp_sock_shutdown,
+    .close      = raw_icmp_sock_close,
+    .poll       = raw_icmp_sock_poll,
+    .setsockopt = raw_icmp_sock_setsockopt,
+    .getsockopt = raw_icmp_sock_getsockopt,
 };
