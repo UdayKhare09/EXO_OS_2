@@ -17,23 +17,29 @@
 
 /* ── socket(2) ───────────────────────────────────────────────────────────── */
 int64_t sys_socket(int domain, int type, int protocol) {
-    return (int64_t)socket_create(domain, type, protocol);
+    int r = socket_create(domain, type, protocol);
+    if (r == -1) return -EINVAL;
+    return (int64_t)r;
 }
 
 /* ── connect(2) ──────────────────────────────────────────────────────────── */
 int64_t sys_connect(int fd, const struct sockaddr *addr, socklen_t addrlen) {
     socket_t *sk = socket_from_fd(fd);
-    if (!sk) return -1;
-    if (!sk->proto_ops || !sk->proto_ops->connect) return -1;
-    return (int64_t)sk->proto_ops->connect(sk, addr, addrlen);
+    if (!sk) return -EBADF;
+    if (!sk->proto_ops || !sk->proto_ops->connect) return -EINVAL;
+    int r = sk->proto_ops->connect(sk, addr, addrlen);
+    if (r == -1) return -EINVAL;
+    return (int64_t)r;
 }
 
 /* ── accept(2) ───────────────────────────────────────────────────────────── */
 int64_t sys_accept(int fd, struct sockaddr *addr, socklen_t *addrlen) {
     socket_t *sk = socket_from_fd(fd);
-    if (!sk) return -1;
-    if (!sk->proto_ops || !sk->proto_ops->accept) return -1;
-    return (int64_t)sk->proto_ops->accept(sk, addr, addrlen);
+    if (!sk) return -EBADF;
+    if (!sk->proto_ops || !sk->proto_ops->accept) return -EINVAL;
+    int r = sk->proto_ops->accept(sk, addr, addrlen);
+    if (r == -1) return -EAGAIN;
+    return (int64_t)r;
 }
 
 /* ── sendto(2) ───────────────────────────────────────────────────────────── */
@@ -41,10 +47,12 @@ int64_t sys_sendto(int fd, const void *buf, size_t len, int flags,
                    const struct sockaddr *dest_addr, socklen_t addrlen)
 {
     socket_t *sk = socket_from_fd(fd);
-    if (!sk) return -1;
-    if (!sk->proto_ops || !sk->proto_ops->sendto) return -1;
-    return (int64_t)sk->proto_ops->sendto(sk, buf, len, flags,
-                                          dest_addr, addrlen);
+    if (!sk) return -EBADF;
+    if (!sk->proto_ops || !sk->proto_ops->sendto) return -EINVAL;
+    int r = (int)sk->proto_ops->sendto(sk, buf, len, flags,
+                                       dest_addr, addrlen);
+    if (r == -1) return -EINVAL;
+    return (int64_t)r;
 }
 
 /* ── recvfrom(2) ─────────────────────────────────────────────────────────── */
@@ -52,41 +60,49 @@ int64_t sys_recvfrom(int fd, void *buf, size_t len, int flags,
                      struct sockaddr *src_addr, socklen_t *addrlen)
 {
     socket_t *sk = socket_from_fd(fd);
-    if (!sk) return -1;
-    if (!sk->proto_ops || !sk->proto_ops->recvfrom) return -1;
-    return (int64_t)sk->proto_ops->recvfrom(sk, buf, len, flags,
-                                            src_addr, addrlen);
+    if (!sk) return -EBADF;
+    if (!sk->proto_ops || !sk->proto_ops->recvfrom) return -EINVAL;
+    int r = (int)sk->proto_ops->recvfrom(sk, buf, len, flags,
+                                         src_addr, addrlen);
+    if (r == -1) return -EAGAIN;
+    return (int64_t)r;
 }
 
 /* ── shutdown(2) ─────────────────────────────────────────────────────────── */
 int64_t sys_shutdown(int fd, int how) {
     socket_t *sk = socket_from_fd(fd);
-    if (!sk) return -1;
-    if (!sk->proto_ops || !sk->proto_ops->shutdown) return -1;
-    return (int64_t)sk->proto_ops->shutdown(sk, how);
+    if (!sk) return -EBADF;
+    if (!sk->proto_ops || !sk->proto_ops->shutdown) return -EINVAL;
+    int r = sk->proto_ops->shutdown(sk, how);
+    if (r == -1) return -EINVAL;
+    return (int64_t)r;
 }
 
 /* ── bind(2) ─────────────────────────────────────────────────────────────── */
 int64_t sys_bind(int fd, const struct sockaddr *addr, socklen_t addrlen) {
     socket_t *sk = socket_from_fd(fd);
-    if (!sk) return -1;
-    if (!sk->proto_ops || !sk->proto_ops->bind) return -1;
-    return (int64_t)sk->proto_ops->bind(sk, addr, addrlen);
+    if (!sk) return -EBADF;
+    if (!sk->proto_ops || !sk->proto_ops->bind) return -EINVAL;
+    int r = sk->proto_ops->bind(sk, addr, addrlen);
+    if (r == -1) return -EINVAL;
+    return (int64_t)r;
 }
 
 /* ── listen(2) ───────────────────────────────────────────────────────────── */
 int64_t sys_listen(int fd, int backlog) {
     socket_t *sk = socket_from_fd(fd);
-    if (!sk) return -1;
-    if (!sk->proto_ops || !sk->proto_ops->listen) return -1;
-    return (int64_t)sk->proto_ops->listen(sk, backlog);
+    if (!sk) return -EBADF;
+    if (!sk->proto_ops || !sk->proto_ops->listen) return -EINVAL;
+    int r = sk->proto_ops->listen(sk, backlog);
+    if (r == -1) return -EINVAL;
+    return (int64_t)r;
 }
 
 /* ── getsockname(2) ──────────────────────────────────────────────────────── */
 int64_t sys_getsockname(int fd, struct sockaddr *addr, socklen_t *addrlen) {
     socket_t *sk = socket_from_fd(fd);
-    if (!sk) return -1;
-    if (!addr || !addrlen || *addrlen < sizeof(struct sockaddr_in)) return -1;
+    if (!sk) return -EBADF;
+    if (!addr || !addrlen || *addrlen < sizeof(struct sockaddr_in)) return -EINVAL;
     memcpy(addr, &sk->local_addr, sizeof(struct sockaddr_in));
     *addrlen = sizeof(struct sockaddr_in);
     return 0;
@@ -95,8 +111,9 @@ int64_t sys_getsockname(int fd, struct sockaddr *addr, socklen_t *addrlen) {
 /* ── getpeername(2) ──────────────────────────────────────────────────────── */
 int64_t sys_getpeername(int fd, struct sockaddr *addr, socklen_t *addrlen) {
     socket_t *sk = socket_from_fd(fd);
-    if (!sk || !sk->connected) return -1;
-    if (!addr || !addrlen || *addrlen < sizeof(struct sockaddr_in)) return -1;
+    if (!sk) return -EBADF;
+    if (!sk->connected) return -EINVAL;
+    if (!addr || !addrlen || *addrlen < sizeof(struct sockaddr_in)) return -EINVAL;
     memcpy(addr, &sk->remote_addr, sizeof(struct sockaddr_in));
     *addrlen = sizeof(struct sockaddr_in);
     return 0;
@@ -107,10 +124,11 @@ int64_t sys_setsockopt(int fd, int level, int optname,
                        const void *optval, socklen_t optlen)
 {
     socket_t *sk = socket_from_fd(fd);
-    if (!sk) return -1;
-    if (!sk->proto_ops || !sk->proto_ops->setsockopt) return -1;
-    return (int64_t)sk->proto_ops->setsockopt(sk, level, optname,
-                                               optval, optlen);
+    if (!sk) return -EBADF;
+    if (!sk->proto_ops || !sk->proto_ops->setsockopt) return -EINVAL;
+    int r = sk->proto_ops->setsockopt(sk, level, optname, optval, optlen);
+    if (r == -1) return -EINVAL;
+    return (int64_t)r;
 }
 
 /* ── getsockopt(2) ───────────────────────────────────────────────────────── */
@@ -118,10 +136,11 @@ int64_t sys_getsockopt(int fd, int level, int optname,
                        void *optval, socklen_t *optlen)
 {
     socket_t *sk = socket_from_fd(fd);
-    if (!sk) return -1;
-    if (!sk->proto_ops || !sk->proto_ops->getsockopt) return -1;
-    return (int64_t)sk->proto_ops->getsockopt(sk, level, optname,
-                                               optval, optlen);
+    if (!sk) return -EBADF;
+    if (!sk->proto_ops || !sk->proto_ops->getsockopt) return -EINVAL;
+    int r = sk->proto_ops->getsockopt(sk, level, optname, optval, optlen);
+    if (r == -1) return -EINVAL;
+    return (int64_t)r;
 }
 
 /* ── poll(2) ─────────────────────────────────────────────────────────────── */
@@ -159,8 +178,8 @@ int64_t sys_poll(struct pollfd *fds, uint64_t nfds, int timeout) {
 int64_t sys_ioctl(int fd, unsigned long cmd, unsigned long arg) {
     task_t *cur = sched_current();
     file_t *f = fd_get(cur, fd);
-    if (!f) return -1;
+    if (!f) return -EBADF;
     if (f->f_ops && f->f_ops->ioctl)
         return (int64_t)f->f_ops->ioctl(f, cmd, arg);
-    return -1;
+    return -EINVAL;
 }

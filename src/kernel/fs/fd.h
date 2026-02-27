@@ -35,6 +35,7 @@ typedef struct file {
     uint64_t    offset;         /* current file position                      */
     int         flags;          /* O_RDONLY / O_WRONLY / O_RDWR etc.          */
     int         fd_flags;       /* FD_CLOEXEC, etc.                           */
+    char        path[VFS_MOUNT_PATH_MAX]; /* absolute path if VFS-backed      */
     uint32_t    refcount;       /* number of fds pointing at this file        */
 
     /* ── Generic file ops (sockets, pipes, eventfds) ────────────────────── */

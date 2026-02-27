@@ -85,6 +85,9 @@ static long syscall6(long nr, long a1, long a2, long a3,
 #define SYS_GETGID        104
 #define SYS_GETEUID       107
 #define SYS_GETEGID       108
+#define SYS_OPENAT        257
+#define SYS_MKDIRAT       258
+#define SYS_RENAMEAT      264
 #define SYS_FCNTL         72
 #define SYS_GETCWD        79
 #define SYS_CHDIR         80
@@ -98,9 +101,14 @@ static long syscall6(long nr, long a1, long a2, long a3,
 #define SYS_UMASK         95
 #define SYS_DUP3          292
 #define SYS_FSTATAT       262
+#define SYS_UNLINKAT      263
+#define SYS_FACCESSAT     269
 #define SYS_PIPE          22
 #define SYS_RENAME        82
 #define SYS_ARCH_PRCTL    158
+
+/* errno values used by ABI conformance checks */
+#define EBADF             9
 
 /* Open flags */
 #define O_RDONLY   0
@@ -108,6 +116,9 @@ static long syscall6(long nr, long a1, long a2, long a3,
 #define O_RDWR     2
 #define O_CREAT    0100
 #define O_TRUNC    01000
+
+#define AT_FDCWD   -100
+#define AT_REMOVEDIR 0x200
 
 /* mmap flags */
 #define PROT_READ    1
@@ -610,6 +621,37 @@ static void test_fstatat(void) {
     test_result("fstatat(AT_FDCWD, \"/dev/null\") returns 0", r == 0);
 }
 
+/* ── openat/mkdirat/unlinkat ────────────────────────────────────────── */
+static void test_at_family(void) {
+    long r = syscall3(SYS_MKDIRAT, AT_FDCWD, (long)"/tmp/at_test", 0755);
+    int ok_mkdir = (r == 0 || r == -17); /* allow EEXIST */
+    test_result("mkdirat(AT_FDCWD, /tmp/at_test)", ok_mkdir);
+
+    int dfd = (int)syscall3(SYS_OPEN, (long)"/tmp/at_test", O_RDONLY, 0);
+    test_result("open(/tmp/at_test) as dirfd", dfd >= 0);
+    if (dfd < 0) return;
+
+    int fd = (int)syscall4(SYS_OPENAT, dfd, (long)"f.txt", O_CREAT | O_RDWR | O_TRUNC, 0644);
+    test_result("openat(dirfd, f.txt, O_CREAT)", fd >= 0);
+    if (fd >= 0) syscall1(SYS_CLOSE, fd);
+
+    r = syscall4(SYS_FACCESSAT, dfd, (long)"f.txt", 0, 0);
+    test_result("faccessat(dirfd, f.txt, F_OK)", r == 0);
+
+    r = syscall4(SYS_RENAMEAT, dfd, (long)"f.txt", dfd, (long)"g.txt");
+    test_result("renameat(dirfd, f.txt -> g.txt)", r == 0);
+
+    r = syscall4(SYS_FACCESSAT, dfd, (long)"g.txt", 0, 0);
+    test_result("faccessat(dirfd, g.txt, F_OK)", r == 0);
+
+    r = syscall3(SYS_UNLINKAT, dfd, (long)"g.txt", 0);
+    test_result("unlinkat(dirfd, g.txt)", r == 0);
+
+    syscall1(SYS_CLOSE, dfd);
+    r = syscall3(SYS_UNLINKAT, AT_FDCWD, (long)"/tmp/at_test", AT_REMOVEDIR);
+    test_result("unlinkat(AT_FDCWD, /tmp/at_test, AT_REMOVEDIR)", r == 0);
+}
+
 /* ── pipe ────────────────────────────────────────────────────────────── */
 static void test_pipe(void) {
     int pipefd[2] = {-1, -1};
@@ -679,6 +721,12 @@ static void test_fd_limits(void) {
     }
 }
 
+/* ── errno ABI conformance ───────────────────────────────────────────── */
+static void test_errno_contract(void) {
+    long r = syscall1(SYS_CLOSE, -1);
+    test_result("errno ABI: close(-1) returns -EBADF", r == -EBADF);
+}
+
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 __attribute__((force_align_arg_pointer))
@@ -701,6 +749,7 @@ void _start(void) {
     test_fstat();
     test_lstat();
     test_fstatat();
+    test_at_family();
 
     println("\n\033[1;33m  -- Directories --\033[0m");
     test_getcwd();
@@ -727,6 +776,7 @@ void _start(void) {
     test_umask();
     test_clock_gettime();
     test_fd_limits();
+    test_errno_contract();
 
     /* Summary */
     println("\n\033[1;36m  === Results ===\033[0m");

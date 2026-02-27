@@ -31,6 +31,9 @@
 #define SYS_EXIT        60
 #define SYS_WAIT4       61
 #define SYS_KILL        62
+#define SYS_OPENAT      257
+#define SYS_MKDIRAT     258
+#define SYS_RENAMEAT    264
 #define SYS_FCNTL       72
 #define SYS_GETCWD      79
 #define SYS_CHDIR       80
@@ -52,8 +55,18 @@
 #define SYS_CLOCK_GETTIME   228
 #define SYS_EXIT_GROUP  231
 #define SYS_FSTATAT     262
+#define SYS_UNLINKAT    263
+#define SYS_SYMLINKAT   266
+#define SYS_READLINKAT  267
+#define SYS_FACCESSAT   269
 #define SYS_DUP3        292
 #define SYS_PIPE2       293
+
+/* *at constants */
+#define AT_FDCWD        (-100)
+#define AT_SYMLINK_NOFOLLOW 0x100
+#define AT_REMOVEDIR    0x200
+#define AT_EACCESS      0x200
 
 /* ── Network syscall numbers (Linux x86-64 ABI) ─────────────────────────── */
 #define SYS_POLL        7

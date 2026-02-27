@@ -20,6 +20,13 @@
 #include <stddef.h>
 
 /* ── Internal helpers ────────────────────────────────────────────────────── */
+static void fill_linux_stat(linux_stat_t *lst, const vfs_stat_t *st);
+int64_t sys_fstatat(int dirfd, const char *upath, linux_stat_t *buf, int flags);
+int64_t sys_mkdirat(int dirfd, const char *upath, uint32_t mode);
+int64_t sys_unlinkat(int dirfd, const char *upath, int flags);
+int64_t sys_renameat(int olddirfd, const char *old_path, int newdirfd, const char *new_path);
+int64_t sys_faccessat(int dirfd, const char *upath, int mode, int flags);
+int64_t sys_symlinkat(const char *target, int newdirfd, const char *linkpath);
 
 /* Resolve a possibly-relative user path to an absolute, normalised path.
  * Returns 0 on success; writes result into `out` (size >= VFS_MOUNT_PATH_MAX). */
@@ -32,6 +39,26 @@ static int resolve_path(const char *upath, char *out) {
     task_t *t = sched_current();
     if (!t) return -EINVAL;
     return path_join(t->cwd, upath, out);
+}
+
+static int resolve_path_at(int dirfd, const char *upath, char *out) {
+    if (!upath || !upath[0]) return -EINVAL;
+    if (upath[0] == '/') {
+        return path_normalize(upath, out);
+    }
+
+    task_t *t = sched_current();
+    if (!t) return -EINVAL;
+
+    if (dirfd == AT_FDCWD) {
+        return path_join(t->cwd, upath, out);
+    }
+
+    file_t *dirf = fd_get(t, dirfd);
+    if (!dirf) return -EBADF;
+    if (!dirf->vnode || !VFS_S_ISDIR(dirf->vnode->mode)) return -ENOTDIR;
+    if (!dirf->path[0]) return -EINVAL;
+    return path_join(dirf->path, upath, out);
 }
 
 static inline task_t *cur_task(void) { return sched_current(); }
@@ -84,10 +111,8 @@ int64_t sys_write(int fd, const void *buf, uint64_t count) {
 }
 
 /* ── sys_open ────────────────────────────────────────────────────────────── */
-int64_t sys_open(const char *upath, int flags, uint32_t mode) {
-    char path[VFS_MOUNT_PATH_MAX];
-    int r = resolve_path(upath, path);
-    if (r < 0) return r;
+static int64_t do_open_abs(const char *path, int flags, uint32_t mode) {
+    int r;
 
     int err = 0;
     vnode_t *v = vfs_lookup(path, true, &err);
@@ -138,12 +163,86 @@ int64_t sys_open(const char *upath, int flags, uint32_t mode) {
     vfs_vnode_put(v); /* file_alloc increments its own ref */
     if (!f) return -ENOMEM;
 
+    strncpy(f->path, path, sizeof(f->path) - 1);
+    f->path[sizeof(f->path) - 1] = '\0';
+
     if (flags & O_APPEND) f->offset = f->vnode->size;
 
     int fd = fd_alloc(cur_task(), f);
     file_put(f); /* fd table holds its own ref */
     if (fd < 0) return -EMFILE;
     return fd;
+}
+
+int64_t sys_open(const char *upath, int flags, uint32_t mode) {
+    char path[VFS_MOUNT_PATH_MAX];
+    int r = resolve_path(upath, path);
+    if (r < 0) return r;
+    return do_open_abs(path, flags, mode);
+}
+
+int64_t sys_openat(int dirfd, const char *upath, int flags, uint32_t mode) {
+    char path[VFS_MOUNT_PATH_MAX];
+    int r = resolve_path_at(dirfd, upath, path);
+    if (r < 0) return r;
+    return do_open_abs(path, flags, mode);
+}
+
+int64_t sys_fstatat(int dirfd, const char *upath, linux_stat_t *buf, int flags) {
+    if (!buf) return -EINVAL;
+    if (flags & ~AT_SYMLINK_NOFOLLOW) return -EINVAL;
+
+    char path[VFS_MOUNT_PATH_MAX];
+    int r = resolve_path_at(dirfd, upath, path);
+    if (r < 0) return r;
+
+    vfs_stat_t st;
+    if (flags & AT_SYMLINK_NOFOLLOW)
+        r = vfs_lstat(path, &st);
+    else
+        r = vfs_stat(path, &st);
+    if (r < 0) return r;
+    fill_linux_stat(buf, &st);
+    return 0;
+}
+
+int64_t sys_mkdirat(int dirfd, const char *upath, uint32_t mode) {
+    char path[VFS_MOUNT_PATH_MAX];
+    int r = resolve_path_at(dirfd, upath, path);
+    if (r < 0) return r;
+    return vfs_mkdir(path, mode ? mode : 0755);
+}
+
+int64_t sys_unlinkat(int dirfd, const char *upath, int flags) {
+    if (flags & ~AT_REMOVEDIR) return -EINVAL;
+
+    char path[VFS_MOUNT_PATH_MAX];
+    int r = resolve_path_at(dirfd, upath, path);
+    if (r < 0) return r;
+
+    if (flags & AT_REMOVEDIR)
+        return vfs_rmdir(path);
+    return vfs_unlink(path);
+}
+
+int64_t sys_readlinkat(int dirfd, const char *upath, char *buf, uint64_t bufsiz) {
+    if (!buf || bufsiz == 0) return -EINVAL;
+
+    char path[VFS_MOUNT_PATH_MAX];
+    int r = resolve_path_at(dirfd, upath, path);
+    if (r < 0) return r;
+
+    r = vfs_readlink(path, buf, (size_t)bufsiz);
+    return r < 0 ? r : (int64_t)strlen(buf);
+}
+
+int64_t sys_symlinkat(const char *target, int newdirfd, const char *linkpath) {
+    if (!target || !target[0]) return -EINVAL;
+
+    char path[VFS_MOUNT_PATH_MAX];
+    int r = resolve_path_at(newdirfd, linkpath, path);
+    if (r < 0) return r;
+    return vfs_symlink(target, path);
 }
 
 /* ── sys_close ───────────────────────────────────────────────────────────── */
@@ -169,15 +268,7 @@ static void fill_linux_stat(linux_stat_t *lst, const vfs_stat_t *st) {
 
 /* ── sys_stat ────────────────────────────────────────────────────────────── */
 int64_t sys_stat(const char *upath, linux_stat_t *buf) {
-    if (!buf) return -EINVAL;
-    char path[VFS_MOUNT_PATH_MAX];
-    int r = resolve_path(upath, path);
-    if (r < 0) return r;
-    vfs_stat_t st;
-    r = vfs_stat(path, &st);
-    if (r < 0) return r;
-    fill_linux_stat(buf, &st);
-    return 0;
+    return sys_fstatat(AT_FDCWD, upath, buf, 0);
 }
 
 /* ── sys_fstat ───────────────────────────────────────────────────────────── */
@@ -198,15 +289,7 @@ int64_t sys_fstat(int fd, linux_stat_t *buf) {
 
 /* ── sys_lstat ───────────────────────────────────────────────────────────── */
 int64_t sys_lstat(const char *upath, linux_stat_t *buf) {
-    if (!buf) return -EINVAL;
-    char path[VFS_MOUNT_PATH_MAX];
-    int r = resolve_path(upath, path);
-    if (r < 0) return r;
-    vfs_stat_t st;
-    r = vfs_lstat(path, &st);
-    if (r < 0) return r;
-    fill_linux_stat(buf, &st);
-    return 0;
+    return sys_fstatat(AT_FDCWD, upath, buf, AT_SYMLINK_NOFOLLOW);
 }
 
 /* ── sys_lseek ───────────────────────────────────────────────────────────── */
@@ -273,10 +356,7 @@ int64_t sys_chdir(const char *upath) {
 
 /* ── sys_mkdir ───────────────────────────────────────────────────────────── */
 int64_t sys_mkdir(const char *upath, uint32_t mode) {
-    char path[VFS_MOUNT_PATH_MAX];
-    int r = resolve_path(upath, path);
-    if (r < 0) return r;
-    return vfs_mkdir(path, mode ? mode : 0755);
+    return sys_mkdirat(AT_FDCWD, upath, mode);
 }
 
 /* ── sys_rmdir ───────────────────────────────────────────────────────────── */
@@ -289,19 +369,38 @@ int64_t sys_rmdir(const char *upath) {
 
 /* ── sys_unlink ──────────────────────────────────────────────────────────── */
 int64_t sys_unlink(const char *upath) {
-    char path[VFS_MOUNT_PATH_MAX];
-    int r = resolve_path(upath, path);
-    if (r < 0) return r;
-    return vfs_unlink(path);
+    return sys_unlinkat(AT_FDCWD, upath, 0);
 }
 
 /* ── sys_rename ──────────────────────────────────────────────────────────── */
 int64_t sys_rename(const char *old_path, const char *new_path) {
+    return sys_renameat(AT_FDCWD, old_path, AT_FDCWD, new_path);
+}
+
+int64_t sys_renameat(int olddirfd, const char *old_path, int newdirfd, const char *new_path) {
     char old_abs[VFS_MOUNT_PATH_MAX], new_abs[VFS_MOUNT_PATH_MAX];
     int r;
-    r = resolve_path(old_path, old_abs); if (r < 0) return r;
-    r = resolve_path(new_path, new_abs); if (r < 0) return r;
+    r = resolve_path_at(olddirfd, old_path, old_abs); if (r < 0) return r;
+    r = resolve_path_at(newdirfd, new_path, new_abs); if (r < 0) return r;
     return vfs_rename(old_abs, new_abs);
+}
+
+int64_t sys_faccessat(int dirfd, const char *upath, int mode, int flags) {
+    if (flags & ~(AT_EACCESS | AT_SYMLINK_NOFOLLOW)) return -EINVAL;
+    if (mode & ~7) return -EINVAL;
+
+    linux_stat_t st;
+    int stat_flags = (flags & AT_SYMLINK_NOFOLLOW) ? AT_SYMLINK_NOFOLLOW : 0;
+    int r = sys_fstatat(dirfd, upath, &st, stat_flags);
+    if (r < 0) return r;
+
+    if (mode == 0) return 0; /* F_OK */
+
+    uint32_t perm = st.st_mode & 0777;
+    if ((mode & 4) && !(perm & (0400 | 0040 | 0004))) return -EACCES;
+    if ((mode & 2) && !(perm & (0200 | 0020 | 0002))) return -EACCES;
+    if ((mode & 1) && !(perm & (0100 | 0010 | 0001))) return -EACCES;
+    return 0;
 }
 
 /* ── sys_getdents64 ──────────────────────────────────────────────────────── */

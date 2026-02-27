@@ -14,6 +14,7 @@ file_t *file_alloc(vnode_t *vnode, int flags) {
     f->vnode        = vnode;
     f->flags        = flags;
     f->offset       = (flags & O_APPEND) ? vnode->size : 0;
+    f->path[0]      = '\0';
     f->refcount     = 1;
     f->f_ops        = NULL;
     f->private_data = NULL;
@@ -28,6 +29,7 @@ file_t *file_alloc_generic(file_ops_t *ops, void *priv, int flags) {
     f->vnode        = NULL;
     f->flags        = flags;
     f->offset       = 0;
+    f->path[0]      = '\0';
     f->refcount     = 1;
     f->f_ops        = ops;
     f->private_data = priv;

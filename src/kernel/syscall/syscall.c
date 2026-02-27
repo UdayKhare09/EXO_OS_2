@@ -28,11 +28,19 @@
 int64_t sys_read(int fd, void *buf, uint64_t count);
 int64_t sys_write(int fd, const void *buf, uint64_t count);
 int64_t sys_open(const char *path, int flags, uint32_t mode);
+int64_t sys_openat(int dirfd, const char *path, int flags, uint32_t mode);
 int64_t sys_close(int fd);
 int64_t sys_stat(const char *path, linux_stat_t *buf);
 int64_t sys_fstat(int fd, linux_stat_t *buf);
 int64_t sys_lstat(const char *path, linux_stat_t *buf);
+int64_t sys_fstatat(int dirfd, const char *path, linux_stat_t *buf, int flags);
 int64_t sys_lseek(int fd, int64_t off, int whence);
+int64_t sys_mkdirat(int dirfd, const char *path, uint32_t mode);
+int64_t sys_unlinkat(int dirfd, const char *path, int flags);
+int64_t sys_readlinkat(int dirfd, const char *path, char *buf, uint64_t bufsiz);
+int64_t sys_renameat(int olddirfd, const char *old_path, int newdirfd, const char *new_path);
+int64_t sys_faccessat(int dirfd, const char *path, int mode, int flags);
+int64_t sys_symlinkat(const char *target, int newdirfd, const char *linkpath);
 int64_t sys_dup(int old_fd);
 int64_t sys_dup2(int old_fd, int new_fd);
 int64_t sys_getcwd(char *buf, uint64_t size);
@@ -86,6 +94,8 @@ static int64_t sc_write(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,u
     { (void)d;(void)e;(void)f; return sys_write((int)a,(const void*)b,c); }
 static int64_t sc_open(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { (void)d;(void)e;(void)f; return sys_open((const char*)a,(int)b,(uint32_t)c); }
+static int64_t sc_openat(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)e;(void)f; return sys_openat((int)a,(const char*)b,(int)c,(uint32_t)d); }
 static int64_t sc_close(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { (void)b;(void)c;(void)d;(void)e;(void)f; return sys_close((int)a); }
 static int64_t sc_stat(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
@@ -138,12 +148,20 @@ static int64_t sc_chdir(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,u
     { (void)b;(void)c;(void)d;(void)e;(void)f; return sys_chdir((const char*)a); }
 static int64_t sc_rename(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { (void)c;(void)d;(void)e;(void)f; return sys_rename((const char*)a,(const char*)b); }
+static int64_t sc_renameat(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)e;(void)f; return sys_renameat((int)a,(const char*)b,(int)c,(const char*)d); }
 static int64_t sc_mkdir(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { (void)c;(void)d;(void)e;(void)f; return sys_mkdir((const char*)a,(uint32_t)b); }
+static int64_t sc_mkdirat(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)d;(void)e;(void)f; return sys_mkdirat((int)a,(const char*)b,(uint32_t)c); }
 static int64_t sc_rmdir(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { (void)b;(void)c;(void)d;(void)e;(void)f; return sys_rmdir((const char*)a); }
 static int64_t sc_unlink(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { (void)b;(void)c;(void)d;(void)e;(void)f; return sys_unlink((const char*)a); }
+static int64_t sc_unlinkat(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)d;(void)e;(void)f; return sys_unlinkat((int)a,(const char*)b,(int)c); }
+static int64_t sc_symlinkat(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)d;(void)e;(void)f; return sys_symlinkat((const char*)a,(int)b,(const char*)c); }
 static int64_t sc_getdents64(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { (void)d;(void)e;(void)f; return sys_getdents64((int)a,(void*)b,c); }
 
@@ -243,12 +261,13 @@ static int64_t sc_writev(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,
 }
 
 static int64_t sc_access(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
-    (void)b;(void)c;(void)d;(void)e;(void)f;
-    /* Check existence (F_OK) by stat-ing the path.
-     * Pass a real buffer — sys_stat returns -EINVAL for NULL buf. */
-    linux_stat_t st;
-    int r = sys_stat((const char *)a, &st);
-    return (r < 0) ? r : 0;
+    (void)c;(void)d;(void)e;(void)f;
+    return sys_faccessat(AT_FDCWD, (const char *)a, (int)b, 0);
+}
+
+static int64_t sc_faccessat(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)e;(void)f;
+    return sys_faccessat((int)a, (const char *)b, (int)c, (int)d);
 }
 
 static int64_t sc_exit_group(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
@@ -354,8 +373,11 @@ static int64_t sc_futex(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,u
 /* Readlink syscall */
 static int64_t sc_readlink(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
     (void)d;(void)e;(void)f;
-    int r = vfs_readlink((const char *)a, (char *)b, (size_t)c);
-    return r < 0 ? r : (int64_t)strlen((const char *)b);
+    return sys_readlinkat(AT_FDCWD, (const char *)a, (char *)b, c);
+}
+static int64_t sc_readlinkat(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)e;(void)f;
+    return sys_readlinkat((int)a, (const char *)b, (char *)c, d);
 }
 
 /* Fcntl syscall */
@@ -380,15 +402,7 @@ static int64_t sc_fcntl(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,u
 /* Fstatat syscall */
 static int64_t sc_fstatat(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
     (void)e;(void)f;
-    int dirfd = (int)a;
-    const char *path = (const char *)b;
-    linux_stat_t *statbuf = (linux_stat_t *)c;
-    int flags_arg = (int)d;
-    (void)dirfd; (void)flags_arg;
-    /* Simplified: ignore dirfd, just do stat on path */
-    if (flags_arg & 0x100) /* AT_SYMLINK_NOFOLLOW */
-        return sys_lstat(path, statbuf);
-    return sys_stat(path, statbuf);
+    return sys_fstatat((int)a, (const char *)b, (linux_stat_t *)c, (int)d);
 }
 
 /* Sparse dispatch table indexed by syscall number */
@@ -397,6 +411,7 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_READ]      = sc_read,
     [SYS_WRITE]     = sc_write,
     [SYS_OPEN]      = sc_open,
+    [SYS_OPENAT]    = sc_openat,
     [SYS_CLOSE]     = sc_close,
     [SYS_STAT]      = sc_stat,
     [SYS_FSTAT]     = sc_fstat,
@@ -419,9 +434,13 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_GETCWD]    = sc_getcwd,
     [SYS_CHDIR]     = sc_chdir,
     [SYS_RENAME]    = sc_rename,
+    [SYS_RENAMEAT]  = sc_renameat,
     [SYS_MKDIR]     = sc_mkdir,
+    [SYS_MKDIRAT]   = sc_mkdirat,
     [SYS_RMDIR]     = sc_rmdir,
     [SYS_UNLINK]    = sc_unlink,
+    [SYS_UNLINKAT]  = sc_unlinkat,
+    [SYS_SYMLINKAT] = sc_symlinkat,
     [SYS_UMASK]     = sc_umask,
     [SYS_GETUID]    = sc_getuid,
     [SYS_GETGID]    = sc_getgid,
@@ -456,8 +475,10 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_CLONE]          = sc_clone,
     [SYS_FUTEX]          = sc_futex,
     [SYS_READLINK]       = sc_readlink,
+    [SYS_READLINKAT]     = sc_readlinkat,
     [SYS_FCNTL]          = sc_fcntl,
     [SYS_FSTATAT]        = sc_fstatat,
+    [SYS_FACCESSAT]      = sc_faccessat,
 };
 
 /* ── INT 0x80 handler ─────────────────────────────────────────────────────── */
