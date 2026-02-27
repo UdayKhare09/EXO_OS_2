@@ -1,9 +1,12 @@
 #include "idt.h"
 #include "gdt.h"
+#include "cpu.h"
 #include "lib/string.h"
 #include "lib/klog.h"
 #include "sched/sched.h"
 #include "sched/task.h"
+#include "mm/vmm.h"
+#include "ipc/signal.h"
 
 static idt_entry_t  idt[IDT_ENTRIES];
 static idtr_t       idtr;
@@ -22,6 +25,42 @@ void idt_set_handler(uint8_t vec, void *handler, uint8_t flags, uint8_t ist) {
 
 void idt_register_handler(uint8_t vec, isr_handler_t fn) {
     isr_handlers[vec] = fn;
+}
+
+/* ── Page fault handler (#PF, vector 14) ──────────────────────────────────── */
+static void page_fault_handler(cpu_regs_t *regs) {
+    uint64_t fault_addr;
+    __asm__ volatile("mov %%cr2, %0" : "=r"(fault_addr));
+
+    task_t *cur = sched_current();
+    uintptr_t pml4 = cur ? cur->cr3 : vmm_get_kernel_pml4();
+
+    /* Try COW / demand-page resolution */
+    if (vmm_handle_page_fault(pml4, fault_addr, regs->err)) {
+        return;  /* handled — resume execution */
+    }
+
+    /* Unresolvable fault in user-mode (CS RPL=3) → SIGSEGV */
+    if ((regs->cs & 3) == 3 && cur) {
+        KLOG_WARN("PF: SIGSEGV tid=%u addr=%p err=0x%x rip=%p\n",
+                  cur->tid, (void *)fault_addr,
+                  (uint32_t)regs->err, (void *)regs->rip);
+        signal_send(cur, SIGSEGV);
+        /* If SIGKILL, scheduler will kill task. For now, mark dead. */
+        cur->state = TASK_DEAD;
+        sched_tick();
+        for (;;) __asm__ volatile("cli; hlt");
+    }
+
+    /* Kernel-mode page fault — fatal */
+    KLOG_WARN("#PF in kernel: addr=%p err=0x%x rip=%p\n",
+              (void *)fault_addr, (uint32_t)regs->err, (void *)regs->rip);
+    if (cur && cur->tid > 0) {
+        cur->state = TASK_DEAD;
+        sched_tick();
+        for (;;) __asm__ volatile("cli; hlt");
+    }
+    for (;;) __asm__ volatile("cli; hlt");
 }
 
 /* Called from isr.asm's common_isr_handler label */
@@ -68,6 +107,9 @@ void idt_init(void) {
 
     idtr.limit = sizeof(idt) - 1;
     idtr.base  = (uint64_t)&idt;
+
+    /* Register page fault handler (#PF = vector 14) */
+    idt_register_handler(14, page_fault_handler);
 
     __asm__ volatile("lidt %0" : : "m"(idtr));
     KLOG_INFO("IDT: loaded %d entries at %p\n", IDT_ENTRIES, (void *)&idt);

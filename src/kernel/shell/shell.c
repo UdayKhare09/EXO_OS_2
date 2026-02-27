@@ -25,6 +25,10 @@
 #include "net/ipv4.h"
 #include "net/udp.h"
 #include "net/tcp.h"
+#include "fs/fd.h"
+#include "fs/elf.h"
+#include "sched/task.h"
+#include "mm/vmm.h"
 
 /* ── ANSI helpers ─────────────────────────────────────────────────────────── */
 #define A_RESET  "\033[0m"
@@ -721,6 +725,188 @@ static void cmd_arp_show(shell_t *sh, const char *args) {
     }
 }
 
+/* ── exec: launch an ELF binary as a user-space process ──────────────────── */
+static void cmd_exec(shell_t *sh, const char *args) {
+    fbcon_t *c = sh->con;
+    if (!args || !*args) {
+        fbcon_puts_inst(c, "  usage: exec <path>\n");
+        return;
+    }
+
+    /* Skip leading spaces */
+    while (*args == ' ') args++;
+    if (!*args) {
+        fbcon_puts_inst(c, "  usage: exec <path>\n");
+        return;
+    }
+
+    /* Resolve the path relative to CWD */
+    char fullpath[VFS_MOUNT_PATH_MAX];
+    if (args[0] == '/') {
+        strncpy(fullpath, args, VFS_MOUNT_PATH_MAX - 1);
+        fullpath[VFS_MOUNT_PATH_MAX - 1] = '\0';
+    } else {
+        path_join(sh->cwd, args, fullpath);
+    }
+
+    /* Open the ELF file */
+    int vfs_err = 0;
+    vnode_t *vn = vfs_lookup(fullpath, true, &vfs_err);
+    if (!vn) {
+        fbcon_printf_inst(c, "  exec: '%s': file not found\n", fullpath);
+        return;
+    }
+
+    uint64_t file_size = vn->size;
+    if (file_size == 0 || file_size > (64ULL * 1024 * 1024)) {
+        fbcon_printf_inst(c, "  exec: '%s': invalid file size (%llu)\n", fullpath, file_size);
+        vfs_vnode_put(vn);
+        return;
+    }
+
+    /* Read the ELF file into a kernel buffer */
+    void *buf = kmalloc(file_size);
+    if (!buf) {
+        fbcon_puts_inst(c, "  exec: out of memory\n");
+        vfs_vnode_put(vn);
+        return;
+    }
+
+    ssize_t rd = vn->ops->read(vn, buf, file_size, 0);
+    vfs_vnode_put(vn);
+    if (rd < 0 || (uint64_t)rd != file_size) {
+        fbcon_printf_inst(c, "  exec: read error (%ld)\n", rd);
+        kfree(buf);
+        return;
+    }
+
+    /* Create a fresh user address space */
+    uintptr_t pml4 = vmm_create_address_space();
+    if (!pml4) {
+        fbcon_puts_inst(c, "  exec: failed to create address space\n");
+        kfree(buf);
+        return;
+    }
+
+    /* Load the ELF into the new address space */
+    elf_info_t info;
+    int r = elf_load(buf, file_size, pml4, &info);
+    kfree(buf);
+    if (r < 0) {
+        fbcon_printf_inst(c, "  exec: ELF load failed (%d)\n", r);
+        vmm_destroy_address_space(pml4);
+        return;
+    }
+
+    /* Allocate user stack (8 pages = 32 KiB) */
+    uintptr_t user_stack_top = USER_STACK_TOP;
+    uintptr_t stack_pages = 8;
+    for (uintptr_t i = 0; i < stack_pages; i++) {
+        uintptr_t pg = pmm_alloc_pages(1);
+        if (pg) {
+            memset((void *)vmm_phys_to_virt(pg), 0, PAGE_SIZE);
+            vmm_map_page_in(pml4,
+                            user_stack_top - (stack_pages - i) * PAGE_SIZE,
+                            pg, VMM_USER_RW);
+        }
+    }
+
+    /* Build minimal user stack: argc=1, argv[0]=path, argv[1]=NULL, envp=NULL, auxv=AT_NULL */
+    uintptr_t sp = user_stack_top;
+
+    /* We need to write into the user address space page via HHDM */
+    #define EXEC_PUSH(val) do {                                          \
+        sp -= 8;                                                          \
+        uint64_t *_pte = vmm_get_pte(pml4, sp);                          \
+        if (_pte) {                                                       \
+            uintptr_t _ph = (*_pte) & 0x000FFFFFFFFFF000ULL;             \
+            uintptr_t _of = sp & (PAGE_SIZE - 1);                        \
+            *(uint64_t *)(vmm_phys_to_virt(_ph) + _of) = (uint64_t)(val);\
+        }                                                                 \
+    } while(0)
+
+    /* Copy path string to top of user stack */
+    size_t pathlen = strlen(fullpath) + 1;
+    sp -= pathlen;
+    sp &= ~0x7ULL; /* align to 8 */
+    uintptr_t argv0_addr = sp;
+    {
+        uint64_t *pte = vmm_get_pte(pml4, sp);
+        if (pte) {
+            uintptr_t ph = (*pte) & 0x000FFFFFFFFFF000ULL;
+            uintptr_t off = sp & (PAGE_SIZE - 1);
+            memcpy((void *)(vmm_phys_to_virt(ph) + off), fullpath, pathlen);
+        }
+    }
+
+    /* Align to 16 bytes */
+    sp &= ~0xFULL;
+
+    /* Auxiliary vector: AT_NULL */
+    EXEC_PUSH(0);           /* AT_NULL value */
+    EXEC_PUSH(0);           /* AT_NULL type  */
+    EXEC_PUSH(PAGE_SIZE);   /* AT_PAGESZ value */
+    EXEC_PUSH(6);           /* AT_PAGESZ type  */
+    EXEC_PUSH(info.entry);  /* AT_ENTRY value  */
+    EXEC_PUSH(9);           /* AT_ENTRY type   */
+
+    /* envp: NULL */
+    EXEC_PUSH(0);
+
+    /* argv: argv[0]=path, NULL */
+    EXEC_PUSH(0);
+    EXEC_PUSH(argv0_addr);
+
+    /* argc */
+    EXEC_PUSH(1);
+
+    /* Ensure 16-byte alignment */
+    sp &= ~0xFULL;
+
+    #undef EXEC_PUSH
+
+    /* Create the user-mode task */
+    uint32_t cpu = sched_pick_cpu();
+    task_t *t = task_create_user(fullpath, pml4, info.entry, sp, cpu);
+    if (!t) {
+        fbcon_puts_inst(c, "  exec: failed to create task\n");
+        vmm_destroy_address_space(pml4);
+        return;
+    }
+
+    /* Set up brk */
+    t->brk_base    = info.brk_start;
+    t->brk_current = info.brk_start;
+    t->mmap_next   = USER_MMAP_BASE;
+    strncpy(t->cwd, "/", TASK_CWD_MAX);
+
+    /* Add stack VMA */
+    vma_t *stack_vma = kmalloc(sizeof(vma_t));
+    if (stack_vma) {
+        stack_vma->start = user_stack_top - stack_pages * PAGE_SIZE;
+        stack_vma->end   = user_stack_top;
+        stack_vma->flags = VMA_READ | VMA_WRITE | VMA_USER | VMA_STACK;
+        stack_vma->next  = NULL;
+        vma_insert(t, stack_vma);
+    }
+
+    /* Set up stdio: fd 0/1/2 → /dev/tty */
+    int vfs_err2 = 0;
+    vnode_t *tty = vfs_lookup("/dev/tty", true, &vfs_err2);
+    if (tty) {
+        fd_setup_stdio(t, tty);
+        vfs_vnode_put(tty);
+    } else {
+        fbcon_puts_inst(c, "  exec: warning: could not open /dev/tty for stdio\n");
+    }
+
+    /* Schedule the task */
+    sched_add_task(t, cpu);
+
+    // fbcon_printf_inst(c, "  exec: launched '%s' (tid=%u, entry=%p)\n",
+    //                  fullpath, t->tid, (void *)info.entry);
+}
+
 /* ── Register all built-in commands ───────────────────────────────────────── */
 void shell_register_builtins(void) {
     spinlock_init(&g_cmd_lock);
@@ -750,6 +936,9 @@ void shell_register_builtins(void) {
     shell_register_cmd("arp",      "show ARP cache",                 cmd_arp_show);
     shell_register_cmd("udptest",  "send a UDP datagram",            cmd_udptest);
     shell_register_cmd("tcpconn",  "open a TCP connection",          cmd_tcpconn);
+
+    /* User-space */
+    shell_register_cmd("exec",     "run an ELF binary",              cmd_exec);
 
     /* Phase 6: Monitoring & power commands (cmd_monitor.c) */
     extern void cmd_monitor_register(void);

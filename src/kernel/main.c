@@ -60,6 +60,8 @@
 #include "drivers/storage/virtio_blk.h"
 #include "drivers/storage/ahci.h"
 #include "drivers/bus/smbus.h"
+#include "drivers/devfs.h"
+#include "fs/procfs.h"
 #include "fs/gpt.h"
 #include "syscall/syscall.h"
 
@@ -295,6 +297,8 @@ void kmain(void) {
     vfs_mkdir("/tmp",  01777);
     vfs_mkdir("/boot", 0755);
     vfs_mkdir("/proc", 0555);
+    devfs_init();
+    procfs_init();
     syscall_init();
 
     /* ── 5c. Input event subsystem ────────────────────────────────────────── */

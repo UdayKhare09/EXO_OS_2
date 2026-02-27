@@ -1,5 +1,5 @@
 #pragma once
-/* syscall/syscall.h — INT 0x80 syscall interface (Linux x86-64 ABI) */
+/* syscall/syscall.h — INT 0x80 + SYSCALL interface (Linux x86-64 ABI) */
 #include "arch/x86_64/idt.h"
 #include <stdint.h>
 
@@ -12,17 +12,48 @@
 #define SYS_FSTAT       5
 #define SYS_LSTAT       6
 #define SYS_LSEEK       8
+#define SYS_MMAP        9
+#define SYS_MPROTECT    10
+#define SYS_MUNMAP      11
 #define SYS_BRK         12
+#define SYS_RT_SIGACTION   13
+#define SYS_RT_SIGPROCMASK 14
+#define SYS_RT_SIGRETURN   15
+#define SYS_WRITEV      20
+#define SYS_ACCESS       21
+#define SYS_PIPE         22
 #define SYS_DUP         32
 #define SYS_DUP2        33
+#define SYS_GETPID      39
+#define SYS_CLONE       56
+#define SYS_FORK        57
+#define SYS_EXECVE      59
 #define SYS_EXIT        60
+#define SYS_WAIT4       61
+#define SYS_KILL        62
+#define SYS_FCNTL       72
 #define SYS_GETCWD      79
 #define SYS_CHDIR       80
 #define SYS_RENAME      82
 #define SYS_MKDIR       83
 #define SYS_RMDIR       84
 #define SYS_UNLINK      87
+#define SYS_READLINK    89
+#define SYS_UMASK       95
+#define SYS_GETUID      102
+#define SYS_GETGID      104
+#define SYS_GETEUID     107
+#define SYS_GETEGID     108
+#define SYS_GETPPID     110
+#define SYS_ARCH_PRCTL  158
+#define SYS_FUTEX       202
 #define SYS_GETDENTS64  217
+#define SYS_SET_TID_ADDRESS 218
+#define SYS_CLOCK_GETTIME   228
+#define SYS_EXIT_GROUP  231
+#define SYS_FSTATAT     262
+#define SYS_DUP3        292
+#define SYS_PIPE2       293
 
 /* ── Network syscall numbers (Linux x86-64 ABI) ─────────────────────────── */
 #define SYS_POLL        7
@@ -40,6 +71,12 @@
 #define SYS_SETSOCKOPT  54
 #define SYS_GETSOCKOPT  55
 
+/* arch_prctl commands */
+#define ARCH_SET_GS     0x1001
+#define ARCH_SET_FS     0x1002
+#define ARCH_GET_FS     0x1003
+#define ARCH_GET_GS     0x1004
+
 /* Linux open flags */
 #define SYS_O_RDONLY    0
 #define SYS_O_WRONLY    1
@@ -48,6 +85,30 @@
 #define SYS_O_TRUNC     01000     /* octal 01000 = 0x200 */
 #define SYS_O_APPEND    02000     /* octal 02000 = 0x400 */
 #define SYS_O_DIRECTORY 0200000
+
+/* mmap flags */
+#define MAP_SHARED      0x01
+#define MAP_PRIVATE     0x02
+#define MAP_FIXED       0x10
+#define MAP_ANONYMOUS   0x20
+#define MAP_ANON        MAP_ANONYMOUS
+
+/* mmap prot flags */
+#define PROT_NONE       0x0
+#define PROT_READ       0x1
+#define PROT_WRITE      0x2
+#define PROT_EXEC       0x4
+
+/* clone flags (subset) */
+#define CLONE_VM        0x00000100
+#define CLONE_FS        0x00000200
+#define CLONE_FILES     0x00000400
+#define CLONE_SIGHAND   0x00000800
+#define CLONE_THREAD    0x00010000
+
+/* futex ops */
+#define FUTEX_WAIT      0
+#define FUTEX_WAKE      1
 
 /* Linux stat structure (x86-64 ABI) */
 typedef struct {
@@ -80,4 +141,17 @@ typedef struct {
     char     d_name[];  /* null-terminated */
 } __attribute__((packed)) linux_dirent64_t;
 
+/* iovec for writev/readv */
+typedef struct {
+    void    *iov_base;
+    uint64_t iov_len;
+} iovec_t;
+
+/* timespec for clock_gettime */
+typedef struct {
+    int64_t  tv_sec;
+    int64_t  tv_nsec;
+} kernel_timespec_t;
+
 void syscall_init(void);
+void syscall_init_fast(void);  /* per-CPU SYSCALL MSR setup (call on each AP) */

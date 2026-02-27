@@ -1,4 +1,4 @@
-; context_switch.asm — x86_64 context switch and task trampoline
+; context_switch.asm — x86_64 context switch, task trampoline, user-mode entry
 bits 64
 section .text
 
@@ -65,7 +65,7 @@ task_switch_asm:
 
     ret                        ; jumps to new task's saved RIP
 
-; ── Task trampoline ──────────────────────────────────────────────────────────
+; ── Task trampoline (kernel tasks) ───────────────────────────────────────────
 ; Called as RIP for a freshly created task.
 ; On entry, the initial frame has:
 ;   rbx = task_entry_t  (entry function)
@@ -82,3 +82,124 @@ task_trampoline:
     cli
     hlt
     jmp  .halt
+
+; ── User-mode trampoline ─────────────────────────────────────────────────────
+; First-time entry into user-space via iretq.
+; On entry (from init_frame_t popped by task_switch_asm):
+;   rbx = user entry point (RIP for ring 3)
+;   r12 = user stack top  (RSP for ring 3)
+;
+; We construct an iretq frame:  SS, RSP, RFLAGS, CS, RIP
+; GDT_USER_DATA | 3 = 0x1B,  GDT_USER_CODE | 3 = 0x23
+global user_mode_trampoline
+user_mode_trampoline:
+    ; Clear all GP registers to avoid leaking kernel data to user-space
+    xor  rax, rax
+    xor  rcx, rcx
+    xor  rdx, rdx
+    xor  rsi, rsi
+    xor  rdi, rdi
+    xor  rbp, rbp
+    xor  r8,  r8
+    xor  r9,  r9
+    xor  r10, r10
+    xor  r11, r11
+    xor  r13, r13
+    xor  r14, r14
+    xor  r15, r15
+
+    ; Build iretq frame on current (kernel) stack
+    push qword 0x1B           ; SS  = GDT_USER_DATA | RPL=3
+    push r12                   ; RSP = user stack
+    push qword 0x202          ; RFLAGS = IF set (interrupts enabled)
+    push qword 0x23           ; CS  = GDT_USER_CODE | RPL=3
+    push rbx                   ; RIP = user entry point
+
+    ; Clear the last two regs we used
+    xor  rbx, rbx
+    xor  r12, r12
+
+    ; Swap GS: move kernel GS base into MSR_KERN_GS_BASE so the next
+    ; swapgs (on SYSCALL/interrupt entry) restores it correctly.
+    swapgs
+
+    iretq
+
+; ── SYSCALL entry point ──────────────────────────────────────────────────────
+; Called via the SYSCALL instruction from user-space.
+; On entry:  RCX = user RIP, R11 = user RFLAGS
+;            RAX = syscall number, args in RDI RSI RDX R10 R8 R9
+; The SYSCALL instruction does NOT switch RSP — we must do that manually.
+; SWAPGS switches GS from user (0) to kernel (per-CPU info).
+extern syscall_dispatch_fast
+global syscall_entry
+syscall_entry:
+    swapgs                             ; GS now points to per-CPU cpu_info_t
+
+    ; Save user RSP and load kernel RSP from TSS RSP0
+    ; Per-CPU TSS RSP0 is at gdt_tables[cpu].tss... but we stored
+    ; the kernel stack top at cpu_info->kernel_stack_top (offset 16).
+    mov  [gs:32], rsp                  ; save user RSP in cpu_info scratch area
+    mov  rsp, [gs:16]                  ; load kernel stack top
+
+    ; Build a cpu_regs_t-compatible frame on the kernel stack:
+    ;   iretq order: SS, RSP, RFLAGS, CS, RIP
+    push qword 0x1B                    ; SS  (user data)
+    push qword [gs:32]                 ; RSP (user, saved above)
+    push r11                           ; RFLAGS (saved in R11 by SYSCALL)
+    push qword 0x23                    ; CS  (user code)
+    push rcx                           ; RIP (saved in RCX by SYSCALL)
+
+    ; Error code + vector (for cpu_regs_t compat)
+    push qword 0                       ; error code (none)
+    push qword 0x80                    ; vector = 0x80 (syscall)
+
+    ; Push GP registers (matches isr_dispatch order)
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    ; Call C dispatcher:  void syscall_dispatch_fast(cpu_regs_t *regs)
+    mov  rdi, rsp
+    call syscall_dispatch_fast
+
+    ; Restore GP registers
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  r11
+    pop  r10
+    pop  r9
+    pop  r8
+    pop  rbp
+    pop  rdi
+    pop  rsi
+    pop  rdx
+    pop  rcx
+    pop  rbx
+    pop  rax     ; return value is in RAX (set by dispatcher)
+
+    ; Skip vec + err
+    add  rsp, 16
+
+    ; ── Return to user via iretq (more robust than sysret) ───────────────
+    ; Stack now has: [RIP] [CS] [RFLAGS] [RSP] [SS] — standard iretq frame.
+    ; swapgs if returning to ring 3 (check saved CS RPL).
+    test qword [rsp + 8], 3        ; check saved CS RPL
+    jz   .syscall_ret_kern
+    swapgs
+.syscall_ret_kern:
+    iretq

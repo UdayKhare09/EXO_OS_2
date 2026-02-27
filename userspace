@@ -1,0 +1,216 @@
+Plan: Userspace + mlibc Preparation
+TL;DR
+EXO_OS has a strong kernel foundation — full VFS with 3 filesystems, 34 Linux-ABI syscalls, per-task FD tables, SMP MLFQ scheduler, ring-3 GDT segments, TSS, and a complete TCP/IP stack. However, zero user-mode code has ever run: there are no per-process page tables, no ELF loader, no fork/exec, no mmap, and no user-mode task entry. The plan is structured in 7 phases, each delivering a testable milestone, culminating in a statically-linked mlibc "hello world" with dynamic linking prep in a later phase. All syscalls follow the existing Linux x86-64 ABI numbering convention already in the codebase.
+
+Phase 1 — Per-Process Address Spaces
+
+Extend VMM in vmm.c / vmm.h:
+
+Add vmm_create_address_space() → allocates a fresh PML4, copies kernel-half entries (indices 256–511) from kernel_pml4 so kernel space is shared across all processes.
+Add vmm_switch_address_space(uint64_t pml4_phys) → writes cr3.
+Add vmm_map_user_page(uint64_t *pml4, uint64_t virt, uint64_t phys, uint64_t flags) → walks/allocates page tables in a given PML4 (not the global one), always sets VMM_USER.
+Add vmm_destroy_address_space(uint64_t *pml4) → walks user-half, frees all page table pages and mapped physical pages.
+Add vmm_clone_address_space(uint64_t *src_pml4) → deep-copies user-half page tables with COW: mark pages read-only in both parent and child, set a custom VMM_COW bit (use an available software bit, e.g., bit 9 or 10 in PTE).
+Add vmm_handle_page_fault(uint64_t fault_addr, uint64_t error_code) → if COW bit set on faulting PTE: allocate new page, copy content, remap with write permission, clear COW bit.
+Wire page fault — Register handler for vector 14 (#PF) in idt.c. Read CR2 for fault address. Dispatch to vmm_handle_page_fault(). If not COW and not demand-paged, deliver SIGSEGV to task (or kill it).
+
+Update task_t in task.h: add uint64_t *pml4 (virtual pointer to process PML4), pid_t pid, pid_t ppid, pid_t pgid, struct task *parent, struct list_head children, int exit_status, uint64_t brk_base, uint64_t brk_current. Keep cr3 as the physical address of PML4.
+
+Update context switch in context_switch.asm: after restoring GP registers and before ret, load new task's cr3 if different from current.
+
+Test: Create two kernel tasks with different page tables, map a different physical page at the same user-half virtual address in each, verify isolation by reading from both.
+
+Phase 2 — Ring 3 Entry + SYSCALL/SYSRET
+
+TSS RSP0 per-task — In context_switch (or sched_switch_to()), update the per-CPU TSS rsp[0] to the top of the incoming task's kernel stack. This is in gdt.c — expose tss_set_rsp0(uint64_t rsp0) and call it on every context switch.
+
+SYSCALL/SYSRET setup — New function syscall_init_fast() in syscall.c:
+
+Write MSR_STAR: bits [47:32] = GDT_KERN_CODE (0x08), bits [63:48] = GDT_USER_DATA - 8 = 0x10 (hardware adds offsets: SS = STAR[63:48]+8 = 0x18 = user data, CS = STAR[63:48]+16 = 0x20 = user code, both OR'd with RPL=3 by hardware).
+Write MSR_LSTAR = address of new syscall_entry asm stub.
+Write MSR_FMASK = 0x200 (clear IF on entry — disable interrupts during kernel prologue).
+Enable SCE bit in MSR_EFER.
+Constants MSR_STAR and MSR_LSTAR already exist in cpu.h.
+syscall_entry asm stub — New assembly in isr.asm (or separate file):
+
+swapgs to get per-CPU data.
+Save user RSP from rcx, load kernel RSP from per-CPU TSS RSP0.
+Push a cpu_regs_t-compatible frame (synthesize ss, rsp, rflags, cs, rip from rcx/r11).
+Call the existing syscall_dispatch().
+On return: restore user rsp, rflags from r11, rip from rcx, swapgs, sysretq.
+enter_usermode(rip, rsp) helper — Pushes ring-3 ss (GDT_USER_DATA|3), user rsp, rflags (with IF set), ring-3 cs (GDT_USER_CODE|3), user rip onto kernel stack, then iretq. This is the initial entry point for new user-mode processes.
+
+Fix sys_exit() — Replace the hlt loop in syscall.c:88 with: store exit status in task->exit_status, wake parent if waiting, call sched_task_exit().
+
+Test: Embed a tiny position-independent "hello" blob (inline bytes: mov rax,1; mov rdi,1; lea rsi,[msg]; mov rdx,len; int 0x80; mov rax,60; xor rdi,rdi; int 0x80). Map it at 0x400000 in a new address space, allocate a user stack at 0x7fffffffe000, call enter_usermode(). Verify output on serial.
+
+Phase 3 — ELF Loader + execve
+
+ELF64 loader — New files src/kernel/fs/elf.c + elf.h:
+
+Validate e_ident magic, ELFCLASS64, ELFDATA2LSB, EM_X86_64.
+Iterate PT_LOAD segments: allocate physical pages, map into process PML4 at p_vaddr with correct VMM_USER | VMM_WRITE (based on p_flags), copy p_filesz from file, zero-fill remainder through p_memsz.
+Extract e_entry as user-space entry point.
+Handle PT_INTERP (store interpreter path for Phase 7).
+Handle PT_PHDR for auxiliary vector.
+Auxiliary vector builder — Construct auxv[] array on user stack: AT_ENTRY, AT_PHDR, AT_PHNUM, AT_PHENT, AT_PAGESZ (4096), AT_NULL. mlibc's crt reads these on startup.
+
+sys_execve() (syscall 59) — In file_syscalls.c:
+
+Copy argv/envp strings from user memory to kernel buffers.
+Destroy current user-space mappings (keep kernel half).
+Call ELF loader to map new binary.
+Set up fresh user stack at top of user address space, push argc, argv[] pointers, envp[] pointers, auxiliary vector (in Linux stack layout order).
+Call fd_close_cloexec() (already exists in fd.c).
+Reset signal handlers to default.
+Set task's brk_base/brk_current to end of BSS (from ELF segments).
+Return to userspace via enter_usermode(e_entry, new_rsp).
+sys_fork() (syscall 57) — In new src/kernel/syscall/proc_syscalls.c:
+
+vmm_clone_address_space() to create COW copy.
+task_create() variant that copies parent's register state (from current cpu_regs_t) into child's kernel stack so context_switch returns to child with rax=0.
+Copy FD table (increment refcounts on all file_t).
+Copy signal handlers.
+Set child PID, parent→child linkage.
+Return child PID to parent.
+sys_wait4() (syscall 61) — Block parent on a waitqueue. When child calls sys_exit(), wake parent, transfer exit status, clean up child task.
+
+sys_getpid (39), sys_getppid (110) — Trivial reads from current_task().
+
+Test: Cross-compile a static C binary (using a system x86_64-elf-gcc), format the binary as a raw ELF, embed in tmpfs or ext2 image. sys_fork() + sys_execve() from a kernel init task > user process prints "Hello from userspace!" via sys_write.
+
+Phase 4 — mmap + brk (mlibc Memory Allocation)
+
+Per-process VMA tracking — Add to task_t a simple vma_t linked list:
+
+Track all user-space mappings (stack, ELF segments, heap, anon mmap regions). This prevents overlap and enables munmap cleanup.
+
+sys_mmap() (syscall 9) — Allocate VMAs in the user region. Support:
+
+MAP_ANONYMOUS | MAP_PRIVATE — main use case for mlibc malloc. Allocate physical pages (or lazily via demand paging), map into process PML4.
+MAP_FIXED — map at exact address.
+PROT_READ | PROT_WRITE | PROT_EXEC → translate to VMM flags.
+File-backed mmap can be deferred (just return -ENOSYS for file mappings initially).
+sys_munmap() (syscall 11) — Unmap pages in range, free physical frames, remove/split VMAs.
+
+sys_mprotect() (syscall 10) — Walk PTEs in range, update permission bits.
+
+sys_brk() (syscall 12) — Replace stub in file_syscalls.c#L342-344. Track brk_base and brk_current in task. Expand/contract heap by mapping/unmapping pages between old and new brk.
+
+Demand paging — Extend the #PF handler from Phase 1: if a fault occurs on a VMA with no backing page yet, allocate and map a zeroed page lazily.
+
+Test: User-mode program calls mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_ANON|MAP_PRIVATE, -1, 0), writes to it, then munmaps. Also test brk expansion.
+
+Phase 5 — Signals (User-Space Delivery) + Pipes + Misc Syscalls
+
+User signal delivery — When returning to user-mode and sig_pending is set:
+
+Save current user register state onto user stack (as a ucontext_t-like frame).
+Push a sigreturn trampoline (small code snippet at a well-known address, or mmap'd per-process, that calls sys_rt_sigreturn).
+Redirect user RIP to the registered signal handler, rdi = signal number.
+sys_rt_sigaction() (13) — Set per-signal handler, sa_mask, sa_flags. Store in task's sig_handlers[] (already an array in task.h).
+
+sys_rt_sigprocmask() (14) — Add uint64_t sig_mask to task_t. Support SIG_BLOCK, SIG_UNBLOCK, SIG_SETMASK.
+
+sys_rt_sigreturn() (15) — Restore register state from the frame saved on user stack. Return to the interrupted user context.
+
+sys_kill() (62) — Send signal to a task by PID. Wire through existing signal_send().
+
+sys_pipe2() (293) / sys_pipe() (22) — Create a pipe_t with a kernel buffer (e.g., 4096 bytes), two file_t entries (one read, one write) with file_ops_t for read/write. Install into two new FDs.
+
+sys_clone() (56) — Simplified Linux clone: CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD creates a thread (shared address space, shared FD table). Without those flags, behaves like fork. mlibc pthreads calls clone().
+
+sys_set_tid_address() (218) — Store a pointer in task; on exit, write 0 to that address and futex-wake it. mlibc uses this for thread join.
+
+sys_futex() (202) — Implement FUTEX_WAIT and FUTEX_WAKE only (bare minimum). Uses a hash table of wait queues keyed on (address space, user virtual address).
+
+Misc trivial syscalls needed by mlibc:
+
+sys_arch_prctl() (158) — ARCH_SET_FS: write MSR_FS_BASE; ARCH_GET_FS: read it. Critical for TLS.
+sys_clock_gettime() (228) — Read HPET or RTC (both already exist in hpet.c / rtc.c). Support CLOCK_REALTIME and CLOCK_MONOTONIC.
+sys_writev() (20) — Scatter-gather write, iterate struct iovec array calling existing sys_write per chunk.
+sys_access() / sys_faccessat() (21/269) — Check file existence/permissions via vfs_stat().
+sys_fcntl() (72) — F_DUPFD, F_GETFD, F_SETFD (CLOEXEC), F_GETFL, F_SETFL.
+sys_dup3() (292) — Like dup2 with O_CLOEXEC flag.
+sys_getuid/getgid/geteuid/getegid (102/104/107/108) — Return 0 (root) for now.
+sys_umask() (95) — Store per-task umask, return old value.
+sys_readlink() (89) / sys_symlink() (88) — Wire through existing VFS symlink support.
+sys_fstatat() (262) — AT_FDCWD variant of stat.
+Test: User-mode program registers a SIGALRM handler, kernel delivers signal, handler runs in user-space, sigreturn resumes execution. Test pipe: fork, parent writes, child reads.
+
+Phase 6 — Device Nodes + /proc
+
+/dev device files — In tmpfs (or a new devfs), create:
+
+null — read returns 0 bytes, write discards. Simple file_ops_t.
+zero — read fills buffer with zeros. Write discards.
+tty / console — wire to fbcon input/output.
+urandom — basic PRNG seeded from RDRAND/RDSEED.
+/proc basics — New procfs filesystem type:
+
+self symlink → /proc/<pid>.
+/proc/<pid>/maps — iterate VMAs, output address ranges (mlibc reads this for debug/sanitizer features; not blocking but useful).
+/proc/<pid>/status — basic task info.
+Test: cat /dev/null, dd if=/dev/zero bs=4096 count=1, read maps.
+
+Phase 7 — mlibc Sysdep Layer + Build System
+
+Create mlibc sysdep directory — src/mlibc-sysdeps/exo/ with:
+
+generic/entry.cpp — __mlibc_entry crt0 entry point: parse auxv from stack, call __mlibc_main.
+generic/generic.cpp — implement mlibc sysdep functions that call your syscalls via inline assembly (int $0x80 or syscall).
+Key sysdep functions mlibc requires:
+sys_libc_log(msg) → write(2, msg, len) for debug
+sys_exit(code) → syscall 60
+sys_open(path, flags, mode) → syscall 2
+sys_read(fd, buf, count) → syscall 0
+sys_write(fd, buf, count) → syscall 1
+sys_close(fd) → syscall 3
+sys_seek(fd, offset, whence) → syscall 8
+sys_vm_map(hint, size, prot, flags, fd, offset) → syscall 9
+sys_vm_unmap(addr, size) → syscall 11
+sys_anon_allocate(size, &ptr) → mmap wrapper
+sys_anon_free(ptr, size) → munmap wrapper
+sys_fork() → syscall 57
+sys_execve(path, argv, envp) → syscall 59
+sys_waitpid(pid, status, flags) → syscall 61
+sys_clock_get(clk, sec, nsec) → syscall 228
+sys_futex_wait(ptr, val, timeout) → syscall 202
+sys_futex_wake(ptr) → syscall 202
+sys_tcb_set(ptr) → arch_prctl(ARCH_SET_FS) (syscall 158) — thread control block / TLS
+sys_sigaction(sig, act, oldact) → syscall 13
+sys_kill(pid, sig) → syscall 62
+sys_sigprocmask(how, set, old) → syscall 14
+sys_clone(entry, stack, flags, arg, ...) → syscall 56
+Socket wrappers for sys_socket, sys_bind, sys_connect, etc.
+meson.build for mlibc integration.
+Cross-compilation toolchain — Add a tools/build_toolchain.sh script that:
+
+Builds x86_64-exo binutils + GCC (freestanding cross-compiler).
+Clones mlibc, configures with --cross-file exo-cross.txt pointing to sysdeps.
+Installs into sysroot/ (headers in sysroot/usr/include, libc.a / libc.so in sysroot/usr/lib).
+Static linking test — Compile a hello.c against sysroot/, produce a static ELF, place on ext2 or tmpfs image, boot the OS, kernel fork+exec → "Hello from mlibc!" via printf → write syscall.
+
+Dynamic linking prep (planned, not Phase 7 deliverable):
+
+ELF loader recognizes PT_INTERP, loads ld.so at a free address, transfers control to interpreter entry.
+sys_mmap supports MAP_FIXED for interpreter loading.
+Auxiliary vector includes AT_BASE (interpreter load address).
+ld.so from mlibc handles relocations, resolves symbols, calls main.
+Verification
+
+Phase 1: Write a kernel unit test that creates 2 address spaces, maps conflicting virtual addresses, switches between them, reads back expected data. Also trigger a COW fault and verify the copy.
+Phase 2: Hardcoded shellcode blob runs in ring 3, makes an INT 0x80 write syscall, output appears on serial. Then test SYSCALL instruction path.
+Phase 3: Static "hello" ELF (hand-written or minimal _start) loaded from tmpfs, forked + exec'd.
+Phase 4: User binary calls mmap, writes to it, munmap. Also test brk expansion.
+Phase 5: Signal delivery to userspace handler + return. Pipe between parent/child. clone() → two threads printing interleaved output.
+Phase 6: cat /dev/null, cat /dev/zero | head -c 16 | xxd, cat /proc/self/maps.
+Phase 7: Full printf("Hello, world!\n") from a C program linked against mlibc running as a user process.
+Decisions
+
+Full fork()+exec() over spawn-only — enables full POSIX compliance and mlibc compatibility from the start, at the cost of implementing COW in Phase 1.
+SYSCALL/SYSRET from Phase 2 — avoids rework later; INT 0x80 remains as fallback for compatibility.
+Static mlibc first, dynamic planned — Phase 7 delivers static; dynamic linking (PT_INTERP + ld.so) is documented but deferred.
+clone() included — mlibc pthreads depends on it; futex(WAIT/WAKE) is the minimum for synchronization.
+Linux x86-64 ABI preserved — all existing syscall numbers already match Linux, keeping this consistent for mlibc sysdep simplicity.
+VMA list over tree — simple linked list is sufficient for early userspace; can upgrade to red-black tree when process count grows.

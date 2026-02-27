@@ -14,6 +14,7 @@ typedef struct cpu_info {
     uint8_t          _pad[2];    /* offset 14: explicit padding               */
     uintptr_t        kernel_stack_top;  /* offset 16                          */
     uint8_t         *isr_xsave_buf;    /* offset 24: per-CPU 4 KiB XSAVE buf */
+    uintptr_t        user_rsp_scratch; /* offset 32: scratch for SYSCALL entry */
 } cpu_info_t;
 
 /* Byte offset of isr_xsave_buf in cpu_info_t — referenced by isr.asm */

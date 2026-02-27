@@ -10,6 +10,7 @@
 #include "mm/vmm.h"
 #include "mm/pmm.h"
 #include "sched/sched.h"
+#include "syscall/syscall.h"
 #include <stdint.h>
 
 #define SMP_TRAMPOLINE_PHYS  0x8000UL
@@ -70,6 +71,9 @@ void smp_ap_entry(cpu_info_t *info) {
 
     /* Init per-CPU scheduler */
     sched_init(info->id);
+
+    /* Enable SYSCALL/SYSRET on this AP */
+    syscall_init_fast();
 
     /* Start periodic LAPIC timer on this AP (same rate as BSP) */
     apic_timer_init(g_apic_ticks_per_ms);

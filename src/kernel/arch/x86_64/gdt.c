@@ -98,3 +98,7 @@ void gdt_load_tss(uint32_t cpu_id) {
 tss_t *gdt_get_tss(uint32_t cpu_id) {
     return &tss_entries[cpu_id];
 }
+
+void gdt_set_tss_rsp0(uint32_t cpu_id, uint64_t rsp0) {
+    tss_entries[cpu_id].rsp[0] = rsp0;
+}

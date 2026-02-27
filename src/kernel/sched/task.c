@@ -8,6 +8,7 @@
 #include "lib/klog.h"
 #include "lib/panic.h"
 #include "arch/x86_64/cpu.h"
+#include "arch/x86_64/gdt.h"
 #include "fs/fd.h"   /* fd_close_all */
 #include <stdint.h>
 #include <stddef.h>
@@ -40,11 +41,13 @@ typedef struct {
 /* Wrapper that calls entry(arg) then marks task dead */
 extern void task_trampoline(void);   /* defined in context_switch.asm */
 
+/* User-mode entry trampoline: sets up iretq frame to jump to ring 3 */
+extern void user_mode_trampoline(void);  /* defined in context_switch.asm */
+
 static uint32_t next_tid = 1;
 
-task_t *task_create(const char *name, task_entry_t entry, void *arg,
-                    uint32_t cpu_id) {
-    /* Allocate task_t structure in kernel heap (use PMM for now) */
+/* Shared init for both kernel and user tasks */
+static task_t *task_alloc_common(const char *name, uint32_t cpu_id) {
     uintptr_t task_page = pmm_alloc_pages(1);
     if (!task_page) return NULL;
     task_t *t = (task_t *)vmm_phys_to_virt(task_page);
@@ -54,10 +57,8 @@ task_t *task_create(const char *name, task_entry_t entry, void *arg,
     uintptr_t stack_phys = pmm_alloc_pages(TASK_STACK_SIZE / PAGE_SIZE);
     if (!stack_phys) { pmm_free_pages(task_page, 1); return NULL; }
     t->stack_phys = stack_phys;
-    uintptr_t stack_virt_top = vmm_phys_to_virt(stack_phys) + TASK_STACK_SIZE;
 
-    /* FPU/SSE/AVX state buffer — must be 64-byte aligned for XSAVE/XRSTOR.
-     * pmm_alloc_pages returns 4096-byte aligned addresses (>= 64 bytes). */
+    /* FPU/SSE/AVX state buffer — must be 64-byte aligned for XSAVE/XRSTOR. */
     uintptr_t fpu_phys = pmm_alloc_pages(1);
     if (!fpu_phys) {
         pmm_free_pages(stack_phys, TASK_STACK_SIZE / PAGE_SIZE);
@@ -66,43 +67,98 @@ task_t *task_create(const char *name, task_entry_t entry, void *arg,
     }
     t->fpu_state = (uint8_t *)vmm_phys_to_virt(fpu_phys);
     memset(t->fpu_state, 0, PAGE_SIZE);
-    /* Zeroed XSTATE_BV (offset 512) means XRSTOR uses initial FPU state:
-     * FCW=0x037F, MXCSR=0x1F80, all ST/XMM/YMM regs zeroed. */
 
-    /* Push initial frame onto the stack */
-    stack_virt_top -= sizeof(init_frame_t);
-    init_frame_t *frame = (init_frame_t *)stack_virt_top;
-    memset(frame, 0, sizeof(*frame));
-    frame->rip = (uint64_t)task_trampoline;
-
-    /* Push entry and arg above the frame so trampoline can pop them */
-    /* We abuse rbx/rbp to pass entry and arg: */
-    frame->rbx = (uint64_t)entry;   /* entry function */
-    frame->r12 = (uint64_t)arg;     /* argument       */
-
-    t->rsp    = stack_virt_top;
-    t->cr3    = read_cr3();
     t->state  = TASK_RUNNABLE;
     t->tid    = next_tid++;
+    t->pid    = t->tid;   /* default: PID == TID */
     t->cpu_id = cpu_id;
     t->next   = NULL;
 
+    /* Process identity defaults */
+    t->ppid   = 0;
+    t->pgid   = t->pid;
+    t->uid    = 0;
+    t->gid    = 0;
+    t->parent = NULL;
+    t->children   = NULL;
+    t->child_next = NULL;
+    t->exit_status = 0;
+    t->is_user  = 0;
+
     /* Priority scheduler fields */
-    t->priority        = 4;   /* default: middle priority (0-7) */
+    t->priority        = 4;
     t->timeslice_ticks = 0;
 
     /* IPC + signal resources */
     t->sig_pending  = 0;
+    t->sig_mask     = 0;
     t->sig_handlers = signal_table_alloc();
+    t->sigactions   = NULL;   /* lazy-allocated on first rt_sigaction call */
     t->mailbox      = ipc_mailbox_create(t);
+
+    /* Memory management */
+    t->vma_list     = NULL;
+    t->brk_base     = USER_HEAP_BASE;
+    t->brk_current  = USER_HEAP_BASE;
+    t->mmap_next    = USER_MMAP_BASE;
+    t->fs_base      = 0;
+    t->clear_child_tid = NULL;
 
     strncpy(t->name, name ? name : "unnamed", TASK_NAME_MAX - 1);
     t->cwd[0] = '/';
     t->cwd[1] = '\0';
     task_register(t);
 
-    KLOG_DEBUG("task: created '%s' tid=%u cpu=%u rsp=%p\n",
+    return t;
+}
+
+task_t *task_create(const char *name, task_entry_t entry, void *arg,
+                    uint32_t cpu_id) {
+    task_t *t = task_alloc_common(name, cpu_id);
+    if (!t) return NULL;
+
+    uintptr_t stack_virt_top = vmm_phys_to_virt(t->stack_phys) + TASK_STACK_SIZE;
+
+    /* Push initial frame onto the stack */
+    stack_virt_top -= sizeof(init_frame_t);
+    init_frame_t *frame = (init_frame_t *)stack_virt_top;
+    memset(frame, 0, sizeof(*frame));
+    frame->rip = (uint64_t)task_trampoline;
+    frame->rbx = (uint64_t)entry;   /* entry function */
+    frame->r12 = (uint64_t)arg;     /* argument       */
+
+    t->rsp    = stack_virt_top;
+    t->cr3    = read_cr3();
+    t->is_user = 0;
+
+    KLOG_DEBUG("task: created kernel '%s' tid=%u cpu=%u rsp=%p\n",
                t->name, t->tid, t->cpu_id, (void *)t->rsp);
+    return t;
+}
+
+task_t *task_create_user(const char *name, uintptr_t pml4_phys,
+                         uintptr_t user_entry, uintptr_t user_stack_top,
+                         uint32_t cpu_id) {
+    task_t *t = task_alloc_common(name, cpu_id);
+    if (!t) return NULL;
+
+    uintptr_t stack_virt_top = vmm_phys_to_virt(t->stack_phys) + TASK_STACK_SIZE;
+
+    /* Push initial frame: trampoline will use rbx=user_entry, r12=user_stack */
+    stack_virt_top -= sizeof(init_frame_t);
+    init_frame_t *frame = (init_frame_t *)stack_virt_top;
+    memset(frame, 0, sizeof(*frame));
+    frame->rip = (uint64_t)user_mode_trampoline;
+    frame->rbx = user_entry;        /* user RIP */
+    frame->r12 = user_stack_top;    /* user RSP */
+
+    t->rsp     = stack_virt_top;
+    t->cr3     = pml4_phys;
+    t->is_user = 1;
+
+    KLOG_DEBUG("task: created user '%s' tid=%u cpu=%u entry=%p ustack=%p\n",
+               t->name, t->tid, t->cpu_id,
+               (void *)user_entry, (void *)user_stack_top);
     return t;
 }
 
@@ -111,7 +167,23 @@ void task_destroy(task_t *t) {
     task_unregister(t);
     fd_close_all(t);
     signal_table_free(t->sig_handlers);  t->sig_handlers = NULL;
+    sigaction_table_free(t->sigactions); t->sigactions   = NULL;
     ipc_mailbox_destroy(t->mailbox);     t->mailbox      = NULL;
+
+    /* Free VMAs */
+    vma_t *v = t->vma_list;
+    while (v) {
+        vma_t *next = v->next;
+        kfree(v);
+        v = next;
+    }
+    t->vma_list = NULL;
+
+    /* Destroy user address space (if process had its own) */
+    if (t->is_user && t->cr3 != vmm_get_kernel_pml4()) {
+        vmm_destroy_address_space(t->cr3);
+    }
+
     if (t->fpu_state) {
         pmm_free_pages(vmm_virt_to_phys((uintptr_t)t->fpu_state), 1);
         t->fpu_state = NULL;

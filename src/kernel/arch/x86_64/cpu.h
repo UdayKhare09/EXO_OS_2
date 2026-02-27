@@ -7,8 +7,13 @@
 #define MSR_EFER            0xC0000080
 #define MSR_STAR            0xC0000081
 #define MSR_LSTAR           0xC0000082
+#define MSR_FMASK           0xC0000084
+#define MSR_FS_BASE         0xC0000100
 #define MSR_GS_BASE         0xC0000101
 #define MSR_KERN_GS_BASE    0xC0000102
+
+/* EFER bit: enable SYSCALL/SYSRET */
+#define EFER_SCE            (1ULL << 0)
 
 static inline uint64_t rdmsr(uint32_t msr) {
     uint32_t lo, hi;

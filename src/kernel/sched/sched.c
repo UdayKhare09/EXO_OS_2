@@ -5,6 +5,7 @@
 #include "arch/x86_64/cpu.h"
 #include "arch/x86_64/smp.h"
 #include "arch/x86_64/idt.h"
+#include "arch/x86_64/gdt.h"
 #include "mm/vmm.h"
 #include "lib/klog.h"
 #include "lib/panic.h"
@@ -218,9 +219,24 @@ void sched_tick(void) {
             dead_list = t;
             tried++;  continue;
         }
+        if (t->state == TASK_ZOMBIE) {
+            /* Zombies stay in limbo until reaped by parent via wait4 */
+            tried++;  continue;
+        }
         rq_enqueue(cs, t);   /* skip blocked tasks */
         tried++;
     }
+
+    /* If we are about to switch away from a task that is still running
+     * (timeslice not yet expired), re-enqueue it so it is not lost.
+     * Without this, the task stays TASK_RUNNING but is neither in any
+     * queue nor cs->current — permanently dropped from scheduling.    */
+    task_t *effective_next = next ? next : cs->idle;
+    if (prev && prev->state == TASK_RUNNING && prev != effective_next) {
+        prev->state = TASK_RUNNABLE;
+        rq_enqueue(cs, prev);
+    }
+
     rq_unlock(cs);
 
     /* Free dead tasks outside the lock (task_destroy acquires kmalloc_lock) */
@@ -248,6 +264,24 @@ void sched_tick(void) {
 
     if (prev == next) return;     /* same task: no switch needed */
 
+    /* Update TSS RSP0 so ring 3 → ring 0 transitions land on
+     * the incoming task's kernel stack top. */
+    uintptr_t next_kstack_top = vmm_phys_to_virt(next->stack_phys) + TASK_STACK_SIZE;
+    gdt_set_tss_rsp0(cpu_id, next_kstack_top);
+
+    /* Also update cpu_info->kernel_stack_top (GS:16) so the SYSCALL
+     * fast-path entry (syscall_entry in context_switch.asm) uses the
+     * incoming task's kernel stack, not the shared per-CPU boot stack.
+     * Without this, SYSCALL frames on the boot stack corrupt the idle
+     * task's saved context that also lives on that boot stack. */
+    cpu_info_t *ci_ctx = smp_self();
+    if (ci_ctx) ci_ctx->kernel_stack_top = next_kstack_top;
+
+    /* If switching to a user task, load its FS base (TLS pointer) */
+    if (next->is_user && next->fs_base) {
+        wrmsr(0xC0000100, next->fs_base);  /* MSR_FS_BASE */
+    }
+
     /* Perform context switch */
     task_switch_asm(&prev->rsp, next->rsp, next->cr3,
                     prev->fpu_state, next->fpu_state);
@@ -258,7 +292,16 @@ __attribute__((noreturn))
 void sched_task_exit(void) {
     cpu_info_t  *ci = smp_self();
     cpu_sched_t *cs = &cpu_scheds[ci->id];
-    cs->current->state = TASK_DEAD;
+    task_t *cur = cs->current;
+
+    /* If this task has a parent, become a zombie so the parent can reap
+     * us via wait4(). Otherwise mark DEAD for immediate cleanup. */
+    if (cur->parent) {
+        cur->state = TASK_ZOMBIE;
+    } else {
+        cur->state = TASK_DEAD;
+    }
+
     /* Trigger immediate reschedule by forcing a tick */
     sched_tick();
     /* unreachable */

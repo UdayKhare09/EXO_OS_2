@@ -13,6 +13,8 @@
 #include "lib/klog.h"
 #include "lib/string.h"
 #include "mm/kmalloc.h"
+#include "mm/vmm.h"
+#include "mm/pmm.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -339,7 +341,61 @@ int64_t sys_getdents64(int fd, void *dirp, uint64_t count) {
 
 /* ── sys_brk ─────────────────────────────────────────────────────────────── */
 int64_t sys_brk(uint64_t addr) {
-    /* Stub — not implemented yet */
-    (void)addr;
-    return -ENOSYS;
+    task_t *cur = sched_current();
+    if (!cur) return -ESRCH;
+
+    /* brk(0) → return current brk */
+    if (addr == 0)
+        return (int64_t)cur->brk_current;
+
+    /* Page-align the new brk */
+    uint64_t new_brk = (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    uint64_t old_brk = cur->brk_current;
+
+    /* Don't allow shrinking below base */
+    if (new_brk < cur->brk_base)
+        return (int64_t)old_brk;
+
+    /* Sanity limit: 256 MiB heap max */
+    if (new_brk - cur->brk_base > (256ULL * 1024 * 1024))
+        return (int64_t)old_brk;
+
+    if (new_brk > old_brk) {
+        /* Expand: map new pages */
+        uint64_t old_page = (old_brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+        for (uint64_t pg = old_page; pg < new_brk; pg += PAGE_SIZE) {
+            uintptr_t phys = pmm_alloc_pages(1);
+            if (!phys) return (int64_t)old_brk;  /* OOM */
+            memset((void *)vmm_phys_to_virt(phys), 0, PAGE_SIZE);
+            vmm_map_page_in(cur->cr3, pg, phys, VMM_USER_RW);
+        }
+    } else if (new_brk < old_brk) {
+        /* Shrink: unmap pages */
+        uint64_t new_page = (new_brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+        for (uint64_t pg = new_page; pg < old_brk; pg += PAGE_SIZE) {
+            uintptr_t phys = vmm_unmap_page_in(cur->cr3, pg);
+            if (phys) pmm_free_pages(phys, 1);
+        }
+    }
+
+    cur->brk_current = new_brk;
+
+    /* Update or create heap VMA */
+    vma_t *v = cur->vma_list;
+    while (v) {
+        if (v->flags & VMA_HEAP) { v->end = new_brk; break; }
+        v = v->next;
+    }
+    if (!v && new_brk > cur->brk_base) {
+        v = kmalloc(sizeof(vma_t));
+        if (v) {
+            v->start = cur->brk_base;
+            v->end   = new_brk;
+            v->flags = VMA_READ | VMA_WRITE | VMA_USER | VMA_HEAP;
+            v->next  = cur->vma_list;
+            cur->vma_list = v; /* simple prepend, not sorted */
+        }
+    }
+
+    return (int64_t)new_brk;
 }

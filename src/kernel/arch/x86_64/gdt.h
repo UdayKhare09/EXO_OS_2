@@ -57,3 +57,7 @@ typedef struct {
 void gdt_init(uint32_t cpu_id, uintptr_t kernel_stack_top);
 void gdt_load_tss(uint32_t cpu_id);
 tss_t *gdt_get_tss(uint32_t cpu_id);
+
+/* Update TSS RSP0 for the given CPU (called on every context switch
+ * so ring 3 → ring 0 transitions use the correct kernel stack). */
+void gdt_set_tss_rsp0(uint32_t cpu_id, uint64_t rsp0);

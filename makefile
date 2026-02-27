@@ -68,7 +68,8 @@ CFLAGS          :=                      \
     -Wall -Wextra                       \
     -Wno-unused-parameter               \
     -I$(SRC_DIR)                        \
-    -I$(BUILD_DIR)
+    -I$(BUILD_DIR)                      \
+    -MMD -MP
 
 ASFLAGS         := $(CFLAGS)
 NASMFLAGS       := -f elf64 -g
@@ -89,6 +90,11 @@ FONT_TOOL     := $(BUILD_DIR)/tools/gen_font
 FONT_TTF      := $(SRC_DIR)/gfx/3rdparty/font.ttf
 FONT_DATA_C   := $(BUILD_DIR)/gfx_font_data.c
 FONT_DATA_OBJ := $(BUILD_DIR)/obj/gfx_font_data.c.o
+
+# ── User-space Hello World binary (freestanding, no libc) ────────────────────
+HELLO_SRC     := tools/hello.c
+HELLO_BIN     := $(BUILD_DIR)/hello
+
 # Trampoline is special: built as flat binary then wrapped in an ELF object
 TRAMPOLINE_SRC  := $(ARCH_DIR)/trampoline.asm
 TRAMPOLINE_BIN  := $(BUILD_DIR)/obj/arch/x86_64/trampoline.bin
@@ -102,6 +108,9 @@ AS_OBJS   := $(patsubst $(SRC_DIR)/%.S,    $(BUILD_DIR)/obj/%.S.o,    $(AS_SRCS)
 NASM_OBJS := $(patsubst $(SRC_DIR)/%.asm,  $(BUILD_DIR)/obj/%.asm.o,  $(NASM_SRCS))
 
 ALL_OBJS := $(C_OBJS) $(AS_OBJS) $(NASM_OBJS) $(TRAMPOLINE_OBJ) $(FONT_DATA_OBJ)
+DEPS     := $(C_OBJS:.o=.d)
+
+-include $(DEPS)
 
 .PHONY: all clean run run-debug
 
@@ -134,6 +143,13 @@ $(FONT_DATA_C): $(FONT_TOOL) $(FONT_TTF)
 $(FONT_DATA_OBJ): $(FONT_DATA_C) $(BUILD_DIR)/limine.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+# ─── User-space Hello World binary (static, freestanding, no libc) ───────────
+$(HELLO_BIN): $(HELLO_SRC)
+	@echo ">>> Building user-space hello binary..."
+	clang --target=x86_64-unknown-linux-elf -nostdlib -nostdinc -static \
+	    -ffreestanding -fno-stack-protector -fno-PIC -O2 -o $@ $< \
+	    -Wl,-e,_start -Wl,--no-dynamic-linker
 
 # ─── Trampoline: flat binary → ELF object ────────────────────────────────────
 $(TRAMPOLINE_BIN): $(TRAMPOLINE_SRC)
@@ -175,7 +191,7 @@ $(EFI_IMG): $(KERNEL_ELF) $(LIMINE_DIR)/limine.h
 	@echo "    EFI partition ready ($(EFI_SECTORS) sectors)"
 
 # ─── Build root partition image (ext2 via mkfs.ext2 + debugfs — no root) ─────
-$(ROOT_IMG): $(KERNEL_ELF)
+$(ROOT_IMG): $(KERNEL_ELF) $(HELLO_BIN)
 	@echo ">>> Building root partition (ext2)..."
 	$(eval ROOT_SECTORS := $(shell echo $$(($(DISK_SIZE_MB) * 2048 - $(ROOT_START) - 33))))
 	dd if=/dev/zero of=$@ bs=512 count=$(ROOT_SECTORS) 2>/dev/null
@@ -187,6 +203,9 @@ $(ROOT_IMG): $(KERNEL_ELF)
 	debugfs -w -R "mkdir proc" $@ 2>/dev/null || true
 	debugfs -w -R "mkdir home" $@ 2>/dev/null || true
 	debugfs -w -R "mkdir etc"  $@ 2>/dev/null || true
+	debugfs -w -R "mkdir bin"  $@ 2>/dev/null || true
+	debugfs -w -R "write $(HELLO_BIN) home/hello" $@ 2>/dev/null || true
+	debugfs -w -R "write $(HELLO_BIN) bin/hello"  $@ 2>/dev/null || true
 	@echo "    root partition ready ($(ROOT_SECTORS) sectors)"
 
 # ─── Assemble full GPT disk image ────────────────────────────────────────────
