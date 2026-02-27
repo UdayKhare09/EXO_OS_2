@@ -124,6 +124,10 @@ static int64_t sc_dup(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uin
     { (void)b;(void)c;(void)d;(void)e;(void)f; return sys_dup((int)a); }
 static int64_t sc_dup2(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { (void)c;(void)d;(void)e;(void)f; return sys_dup2((int)a,(int)b); }
+static int64_t sc_sync(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; vfs_sync_all(); return 0; }
+    static int64_t sc_eventfd2(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+        { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; return -ENOSYS; }
 
 /* ── sys_exit: properly terminate the task ────────────────────────────────── */
 static int64_t sc_exit(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
@@ -954,6 +958,7 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_GETPGID]   = sc_getpgid,
     [SYS_GETSID]    = sc_getsid,
     [SYS_ARCH_PRCTL]= sc_arch_prctl,
+    [SYS_SYNC]      = sc_sync,
     [SYS_GETDENTS64]= sc_getdents64,
     [SYS_SET_TID_ADDRESS] = sc_set_tid_address,
     [SYS_SET_ROBUST_LIST] = sc_set_robust_list,
@@ -991,6 +996,7 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_FSTATAT]        = sc_fstatat,
     [SYS_FUTIMESAT]      = sc_futimesat,
     [SYS_UTIMENSAT]      = sc_utimensat,
+        [SYS_EVENTFD2]       = sc_eventfd2,
     [SYS_FACCESSAT]      = sc_faccessat,
 };
 

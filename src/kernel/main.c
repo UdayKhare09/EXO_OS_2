@@ -277,7 +277,6 @@ static void init_task(void *arg) {
         return;
     }
 
-    extern void cmd_exec_path(shell_t *sh, const char *path);
     for (;;) {
         if (con)
             fbcon_printf_inst(con, "\n  EXO_OS — launching %s\n\n", shell_path);

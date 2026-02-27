@@ -225,16 +225,27 @@ int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
     if (envc < 0) { kfree(argv_buf); kfree(envp_buf); return envc; }
 
     char kpath[VFS_MOUNT_PATH_MAX];
+    char exec_path[VFS_MOUNT_PATH_MAX];
     int prc = exec_copy_user_cstr(cur->cr3, path, kpath, sizeof(kpath), NULL);
     if (prc < 0) {
         kfree(argv_buf); kfree(envp_buf);
         return (prc == -ENAMETOOLONG) ? -ENAMETOOLONG : -EFAULT;
     }
 
+    if (kpath[0] == '/') {
+        prc = path_normalize(kpath, exec_path);
+    } else {
+        prc = path_join(cur->cwd, kpath, exec_path);
+    }
+    if (prc < 0) {
+        kfree(argv_buf); kfree(envp_buf);
+        return prc;
+    }
+
     /* Open the ELF file */
     int vfs_err = 0;
-    vnode_t *vn = vfs_lookup(kpath, true, &vfs_err);
-    if (!vn) { kfree(argv_buf); kfree(envp_buf); return vfs_err ? -vfs_err : -ENOENT; }
+    vnode_t *vn = vfs_lookup(exec_path, true, &vfs_err);
+    if (!vn) { kfree(argv_buf); kfree(envp_buf); return vfs_err ? vfs_err : -ENOENT; }
 
     /* Read ELF into a temporary kernel buffer */
     uint64_t size = vn->size;
@@ -430,7 +441,7 @@ int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
     /* Do not realign after pushing argc; [RSP] must point at argc. */
 
     KLOG_INFO("execve: '%s' entry=%p brk=%p argc=%d envc=%d sp=%p\n",
-              kpath, (void *)info.entry, (void *)info.brk_start, argc, envc, (void*)sp);
+              exec_path, (void *)info.entry, (void *)info.brk_start, argc, envc, (void*)sp);
 
     /* Jump to user-mode at the new entry point via user_mode_trampoline */
     extern void user_mode_trampoline(void);

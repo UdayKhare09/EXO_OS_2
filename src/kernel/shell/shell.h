@@ -40,20 +40,8 @@ void shell_register_cmd(const char *name, const char *help, shell_cmd_fn_t fn);
  * registrations are complete (before REPL loop). */
 void shell_sort_commands(void);
 
-/* Create a shell attached to an fbcon console */
-shell_t *shell_create(fbcon_t *con);
-
 /* Create a shell without printing the banner */
 shell_t *shell_create_quiet(fbcon_t *con);
 
 /* Launch a binary as a user process (blocks until it exits) */
 void cmd_exec_path(shell_t *sh, const char *path);
-
-/* Destroy shell */
-void shell_destroy(shell_t *sh);
-
-/* Feed one character (ASCII + \n + \b) from the keyboard */
-void shell_on_char_inst(shell_t *sh, char c);
-
-/* Get the fbcon attached to this shell */
-fbcon_t *shell_get_fbcon(shell_t *sh);

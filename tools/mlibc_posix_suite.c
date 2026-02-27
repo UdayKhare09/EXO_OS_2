@@ -11,8 +11,6 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-void *__dso_handle;
-
 static int failures = 0;
 
 #define CHECK(cond, msg) \

@@ -1,8 +1,6 @@
 #include <pthread.h>
 #include <stdio.h>
 
-void *__dso_handle;
-
 static void *thread_main(void *arg) {
     (void)arg;
     return (void *)0x1234;

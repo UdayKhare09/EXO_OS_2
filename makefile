@@ -111,38 +111,29 @@ USER_CC_FLAGS := \
     -ffreestanding -fno-stack-protector -fno-PIC -O2 \
     -Wl,-e,_start -Wl,--no-dynamic-linker
 
-# ── mlibc ─────────────────────────────────────────────────────────────────────
-MLIBC_REPO    := $(BUILD_DIR)/mlibc
-MLIBC_BUILD   := $(BUILD_DIR)/mlibc-build
-MLIBC_SYSROOT := $(BUILD_DIR)/sysroot
-MLIBC_CROSS   := src/mlibc-sysdeps/exo/exo-cross.ini
-MLIBC_SYSDEP  := src/mlibc-sysdeps/exo
+# ── musl userspace smoke binaries ────────────────────────────────────────────
+MUSL_DIR       ?= /usr/lib/musl
+MUSL_LIB_DIR   ?= $(MUSL_DIR)/lib
+MUSL_INC_DIR   ?= $(MUSL_DIR)/include
+MUSL_SMOKE_CC  ?= clang
 
-MLIBC_CC    ?= clang
-MLIBC_CXX   ?= clang++
-MLIBC_AR    ?= ar
-MLIBC_STRIP ?= strip
+LIBC_SMOKE_DIR  := $(BUILD_DIR)/musl-smoke
+LIBC_HELLO_BIN  := $(LIBC_SMOKE_DIR)/hello
+LIBC_PTH_BIN    := $(LIBC_SMOKE_DIR)/pthread_smoke
+LIBC_SUITE_BIN  := $(LIBC_SMOKE_DIR)/posix_suite
+LIBC_SMOKE_BINS := $(LIBC_HELLO_BIN) $(LIBC_PTH_BIN) $(LIBC_SUITE_BIN)
 
-MLIBC_SMOKE_DIR  := $(BUILD_DIR)/mlibc-smoke
-MLIBC_SMOKE_CC   ?= clang
-
-MLIBC_HELLO_BIN  := $(MLIBC_SMOKE_DIR)/hello
-MLIBC_PTH_BIN    := $(MLIBC_SMOKE_DIR)/pthread_smoke
-MLIBC_SUITE_BIN  := $(MLIBC_SMOKE_DIR)/posix_suite
-MLIBC_SMOKE_BINS := $(MLIBC_HELLO_BIN) $(MLIBC_PTH_BIN) $(MLIBC_SUITE_BIN)
-
-MLIBC_HELLO_SRC  := tools/mlibc_hello.c
-MLIBC_PTH_SRC    := tools/mlibc_pthread_smoke.c
-MLIBC_SUITE_SRC  := tools/mlibc_posix_suite.c
-
-# Stamp files track the stateful meson steps
-MLIBC_STAMP_CLONE     := $(BUILD_DIR)/.stamp-mlibc-clone
-MLIBC_STAMP_CONFIGURE := $(BUILD_DIR)/.stamp-mlibc-configure
-MLIBC_STAMP_INSTALL   := $(BUILD_DIR)/.stamp-mlibc-install
+LIBC_HELLO_SRC  := tools/mlibc_hello.c
+LIBC_PTH_SRC    := tools/mlibc_pthread_smoke.c
+LIBC_SUITE_SRC  := tools/mlibc_posix_suite.c
 
 # ── BusyBox (prebuilt upstream static binary) ─────────────────────────────────
 BUSYBOX_URL := https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox
-BUSYBOX_BIN := $(MLIBC_SMOKE_DIR)/busybox
+BUSYBOX_BIN := $(LIBC_SMOKE_DIR)/busybox
+
+# ── curl (prebuilt static binary) ─────────────────────────────────────────────
+CURL_URL := https://github.com/moparisthebest/static-curl/releases/latest/download/curl-amd64
+CURL_BIN := $(LIBC_SMOKE_DIR)/curl
 
 # ── rootfs config files ───────────────────────────────────────────────────────
 ROOTFS_PROFILE  := tools/rootfs/profile
@@ -168,7 +159,7 @@ QEMU_FLAGS := \
     -no-reboot
 
 .PHONY: all clean distclean run run-debug
-.PHONY: mlibc-clone mlibc-configure mlibc-build mlibc-install mlibc-smoke busybox-build
+.PHONY: check-musl libc-smoke busybox-build curl-build
 
 all: $(DISK_IMG)
 
@@ -231,60 +222,35 @@ $(KERNEL_ELF): $(ALL_OBJS)
 	@echo ">>> Linking kernel..."
 	$(LD) $(LDFLAGS) $^ -o $@
 
-# ── mlibc build chain ─────────────────────────────────────────────────────────
-$(MLIBC_STAMP_CLONE):
-	@if [ ! -d "$(MLIBC_REPO)" ]; then \
-		echo ">>> Cloning mlibc..."; \
-		git clone --depth=1 https://github.com/managarm/mlibc.git $(MLIBC_REPO); \
-	fi
-	@mkdir -p $(MLIBC_REPO)/sysdeps
-	@ln -sfn $(abspath $(MLIBC_SYSDEP)) $(MLIBC_REPO)/sysdeps/exo
-	@python3 tools/patch_mlibc_meson.py $(MLIBC_REPO)
-	@touch $@
+# ── musl smoke binaries ──────────────────────────────────────────────────────
+check-musl:
+	@test -f "$(MUSL_LIB_DIR)/crt1.o" || (echo "Missing musl CRT: $(MUSL_LIB_DIR)/crt1.o"; exit 1)
+	@test -f "$(MUSL_INC_DIR)/stdio.h" || (echo "Missing musl headers: $(MUSL_INC_DIR)/stdio.h"; exit 1)
 
-$(MLIBC_STAMP_CONFIGURE): $(MLIBC_STAMP_CLONE)
-	@echo ">>> Configuring mlibc..."
-	CC=$(MLIBC_CC) CXX=$(MLIBC_CXX) AR=$(MLIBC_AR) STRIP=$(MLIBC_STRIP) \
-	meson setup $(MLIBC_BUILD) $(MLIBC_REPO) \
-	    --cross-file $(abspath $(MLIBC_CROSS)) \
-	    -Dbuild_tests=false \
-	    -Dlinux_kernel_headers=disabled \
-	    -Ddefault_library=static \
-	    --prefix=/usr \
-	    --reconfigure
-	@touch $@
-
-$(MLIBC_STAMP_INSTALL): $(MLIBC_STAMP_CONFIGURE)
-	@echo ">>> Building and installing mlibc..."
-	ninja -C $(MLIBC_BUILD)
-	@mkdir -p $(MLIBC_SYSROOT)
-	DESTDIR=$(abspath $(MLIBC_SYSROOT)) ninja -C $(MLIBC_BUILD) install
-	@touch $@
-
-# Shared link recipe for mlibc smoke binaries.
-# Usage: $(call mlibc-link, OUTPUT, SOURCE, LIBS)
-define mlibc-link
-	$(MLIBC_SMOKE_CC) --sysroot=$(abspath $(MLIBC_SYSROOT)) \
+# Usage: $(call musl-link, OUTPUT, SOURCE, LIBS)
+define musl-link
+	$(MUSL_SMOKE_CC) --target=x86_64-linux-musl \
 	    -O2 -static -fno-stack-protector -nostdlib \
-	    $(abspath $(MLIBC_SYSROOT))/usr/lib/crt1.o \
-	    $(abspath $(MLIBC_SYSROOT))/usr/lib/crti.o \
+	    -isystem $(MUSL_INC_DIR) \
+	    $(MUSL_LIB_DIR)/crt1.o \
+	    $(MUSL_LIB_DIR)/crti.o \
 	    -o $(1) $(2) \
-	    -L$(abspath $(MLIBC_SYSROOT))/usr/lib \
+	    -L$(MUSL_LIB_DIR) \
 	    -Wl,--start-group $(3) -lgcc -Wl,--end-group \
-	    $(abspath $(MLIBC_SYSROOT))/usr/lib/crtn.o
+	    $(MUSL_LIB_DIR)/crtn.o
 endef
 
-$(MLIBC_HELLO_BIN): $(MLIBC_HELLO_SRC) $(MLIBC_STAMP_INSTALL)
+$(LIBC_HELLO_BIN): $(LIBC_HELLO_SRC) check-musl
 	@mkdir -p $(dir $@)
-	$(call mlibc-link,$@,$<,-lc)
+	$(call musl-link,$@,$<,-lc)
 
-$(MLIBC_PTH_BIN): $(MLIBC_PTH_SRC) $(MLIBC_STAMP_INSTALL)
+$(LIBC_PTH_BIN): $(LIBC_PTH_SRC) check-musl
 	@mkdir -p $(dir $@)
-	$(call mlibc-link,$@,$<,-lpthread -lc)
+	$(call musl-link,$@,$<,-lpthread -lc)
 
-$(MLIBC_SUITE_BIN): $(MLIBC_SUITE_SRC) $(MLIBC_STAMP_INSTALL)
+$(LIBC_SUITE_BIN): $(LIBC_SUITE_SRC) check-musl
 	@mkdir -p $(dir $@)
-	$(call mlibc-link,$@,$<,-lpthread -lc)
+	$(call musl-link,$@,$<,-lpthread -lc)
 
 $(BUSYBOX_BIN):
 	@echo ">>> Fetching BusyBox static binary..."
@@ -292,13 +258,15 @@ $(BUSYBOX_BIN):
 	curl -L --fail -o $@ $(BUSYBOX_URL)
 	@chmod +x $@
 
-# Phony aliases so manual `make mlibc-smoke` etc. still work
-mlibc-clone:     $(MLIBC_STAMP_CLONE)
-mlibc-configure: $(MLIBC_STAMP_CONFIGURE)
-mlibc-build:     $(MLIBC_STAMP_INSTALL)
-mlibc-install:   $(MLIBC_STAMP_INSTALL)
-mlibc-smoke:     $(MLIBC_SMOKE_BINS)
+$(CURL_BIN):
+	@echo ">>> Fetching curl static binary..."
+	@mkdir -p $(dir $@)
+	curl -L --fail -o $@ $(CURL_URL)
+	@chmod +x $@
+
+libc-smoke:      $(LIBC_SMOKE_BINS)
 busybox-build:   $(BUSYBOX_BIN)
+curl-build:      $(CURL_BIN)
 
 # ── EFI partition (FAT32, no root needed — mtools) ────────────────────────────
 $(EFI_IMG): $(KERNEL_ELF) $(LIMINE_DIR)/limine.h
@@ -312,7 +280,7 @@ $(EFI_IMG): $(KERNEL_ELF) $(LIMINE_DIR)/limine.h
 
 # ── Root partition (ext2, no root needed — debugfs) ───────────────────────────
 $(ROOT_IMG): $(HELLO_BIN) $(SYSCALL_TEST_BIN) \
-             $(MLIBC_SMOKE_BINS) $(BUSYBOX_BIN) \
+			 $(LIBC_SMOKE_BINS) $(BUSYBOX_BIN) $(CURL_BIN) \
              $(ROOTFS_PROFILE) $(ROOTFS_ENV_FILE)
 	@echo ">>> Building root partition (ext2)..."
 	$(eval ROOT_SECTORS := $(shell echo $$(($(DISK_SIZE_MB) * 2048 - $(ROOT_START) - 33))))
@@ -320,18 +288,19 @@ $(ROOT_IMG): $(HELLO_BIN) $(SYSCALL_TEST_BIN) \
 	mkfs.ext2 -q -L "EXOOS_ROOT" -b 4096 $@
 	$(foreach d, dev tmp boot proc sys sys/bus sys/bus/usb sys/bus/usb/devices sys/bus/pci sys/bus/pci/devices home etc bin usr usr/bin usr/sbin sbin var run, \
 	    debugfs -w -R "mkdir $(d)" $@ 2>/dev/null || true ;)
-	debugfs -w -R "write $(HELLO_BIN)           home/hello"        $@ 2>/dev/null
 	debugfs -w -R "write $(HELLO_BIN)           bin/hello"         $@ 2>/dev/null
+	debugfs -w -R "write $(HELLO_BIN)           home/hello"        $@ 2>/dev/null
 	debugfs -w -R "write $(SYSCALL_TEST_BIN)    bin/syscall_test"  $@ 2>/dev/null
-	debugfs -w -R "write $(SYSCALL_TEST_BIN)    home/syscall_test" $@ 2>/dev/null
-	debugfs -w -R "write $(MLIBC_HELLO_BIN)     bin/mlibc_hello"   $@ 2>/dev/null
-	debugfs -w -R "write $(MLIBC_PTH_BIN)       bin/pthread_smoke" $@ 2>/dev/null
-	debugfs -w -R "write $(MLIBC_SUITE_BIN)     bin/posix_suite"   $@ 2>/dev/null
+	debugfs -w -R "write $(SYSCALL_TEST_BIN)    home/syscall_test"  $@ 2>/dev/null
+	debugfs -w -R "write $(LIBC_HELLO_BIN)      bin/mlibc_hello"   $@ 2>/dev/null
+	debugfs -w -R "write $(LIBC_HELLO_BIN)      home/mlibc_hello"   $@ 2>/dev/null
+	debugfs -w -R "write $(LIBC_PTH_BIN)        bin/pthread_smoke" $@ 2>/dev/null
+	debugfs -w -R "write $(LIBC_PTH_BIN)        home/pthread_smoke" $@ 2>/dev/null
+	debugfs -w -R "write $(LIBC_SUITE_BIN)      bin/posix_suite"   $@ 2>/dev/null
+	debugfs -w -R "write $(LIBC_SUITE_BIN)      home/posix_suite"   $@ 2>/dev/null
 	debugfs -w -R "write $(BUSYBOX_BIN)         bin/busybox"       $@ 2>/dev/null
-	debugfs -w -R "write $(BUSYBOX_BIN)         bin/ls"            $@ 2>/dev/null
-	debugfs -w -R "write $(BUSYBOX_BIN)         bin/rm"            $@ 2>/dev/null
-	debugfs -w -R "write $(BUSYBOX_BIN)         bin/mkdir"         $@ 2>/dev/null
 	debugfs -w -R "write $(BUSYBOX_BIN)         bin/sh"            $@ 2>/dev/null
+	debugfs -w -R "write $(CURL_BIN)            bin/curl"          $@ 2>/dev/null
 	debugfs -w -R "write $(ROOTFS_PROFILE)      etc/profile"       $@ 2>/dev/null
 	debugfs -w -R "write $(ROOTFS_ENV_FILE)     etc/environment"   $@ 2>/dev/null
 
@@ -362,7 +331,8 @@ clean:
 	rm -rf $(BUILD_DIR)/obj $(KERNEL_ELF) $(DISK_IMG) \
 	       $(EFI_IMG) $(ROOT_IMG) $(BUILD_DIR)/limine.h \
 	       $(FONT_DATA_C) $(FONT_DATA_OBJ) $(OVMF_VARS) \
-	       $(MLIBC_BUILD) $(MLIBC_SYSROOT) $(MLIBC_SMOKE_DIR) \
+	       $(LIBC_SMOKE_DIR) \
+	       $(BUILD_DIR)/mlibc $(BUILD_DIR)/mlibc-build $(BUILD_DIR)/sysroot \
 	       $(BUILD_DIR)/.stamp-mlibc-*
 
 distclean:

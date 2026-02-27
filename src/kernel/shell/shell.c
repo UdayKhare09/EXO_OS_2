@@ -94,9 +94,7 @@ static shell_cmd_t *shell_find_cmd(const char *name) {
 }
 
 /* ── exec: launch an ELF binary as a user-space process ──────────────────── */
-void cmd_exec_path(shell_t *sh, const char *path);  /* forward decl */
-
-static void cmd_exec(shell_t *sh, const char *args) {
+void cmd_exec_path(shell_t *sh, const char *args) {
     fbcon_t *c = sh->con;
     if (!args || !*args) {
         fbcon_puts_inst(c, "  usage: exec <path>\n");
@@ -237,7 +235,7 @@ static void cmd_exec(shell_t *sh, const char *args) {
         "LOGNAME=root",
         env_pwd,
         "TMPDIR=/tmp",
-        "PS1=# ",
+        "PS1=uday# ",
     };
     uintptr_t env_addrs[sizeof(env_list) / sizeof(env_list[0])] = {0};
     int env_count = 0;
@@ -348,11 +346,6 @@ static void cmd_exec(shell_t *sh, const char *args) {
             task_destroy(ct);
         }
     }
-}
-
-/* ── Public API: launch a binary by path (used by init_task in main.c) ── */
-void cmd_exec_path(shell_t *sh, const char *path) {
-    cmd_exec(sh, path);
 }
 
 /* ── Command dispatcher ───────────────────────────────────────────────────── */
