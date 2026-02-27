@@ -217,6 +217,7 @@ int64_t sys_lstat(const char *upath, linux_stat_t *buf) {
 int64_t sys_lseek(int fd, int64_t off, int whence) {
     file_t *f = fd_get(cur_task(), fd);
     if (!f) return -EBADF;
+    if (!f->vnode) return -ESPIPE;  /* pipes/sockets are not seekable */
     if (VFS_S_ISDIR(f->vnode->mode)) return -EISDIR;
 
     int64_t new_off;

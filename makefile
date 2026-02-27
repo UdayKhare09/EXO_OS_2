@@ -95,6 +95,10 @@ FONT_DATA_OBJ := $(BUILD_DIR)/obj/gfx_font_data.c.o
 HELLO_SRC     := tools/hello.c
 HELLO_BIN     := $(BUILD_DIR)/hello
 
+# ── User-space syscall test binary ───────────────────────────────────────────
+SYSCALL_TEST_SRC := tools/syscall_test.c
+SYSCALL_TEST_BIN := $(BUILD_DIR)/syscall_test
+
 # Trampoline is special: built as flat binary then wrapped in an ELF object
 TRAMPOLINE_SRC  := $(ARCH_DIR)/trampoline.asm
 TRAMPOLINE_BIN  := $(BUILD_DIR)/obj/arch/x86_64/trampoline.bin
@@ -151,6 +155,13 @@ $(HELLO_BIN): $(HELLO_SRC)
 	    -ffreestanding -fno-stack-protector -fno-PIC -O2 -o $@ $< \
 	    -Wl,-e,_start -Wl,--no-dynamic-linker
 
+# ─── User-space syscall test binary ──────────────────────────────────────────
+$(SYSCALL_TEST_BIN): $(SYSCALL_TEST_SRC)
+	@echo ">>> Building syscall_test binary..."
+	clang --target=x86_64-unknown-linux-elf -nostdlib -nostdinc -static \
+	    -ffreestanding -fno-stack-protector -fno-PIC -O2 -o $@ $< \
+	    -Wl,-e,_start -Wl,--no-dynamic-linker
+
 # ─── Trampoline: flat binary → ELF object ────────────────────────────────────
 $(TRAMPOLINE_BIN): $(TRAMPOLINE_SRC)
 	@mkdir -p $(dir $@)
@@ -191,7 +202,7 @@ $(EFI_IMG): $(KERNEL_ELF) $(LIMINE_DIR)/limine.h
 	@echo "    EFI partition ready ($(EFI_SECTORS) sectors)"
 
 # ─── Build root partition image (ext2 via mkfs.ext2 + debugfs — no root) ─────
-$(ROOT_IMG): $(KERNEL_ELF) $(HELLO_BIN)
+$(ROOT_IMG): $(KERNEL_ELF) $(HELLO_BIN) $(SYSCALL_TEST_BIN)
 	@echo ">>> Building root partition (ext2)..."
 	$(eval ROOT_SECTORS := $(shell echo $$(($(DISK_SIZE_MB) * 2048 - $(ROOT_START) - 33))))
 	dd if=/dev/zero of=$@ bs=512 count=$(ROOT_SECTORS) 2>/dev/null
@@ -204,8 +215,10 @@ $(ROOT_IMG): $(KERNEL_ELF) $(HELLO_BIN)
 	debugfs -w -R "mkdir home" $@ 2>/dev/null || true
 	debugfs -w -R "mkdir etc"  $@ 2>/dev/null || true
 	debugfs -w -R "mkdir bin"  $@ 2>/dev/null || true
-	debugfs -w -R "write $(HELLO_BIN) home/hello" $@ 2>/dev/null || true
-	debugfs -w -R "write $(HELLO_BIN) bin/hello"  $@ 2>/dev/null || true
+	debugfs -w -R "write $(HELLO_BIN) home/hello"             $@ 2>/dev/null || true
+	debugfs -w -R "write $(HELLO_BIN) bin/hello"              $@ 2>/dev/null || true
+	debugfs -w -R "write $(SYSCALL_TEST_BIN) bin/syscall_test" $@ 2>/dev/null || true
+	debugfs -w -R "write $(SYSCALL_TEST_BIN) home/syscall_test" $@ 2>/dev/null || true
 	@echo "    root partition ready ($(ROOT_SECTORS) sectors)"
 
 # ─── Assemble full GPT disk image ────────────────────────────────────────────

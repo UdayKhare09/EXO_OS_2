@@ -103,6 +103,14 @@ uintptr_t pmm_alloc_pages(size_t count) {
 
 void pmm_free_pages(uintptr_t phys, size_t count) {
     uint64_t start = phys / PAGE_SIZE;
+    if (start + count > bitmap_pages) {
+        KLOG_WARN("PMM: pmm_free_pages: phys=0x%lx count=%zu out of bounds "
+                  "(start_page=%llu bitmap_pages=%llu) — double-free or bad PTE?\n",
+                  (unsigned long)phys, count,
+                  (unsigned long long)start,
+                  (unsigned long long)bitmap_pages);
+        return;
+    }
     for (size_t i = 0; i < count; i++) {
         if (bitmap_test(start + i)) {
             bitmap_clear(start + i);
@@ -118,3 +126,9 @@ void pmm_print_stats(void) {
 
 uint64_t pmm_get_total_pages(void) { return usable_pages; }
 uint64_t pmm_get_free_pages(void)  { return free_pages; }
+
+int pmm_phys_valid(uintptr_t phys, size_t count) {
+    if (!bitmap || count == 0) return 0;
+    uint64_t start = phys / PAGE_SIZE;
+    return (start + count <= bitmap_pages) ? 1 : 0;
+}

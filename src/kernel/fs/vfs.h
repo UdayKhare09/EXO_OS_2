@@ -181,7 +181,7 @@ struct fs_inst {
 };
 
 /* ── Mount table entry ───────────────────────────────────────────────────── */
-#define VFS_MOUNT_PATH_MAX 256
+#define VFS_MOUNT_PATH_MAX 512
 #define VFS_MAX_MOUNTS     16
 
 struct mount {
@@ -228,6 +228,7 @@ struct mount {
 #define EINVAL  22
 #define EMFILE  24
 #define ENOSPC  28
+#define ESPIPE  29
 #define EPIPE   32
 #define ERANGE  34
 #define EDEADLK 35

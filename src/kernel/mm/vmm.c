@@ -5,6 +5,7 @@
 #include "lib/panic.h"
 #include "sched/task.h"
 #include <stdint.h>
+#include <stddef.h>
 
 static uint64_t  hhdm_off     = 0;
 static uintptr_t kernel_pml4  = 0;   /* physical address of kernel PML4 */
@@ -133,8 +134,22 @@ static void free_pt_level(uintptr_t table_phys, int level) {
         uintptr_t child_phys = table[i] & VMM_PTE_ADDR_MASK;
 
         if (level == 1) {
-            /* Level 1 = PT: entries are leaf pages. Free the mapped page. */
+            /* Level 1 = PT: entries are leaf 4 KiB pages.
+             * Validate physical address before freeing — a corrupt or stale
+             * PTE might contain garbage that would trip the PMM bounds check. */
+            if (!pmm_phys_valid(child_phys, 1)) {
+                KLOG_WARN("VMM: free_pt_level: skipping bad leaf PTE phys=0x%lx\n",
+                          (unsigned long)child_phys);
+                continue;
+            }
             pmm_free_pages(child_phys, 1);
+        } else if (table[i] & VMM_HUGE) {
+            /* Huge page leaf — do NOT recurse: child_phys is a data page,
+             * not a page table.  Free the underlying pages directly.
+             *   level 2 (PD)   → 2 MiB = 512 × 4 KiB pages
+             *   level 3 (PDPT) → 1 GiB = 512 × 512 × 4 KiB pages        */
+            size_t npages = (level == 2) ? 512 : (512 * 512);
+            pmm_free_pages(child_phys, npages);
         } else {
             /* Recurse into PDPT (3) → PD (2) → PT (1) */
             free_pt_level(child_phys, level - 1);
@@ -225,6 +240,12 @@ static uintptr_t clone_pd(uintptr_t src_pd_phys) {
 
     for (int i = 0; i < 512; i++) {
         if (!(src[i] & VMM_PRESENT)) { dst[i] = 0; continue; }
+        if (src[i] & VMM_HUGE) {
+            /* 2 MiB huge page leaf — mark COW in both src and clone */
+            src[i] = (src[i] & ~VMM_WRITE) | VMM_COW;
+            dst[i] = src[i];
+            continue;
+        }
         uintptr_t child = clone_pt(src[i] & VMM_PTE_ADDR_MASK);
         if (!child) return 0; /* OOM — caller should handle cleanup */
         /* Preserve hierarchy flags (PRESENT|WRITE|USER) */
@@ -244,6 +265,12 @@ static uintptr_t clone_pdpt(uintptr_t src_pdpt_phys) {
 
     for (int i = 0; i < 512; i++) {
         if (!(src[i] & VMM_PRESENT)) { dst[i] = 0; continue; }
+        if (src[i] & VMM_HUGE) {
+            /* 1 GiB huge page leaf — mark COW in both src and clone */
+            src[i] = (src[i] & ~VMM_WRITE) | VMM_COW;
+            dst[i] = src[i];
+            continue;
+        }
         uintptr_t child = clone_pd(src[i] & VMM_PTE_ADDR_MASK);
         if (!child) return 0;
         dst[i] = child | (src[i] & ~VMM_PTE_ADDR_MASK);

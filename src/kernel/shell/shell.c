@@ -900,11 +900,31 @@ static void cmd_exec(shell_t *sh, const char *args) {
         fbcon_puts_inst(c, "  exec: warning: could not open /dev/tty for stdio\n");
     }
 
+    /* Set shell as parent so child becomes ZOMBIE (not immediately freed) on exit */
+    t->parent = sched_current();
+    uint32_t child_tid = t->tid;
+
     /* Schedule the task */
     sched_add_task(t, cpu);
 
-    // fbcon_printf_inst(c, "  exec: launched '%s' (tid=%u, entry=%p)\n",
-    //                  fullpath, t->tid, (void *)info.entry);
+    /* Wait for child to exit — poll every 10 ms.
+     * Because t->parent is set, the child transitions to TASK_ZOMBIE on exit
+     * and stays in the task table until we reap it here. */
+    {
+        task_t *ct;
+        for (;;) {
+            ct = task_lookup(child_tid);
+            if (!ct || ct->state == TASK_ZOMBIE || ct->state == TASK_DEAD)
+                break;
+            sched_sleep(10);
+        }
+        /* Reap the zombie so its slot is freed */
+        ct = task_lookup(child_tid);
+        if (ct && ct->state == TASK_ZOMBIE) {
+            ct->parent = NULL;
+            task_destroy(ct);
+        }
+    }
 }
 
 /* ── Register all built-in commands ───────────────────────────────────────── */

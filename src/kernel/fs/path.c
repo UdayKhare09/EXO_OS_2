@@ -8,45 +8,52 @@
  * Returns 0 on success, -EINVAL if path is not absolute or result overflows.
  */
 int path_normalize(const char *in, char *out) {
-    if (!in || in[0] != '/') return -EINVAL;
+    if (!in || !out || in[0] != '/') return -EINVAL;
 
-    /* Use a temporary stack of components */
-    char  parts[VFS_MOUNT_PATH_MAX][VFS_NAME_MAX + 1];
-    int   depth = 0;
+    /* Build normalized output in-place to avoid large stack buffers. */
+    size_t out_len = 1;
+    out[0] = '/';
+    out[1] = '\0';
 
-    const char *p = in + 1;
+    const char *p = in;
     while (*p) {
         while (*p == '/') p++;
         if (!*p) break;
 
-        /* Extract component */
-        char comp[VFS_NAME_MAX + 1];
-        int  clen = 0;
-        while (*p && *p != '/' && clen < VFS_NAME_MAX)
-            comp[clen++] = *p++;
-        comp[clen] = '\0';
+        const char *comp = p;
+        size_t clen = 0;
+        while (*p && *p != '/') {
+            p++;
+            clen++;
+        }
 
-        if (strcmp(comp, ".") == 0) continue;
-        if (strcmp(comp, "..") == 0) {
-            if (depth > 0) depth--;
+        /* Reject overlong components instead of truncating/splitting them. */
+        if (clen > VFS_NAME_MAX) return -EINVAL;
+
+        if (clen == 1 && comp[0] == '.') {
             continue;
         }
-        if (depth < VFS_MOUNT_PATH_MAX) {
-            strncpy(parts[depth], comp, VFS_NAME_MAX);
-            depth++;
+        if (clen == 2 && comp[0] == '.' && comp[1] == '.') {
+            if (out_len > 1) {
+                while (out_len > 1 && out[out_len - 1] != '/')
+                    out_len--;
+                if (out_len > 1) out_len--;
+                out[out_len] = '\0';
+            }
+            continue;
         }
+
+        /* Append "/component" (without duplicate leading slash at root). */
+        if (out_len > 1) {
+            if (out_len + 1 >= VFS_MOUNT_PATH_MAX) return -EINVAL;
+            out[out_len++] = '/';
+        }
+        if (out_len + clen >= VFS_MOUNT_PATH_MAX) return -EINVAL;
+        memcpy(out + out_len, comp, clen);
+        out_len += clen;
+        out[out_len] = '\0';
     }
 
-    /* Reassemble */
-    char *o = out;
-    char *end = out + VFS_MOUNT_PATH_MAX - 1;
-    *o++ = '/';
-    for (int i = 0; i < depth; i++) {
-        const char *s = parts[i];
-        while (*s && o < end) *o++ = *s++;
-        if (i + 1 < depth && o < end) *o++ = '/';
-    }
-    *o = '\0';
     return 0;
 }
 

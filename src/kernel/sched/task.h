@@ -7,10 +7,10 @@
 /* Forward-declare file_t to avoid circular include (fs/fd.h includes sched/task.h) */
 struct file;
 
-#define TASK_STACK_SIZE   (PAGE_SIZE * 4)   /* 16 KiB default stack */
+#define TASK_STACK_SIZE   (PAGE_SIZE * 8)   /* 32 KiB default stack */
 #define TASK_NAME_MAX     32
 #define TASK_FD_TABLE_SIZE 256
-#define TASK_CWD_MAX      256
+#define TASK_CWD_MAX      512
 
 typedef enum {
     TASK_RUNNABLE  = 0,

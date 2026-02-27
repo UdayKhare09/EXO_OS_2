@@ -237,11 +237,36 @@ int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
         return -EIO;
     }
 
-    /* Parse ELF and load segments */
+    /* Create a FRESH address space for the new image.
+     * This ensures no stale mappings from the old process image survive. */
+    uintptr_t old_cr3 = cur->cr3;
+    uintptr_t new_cr3 = vmm_create_address_space();
+    if (!new_cr3) {
+        kfree(buf); kfree(argv_buf); kfree(envp_buf);
+        return -ENOMEM;
+    }
+
+    /* Parse ELF and load segments into the new address space */
     elf_info_t info;
-    int r = elf_load(buf, size, cur->cr3, &info);
+    int r = elf_load(buf, size, new_cr3, &info);
     kfree(buf);
-    if (r < 0) { kfree(argv_buf); kfree(envp_buf); return r; }
+    if (r < 0) {
+        vmm_destroy_address_space(new_cr3);
+        kfree(argv_buf); kfree(envp_buf);
+        return r;
+    }
+
+    /* Switch the task to the new address space and activate it in hardware.
+     * Do this before destroying the old one so we always run with a valid CR3. */
+    cur->cr3 = new_cr3;
+    __asm__ volatile("mov %0, %%cr3" : : "r"(new_cr3) : "memory");
+
+    /* Now safe to tear down the old address space (we are no longer using it) */
+    if (old_cr3 && old_cr3 != vmm_get_kernel_pml4())
+        vmm_destroy_address_space(old_cr3);
+
+    /* Reset mmap bump pointer */
+    cur->mmap_next = USER_MMAP_BASE;
 
     /* Close FD_CLOEXEC fds */
     fd_close_cloexec(cur);

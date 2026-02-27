@@ -43,4 +43,5 @@ void pmm_free_pages(uintptr_t phys, size_t count);
 /* Statistics */
 void     pmm_print_stats(void);
 uint64_t pmm_get_total_pages(void);
-uint64_t pmm_get_free_pages(void);
+uint64_t pmm_get_free_pages(void);/* Returns non-zero if [phys, phys+count*PAGE_SIZE) is within the tracked range */
+int pmm_phys_valid(uintptr_t phys, size_t count);

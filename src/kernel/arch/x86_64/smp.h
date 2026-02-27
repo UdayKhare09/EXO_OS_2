@@ -3,7 +3,7 @@
 #include <stdbool.h>
 
 #define MAX_CPUS     256
-#define CPU_STACK_SIZE  (4096 * 4)   /* 16 KiB per CPU kernel stack */
+#define CPU_STACK_SIZE  (4096 * 8)   /* 32 KiB per CPU kernel stack */
 
 /* Per-CPU structure — stored in GS base */
 typedef struct cpu_info {

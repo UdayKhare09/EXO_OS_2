@@ -244,8 +244,11 @@ static int64_t sc_writev(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,
 
 static int64_t sc_access(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
     (void)b;(void)c;(void)d;(void)e;(void)f;
-    /* Simplified: just check if file exists via stat */
-    return sys_stat((const char *)a, NULL) < 0 ? -EACCES : 0;
+    /* Check existence (F_OK) by stat-ing the path.
+     * Pass a real buffer — sys_stat returns -EINVAL for NULL buf. */
+    linux_stat_t st;
+    int r = sys_stat((const char *)a, &st);
+    return (r < 0) ? r : 0;
 }
 
 static int64_t sc_exit_group(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
