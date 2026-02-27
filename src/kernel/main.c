@@ -417,11 +417,7 @@ void kmain(void) {
     /* ── 10. SMP: bring up AP cores ───────────────────────────────────────── */
     smp_init();
 
-    /* ── 11. Spawn tasks ──────────────────────────────────────────────────── */
-    /* Register all built-in shell commands before spawning the shell */
-    extern void shell_register_builtins(void);
-    shell_register_builtins();
-    shell_sort_commands();
+
 
     sched_spawn("init",         init_task,         NULL);
     sched_spawn("usb-init",     usb_init_task,     NULL);
