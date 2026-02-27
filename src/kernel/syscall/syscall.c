@@ -44,6 +44,7 @@ int64_t sys_readlinkat(int dirfd, const char *path, char *buf, uint64_t bufsiz);
 int64_t sys_renameat(int olddirfd, const char *old_path, int newdirfd, const char *new_path);
 int64_t sys_faccessat(int dirfd, const char *path, int mode, int flags);
 int64_t sys_symlinkat(const char *target, int newdirfd, const char *linkpath);
+int64_t sys_utimensat(int dirfd, const char *upath, const kernel_timespec_t times[2], int flags);
 int64_t sys_dup(int old_fd);
 int64_t sys_dup2(int old_fd, int new_fd);
 int64_t sys_getcwd(char *buf, uint64_t size);
@@ -343,6 +344,22 @@ typedef struct {
     kernel_timeval_t it_value;
 } kernel_itimerval_t;
 
+#define ITIMER_REAL 0
+
+static uint64_t timeval_to_ms(const kernel_timeval_t *tv) {
+    if (!tv) return 0;
+    if (tv->tv_sec < 0 || tv->tv_usec < 0 || tv->tv_usec >= 1000000LL) return 0;
+    uint64_t ms = (uint64_t)tv->tv_sec * 1000ULL + (uint64_t)(tv->tv_usec / 1000ULL);
+    if (ms == 0 && (tv->tv_sec > 0 || tv->tv_usec > 0)) ms = 1;
+    return ms;
+}
+
+static void ms_to_timeval(uint64_t ms, kernel_timeval_t *tv) {
+    if (!tv) return;
+    tv->tv_sec = (int64_t)(ms / 1000ULL);
+    tv->tv_usec = (int64_t)((ms % 1000ULL) * 1000ULL);
+}
+
 typedef struct {
     int64_t tms_utime;
     int64_t tms_stime;
@@ -382,31 +399,80 @@ static int64_t sc_nanosleep(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t
 }
 
 static int64_t sc_getitimer(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
-    (void)a;(void)c;(void)d;(void)e;(void)f;
+    (void)c;(void)d;(void)e;(void)f;
+    if ((int)a != ITIMER_REAL) return -EINVAL;
     kernel_itimerval_t *curr = (kernel_itimerval_t *)b;
     if (!curr) return -EFAULT;
-    curr->it_interval.tv_sec = 0;
-    curr->it_interval.tv_usec = 0;
-    curr->it_value.tv_sec = 0;
-    curr->it_value.tv_usec = 0;
+
+    task_t *cur = sched_current();
+    if (!cur) return -ESRCH;
+
+    uint64_t now = sched_get_ticks();
+    uint64_t deadline = __atomic_load_n(&cur->itimer_real_deadline, __ATOMIC_RELAXED);
+    uint64_t interval = __atomic_load_n(&cur->itimer_real_interval, __ATOMIC_RELAXED);
+    uint64_t remain = (deadline > now) ? (deadline - now) : 0;
+
+    ms_to_timeval(interval, &curr->it_interval);
+    ms_to_timeval(remain, &curr->it_value);
     return 0;
 }
 
 static int64_t sc_setitimer(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
-    (void)a;(void)b;(void)d;(void)e;(void)f;
+    (void)d;(void)e;(void)f;
+    if ((int)a != ITIMER_REAL) return -EINVAL;
+    const kernel_itimerval_t *newv = (const kernel_itimerval_t *)b;
     kernel_itimerval_t *oldv = (kernel_itimerval_t *)c;
+
+    task_t *cur = sched_current();
+    if (!cur) return -ESRCH;
+
+    uint64_t now = sched_get_ticks();
+    uint64_t old_deadline = __atomic_load_n(&cur->itimer_real_deadline, __ATOMIC_RELAXED);
+    uint64_t old_interval = __atomic_load_n(&cur->itimer_real_interval, __ATOMIC_RELAXED);
+
     if (oldv) {
-        oldv->it_interval.tv_sec = 0;
-        oldv->it_interval.tv_usec = 0;
-        oldv->it_value.tv_sec = 0;
-        oldv->it_value.tv_usec = 0;
+        uint64_t old_remain = (old_deadline > now) ? (old_deadline - now) : 0;
+        ms_to_timeval(old_interval, &oldv->it_interval);
+        ms_to_timeval(old_remain, &oldv->it_value);
     }
+
+    if (!newv) return 0;
+
+    if (newv->it_value.tv_sec < 0 || newv->it_value.tv_usec < 0 || newv->it_value.tv_usec >= 1000000LL)
+        return -EINVAL;
+    if (newv->it_interval.tv_sec < 0 || newv->it_interval.tv_usec < 0 || newv->it_interval.tv_usec >= 1000000LL)
+        return -EINVAL;
+
+    uint64_t value_ms = timeval_to_ms(&newv->it_value);
+    uint64_t interval_ms = timeval_to_ms(&newv->it_interval);
+
+    __atomic_store_n(&cur->itimer_real_interval, interval_ms, __ATOMIC_RELAXED);
+    if (value_ms == 0)
+        __atomic_store_n(&cur->itimer_real_deadline, 0, __ATOMIC_RELAXED);
+    else
+        __atomic_store_n(&cur->itimer_real_deadline, now + value_ms, __ATOMIC_RELAXED);
+
     return 0;
 }
 
 static int64_t sc_alarm(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
-    (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;
-    return 0;
+    (void)b;(void)c;(void)d;(void)e;(void)f;
+    task_t *cur = sched_current();
+    if (!cur) return -ESRCH;
+
+    uint64_t now = sched_get_ticks();
+    uint64_t old_deadline = __atomic_load_n(&cur->itimer_real_deadline, __ATOMIC_RELAXED);
+    uint64_t old_remain_ms = (old_deadline > now) ? (old_deadline - now) : 0;
+    uint64_t old_remain_sec = (old_remain_ms + 999ULL) / 1000ULL;
+
+    uint64_t sec = a;
+    __atomic_store_n(&cur->itimer_real_interval, 0, __ATOMIC_RELAXED);
+    if (sec == 0)
+        __atomic_store_n(&cur->itimer_real_deadline, 0, __ATOMIC_RELAXED);
+    else
+        __atomic_store_n(&cur->itimer_real_deadline, now + sec * 1000ULL, __ATOMIC_RELAXED);
+
+    return (int64_t)old_remain_sec;
 }
 
 static int64_t sc_clock_nanosleep(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
@@ -816,6 +882,16 @@ static int64_t sc_fstatat(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e
     return sys_fstatat((int)a, (const char *)b, (linux_stat_t *)c, (int)d);
 }
 
+static int64_t sc_utimensat(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)e;(void)f;
+    return sys_utimensat((int)a, (const char *)b, (const kernel_timespec_t *)c, (int)d);
+}
+
+static int64_t sc_futimesat(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)c;(void)d;(void)e;(void)f;
+    return sys_utimensat((int)a, (const char *)b, NULL, 0);
+}
+
 /* Sparse dispatch table indexed by syscall number */
 #define SYSCALL_TABLE_SIZE 512
 static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
@@ -913,6 +989,8 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_READLINKAT]     = sc_readlinkat,
     [SYS_FCNTL]          = sc_fcntl,
     [SYS_FSTATAT]        = sc_fstatat,
+    [SYS_FUTIMESAT]      = sc_futimesat,
+    [SYS_UTIMENSAT]      = sc_utimensat,
     [SYS_FACCESSAT]      = sc_faccessat,
 };
 

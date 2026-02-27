@@ -62,6 +62,7 @@
 #include "drivers/bus/smbus.h"
 #include "drivers/devfs.h"
 #include "fs/procfs.h"
+#include "fs/sysfs.h"
 #include "fs/gpt.h"
 #include "syscall/syscall.h"
 
@@ -350,8 +351,10 @@ void kmain(void) {
     vfs_mkdir("/tmp",  01777);
     vfs_mkdir("/boot", 0755);
     vfs_mkdir("/proc", 0555);
+    vfs_mkdir("/sys",  0555);
     devfs_init();
     procfs_init();
+    sysfs_init();
     syscall_init();
 
     /* ── 5c. Input event subsystem ────────────────────────────────────────── */

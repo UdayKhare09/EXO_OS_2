@@ -11,6 +11,7 @@
 #include "net/netutil.h"
 #include "fs/fd.h"
 #include "sched/sched.h"
+#include "sched/task.h"
 #include "lib/klog.h"
 #include "lib/string.h"
 #include "mm/kmalloc.h"
@@ -19,6 +20,13 @@
 static socket_proto_ops_t tcp_proto_ops;
 static socket_proto_ops_t udp_proto_ops;
 static socket_proto_ops_t raw_icmp_proto_ops;
+
+static inline int socket_has_unmasked_signal_pending(void) {
+    task_t *cur = sched_current();
+    if (!cur) return 0;
+    uint32_t pending = __atomic_load_n(&cur->sig_pending, __ATOMIC_RELAXED);
+    return (pending & ~cur->sig_mask) != 0;
+}
 
 #define RAW_ICMP_MAX_SOCKS 32
 static socket_t *g_raw_icmp_socks[RAW_ICMP_MAX_SOCKS];
@@ -635,8 +643,10 @@ static ssize_t udp_sock_recvfrom(socket_t *sk, void *buf, size_t len,
 
     /* wait for a datagram */
     while (skb_queue_empty(&sk->rx_queue)) {
+        if (socket_has_unmasked_signal_pending()) return -2; /* EINTR */
         if (sk->nonblock) return -1; /* EAGAIN */
         waitq_wait(&sk->wq_rx);
+        if (socket_has_unmasked_signal_pending()) return -2; /* EINTR */
     }
 
     skbuff_t *skb = skb_queue_pop(&sk->rx_queue);
@@ -770,8 +780,10 @@ static ssize_t raw_icmp_sock_recvfrom(socket_t *sk, void *buf, size_t len,
 {
     (void)flags;
     while (skb_queue_empty(&sk->rx_queue)) {
+        if (socket_has_unmasked_signal_pending()) return -2; /* EINTR */
         if (sk->nonblock) return -1;
         waitq_wait(&sk->wq_rx);
+        if (socket_has_unmasked_signal_pending()) return -2; /* EINTR */
     }
 
     skbuff_t *skb = skb_queue_pop(&sk->rx_queue);

@@ -192,6 +192,12 @@ struct mount {
     bool       active;
 };
 
+typedef struct {
+    char path[VFS_MOUNT_PATH_MAX];
+    char fs_name[16];
+    char dev_name[32];
+} vfs_mount_info_t;
+
 /* ── Registered filesystem types ─────────────────────────────────────────── */
 #define VFS_MAX_FS_TYPES  8
 
@@ -299,6 +305,10 @@ int vfs_truncate(const char *path, uint64_t size);
 
 /* Sync all mounted filesystems. */
 void vfs_sync_all(void);
+
+/* Enumerate active mounts into buf. Returns number of mounts written.
+ * If max_count is 0, returns the total number of active mounts. */
+int vfs_snapshot_mounts(vfs_mount_info_t *buf, int max_count);
 
 /* Allocate a new vnode (zero-initialised). Returns NULL on OOM. */
 vnode_t *vfs_alloc_vnode(void);

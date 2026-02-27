@@ -2,6 +2,10 @@
 #include "input.h"
 #include "lib/klog.h"
 #include "arch/x86_64/cpu.h"   /* cpu_mfence */
+#include "ipc/signal.h"
+
+/* Defined in syscall/net_syscalls.c */
+extern void tty_signal_foreground(int sig);
 
 input_ring_t g_kbd_ring;
 input_ring_t g_mouse_ring;
@@ -18,6 +22,30 @@ static inline void tty_char_push(char ch) {
     g_tty_chars[h] = ch;
     cpu_mfence();
     g_tty_head = next;
+}
+
+static inline void tty_seq_push(const char *s) {
+    if (!s) return;
+    while (*s) tty_char_push(*s++);
+}
+
+/* modifier byte bits: ctrl={0,4}, shift={1,5}, alt={2,6} */
+#define MOD_CTRL   ((1 << 0) | (1 << 4))
+#define MOD_SHIFT  ((1 << 1) | (1 << 5))
+#define MOD_ALT    ((1 << 2) | (1 << 6))
+
+static bool input_keycode_to_esc_seq(uint8_t keycode, const char **seq) {
+    if (!seq) return false;
+    switch (keycode) {
+        case 0x4F: *seq = "\x1b[C"; return true; /* Right arrow */
+        case 0x50: *seq = "\x1b[D"; return true; /* Left arrow  */
+        case 0x51: *seq = "\x1b[B"; return true; /* Down arrow  */
+        case 0x52: *seq = "\x1b[A"; return true; /* Up arrow    */
+        case 0x4A: *seq = "\x1b[H"; return true; /* Home */
+        case 0x4D: *seq = "\x1b[F"; return true; /* End  */
+        case 0x4C: *seq = "\x1b[3~"; return true; /* Delete */
+        default: return false;
+    }
 }
 
 void input_init(void) {
@@ -62,8 +90,31 @@ void input_push_key(uint8_t modifiers, uint8_t keycode, uint8_t state) {
         KLOG_WARN("input: keyboard ring full, event dropped\n");
 
     if (state == INPUT_KEY_PRESS) {
+        if (modifiers & MOD_CTRL) {
+            /* Ctrl+A..Ctrl+Z => 0x01..0x1A */
+            if (keycode >= 0x04 && keycode <= 0x1D) {
+                char ctrl = (char)(1 + (keycode - 0x04));
+                if (ctrl == 0x03) {
+                    /* Ctrl-C: interrupt foreground process group */
+                    tty_signal_foreground(SIGINT);
+                } else {
+                    tty_char_push(ctrl);
+                }
+                return;
+            }
+        }
+
+        const char *esc = 0;
+        if (input_keycode_to_esc_seq(keycode, &esc)) {
+            tty_seq_push(esc);
+            return;
+        }
+
         char ch = input_keycode_to_ascii(keycode, modifiers);
-        if (ch) tty_char_push(ch);
+        if (ch) {
+            if (modifiers & MOD_ALT) tty_char_push('\x1b');
+            tty_char_push(ch);
+        }
     }
 }
 
@@ -117,9 +168,6 @@ static const char keycode_shifted[0x40] = {
     [0x33]=':',[0x34]='"',[0x35]='~',[0x36]='<',[0x37]='>',
     [0x38]='?',
 };
-
-/* modifier byte bit 1 = Left Shift, bit 5 = Right Shift */
-#define MOD_SHIFT  ((1 << 1) | (1 << 5))
 
 char input_keycode_to_ascii(uint8_t keycode, uint8_t modifiers) {
     if (keycode >= 0x40) return 0;

@@ -324,15 +324,30 @@ vnode_t *vfs_lookup(const char *path, bool follow_last_link, int *err_out) {
 
             /* Recurse for symlink target (only absolute links for now) */
             if (link_target[0] == '/') {
-                /* Absolute symlink: restart from root */
-                cur = g_root_vnode;
-                vfs_vnode_get(cur);
-                p = link_target + 1;
-                /* We need to restart our walk — use a temporary buffer */
-                /* For simplicity, tail-call the resolver recursively */
+                /* Absolute symlink: preserve remaining suffix after this component */
+                char combined[VFS_MOUNT_PATH_MAX];
+                const char *rest = p;
+                while (*rest == '/') rest++;
+
+                if (*rest) {
+                    size_t lt_len = strlen(link_target);
+                    size_t rest_len = strlen(rest);
+                    if (lt_len + 1 + rest_len >= sizeof(combined)) {
+                        if (err_out) *err_out = -ENAMETOOLONG;
+                        return NULL;
+                    }
+                    memcpy(combined, link_target, lt_len);
+                    if (lt_len == 0 || combined[lt_len - 1] != '/') {
+                        combined[lt_len++] = '/';
+                    }
+                    memcpy(combined + lt_len, rest, rest_len + 1);
+                } else {
+                    strncpy(combined, link_target, sizeof(combined) - 1);
+                    combined[sizeof(combined) - 1] = '\0';
+                }
+
                 int sub_err = 0;
-                vnode_t *result = vfs_lookup(link_target, follow_last_link, &sub_err);
-                vfs_vnode_put(cur);
+                vnode_t *result = vfs_lookup(combined, follow_last_link, &sub_err);
                 if (!result && err_out) *err_out = sub_err;
                 return result;
             }
@@ -518,4 +533,36 @@ void vfs_sync_all(void) {
             m->fsi->ops->sync(m->root);
         }
     }
+}
+
+int vfs_snapshot_mounts(vfs_mount_info_t *buf, int max_count) {
+    int total = 0;
+    for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
+        mount_t *m = &g_mounts[i];
+        if (!m->active) continue;
+
+        if (buf && total < max_count) {
+            vfs_mount_info_t *out = &buf[total];
+            strncpy(out->path, m->path, sizeof(out->path) - 1);
+            out->path[sizeof(out->path) - 1] = '\0';
+
+            if (m->fsi && m->fsi->ops && m->fsi->ops->name) {
+                strncpy(out->fs_name, m->fsi->ops->name, sizeof(out->fs_name) - 1);
+                out->fs_name[sizeof(out->fs_name) - 1] = '\0';
+            } else {
+                strncpy(out->fs_name, "unknown", sizeof(out->fs_name) - 1);
+                out->fs_name[sizeof(out->fs_name) - 1] = '\0';
+            }
+
+            if (m->fsi && m->fsi->dev && m->fsi->dev->name[0]) {
+                strncpy(out->dev_name, m->fsi->dev->name, sizeof(out->dev_name) - 1);
+                out->dev_name[sizeof(out->dev_name) - 1] = '\0';
+            } else {
+                strncpy(out->dev_name, "none", sizeof(out->dev_name) - 1);
+                out->dev_name[sizeof(out->dev_name) - 1] = '\0';
+            }
+        }
+        total++;
+    }
+    return total;
 }

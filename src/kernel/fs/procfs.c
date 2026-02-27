@@ -15,8 +15,13 @@
 #include "lib/klog.h"
 #include "sched/sched.h"
 #include "sched/task.h"
+#include "mm/pmm.h"
+#include "arch/x86_64/smp.h"
+#include "drivers/storage/blkdev.h"
+#include "drivers/net/netdev.h"
 #include <stdint.h>
 #include <stddef.h>
+#include <stdarg.h>
 
 /* ── Node types ──────────────────────────────────────────────────────────── */
 #define PROC_ROOT      0   /* /proc directory itself */
@@ -24,6 +29,20 @@
 #define PROC_STATUS    2   /* /proc/<pid>/status file */
 #define PROC_MAPS      3   /* /proc/<pid>/maps file   */
 #define PROC_SELF      4   /* /proc/self symlink       */
+#define PROC_NET_DIR   5   /* /proc/net directory       */
+#define PROC_NET_DEV   6   /* /proc/net/dev file        */
+#define PROC_MEMINFO   7   /* /proc/meminfo             */
+#define PROC_UPTIME    8   /* /proc/uptime              */
+#define PROC_CPUINFO   9   /* /proc/cpuinfo             */
+#define PROC_VERSION  10   /* /proc/version             */
+#define PROC_LOADAVG  11   /* /proc/loadavg             */
+#define PROC_STAT     12   /* /proc/stat                */
+#define PROC_MOUNTS   13   /* /proc/mounts              */
+#define PROC_PARTS    14   /* /proc/partitions          */
+#define PROC_CMDLINE  15   /* /proc/cmdline             */
+#define PROC_PID_STAT 16   /* /proc/<pid>/stat          */
+#define PROC_PID_CMD  17   /* /proc/<pid>/cmdline       */
+#define PROC_PID_EXE  18   /* /proc/<pid>/exe symlink   */
 
 /* ── Per-vnode data ──────────────────────────────────────────────────────── */
 typedef struct {
@@ -206,6 +225,214 @@ static ssize_t gen_maps(uint32_t pid, char *buf, size_t bufsz) {
     return (ssize_t)off;
 }
 
+/* ── Generate /proc/net/dev content ─────────────────────────────────────── */
+static ssize_t gen_net_dev(char *buf, size_t bufsz) {
+    size_t off = 0;
+
+    #define NETDEV_APPEND(s) do { \
+        const char *_s = (s); \
+        while (*_s && off + 1 < bufsz) buf[off++] = *_s++; \
+    } while (0)
+
+    NETDEV_APPEND("Inter-|   Receive                                                |  Transmit\n");
+    NETDEV_APPEND(" face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n");
+
+    for (int i = 0; i < netdev_count(); i++) {
+        netdev_t *dev = netdev_get_nth(i);
+        if (!dev) continue;
+
+        NETDEV_APPEND(" ");
+        NETDEV_APPEND(dev->name);
+        NETDEV_APPEND(":");
+        NETDEV_APPEND("        0       0    0    0    0     0          0         0");
+        NETDEV_APPEND("        0       0    0    0    0     0       0          0\n");
+    }
+
+    #undef NETDEV_APPEND
+    return (ssize_t)off;
+}
+
+static size_t procfs_appendf(char *buf, size_t bufsz, size_t off, const char *fmt, ...) {
+    if (off >= bufsz) return off;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = kvsnprintf(buf + off, bufsz - off, fmt, ap);
+    va_end(ap);
+    if (n < 0) return bufsz ? bufsz - 1 : 0;
+    size_t next = off + (size_t)n;
+    if (next >= bufsz) return bufsz ? bufsz - 1 : 0;
+    return next;
+}
+
+static ssize_t gen_meminfo(char *buf, size_t bufsz) {
+    uint64_t total_kb = (pmm_get_total_pages() * PAGE_SIZE) / 1024;
+    uint64_t free_kb  = (pmm_get_free_pages() * PAGE_SIZE) / 1024;
+    uint64_t used_kb  = (total_kb > free_kb) ? (total_kb - free_kb) : 0;
+
+    size_t off = 0;
+    off = procfs_appendf(buf, bufsz, off, "MemTotal:       %llu kB\n", (unsigned long long)total_kb);
+    off = procfs_appendf(buf, bufsz, off, "MemFree:        %llu kB\n", (unsigned long long)free_kb);
+    off = procfs_appendf(buf, bufsz, off, "MemAvailable:   %llu kB\n", (unsigned long long)free_kb);
+    off = procfs_appendf(buf, bufsz, off, "MemUsed:        %llu kB\n", (unsigned long long)used_kb);
+    return (ssize_t)off;
+}
+
+static ssize_t gen_uptime(char *buf, size_t bufsz) {
+    uint64_t ticks = sched_get_ticks();
+    uint64_t sec = ticks / 1000;
+    uint64_t frac = (ticks % 1000) / 10;
+    int n = ksnprintf(buf, bufsz, "%llu.%02llu %llu.%02llu\n",
+                      (unsigned long long)sec, (unsigned long long)frac,
+                      (unsigned long long)sec, (unsigned long long)frac);
+    if (n < 0) return -EIO;
+    return (ssize_t)n;
+}
+
+static ssize_t gen_cpuinfo(char *buf, size_t bufsz) {
+    size_t off = 0;
+    uint32_t ncpu = smp_cpu_count();
+    if (ncpu == 0) ncpu = 1;
+
+    for (uint32_t i = 0; i < ncpu; i++) {
+        off = procfs_appendf(buf, bufsz, off, "processor\t: %u\n", i);
+        off = procfs_appendf(buf, bufsz, off, "vendor_id\t: EXO\n");
+        off = procfs_appendf(buf, bufsz, off, "model name\t: EXO_OS Virtual CPU\n");
+        off = procfs_appendf(buf, bufsz, off, "cpu MHz\t\t: 1000.000\n");
+        off = procfs_appendf(buf, bufsz, off, "\n");
+        if (off + 1 >= bufsz) break;
+    }
+    return (ssize_t)off;
+}
+
+static ssize_t gen_version(char *buf, size_t bufsz) {
+    int n = ksnprintf(buf, bufsz,
+                      "EXO_OS version 0.1 (exo@kernel) #1 SMP %u\n",
+                      smp_cpu_count());
+    if (n < 0) return -EIO;
+    return (ssize_t)n;
+}
+
+static ssize_t gen_loadavg(char *buf, size_t bufsz) {
+    int n = ksnprintf(buf, bufsz, "0.00 0.00 0.00 1/1 %llu\n",
+                      (unsigned long long)sched_get_ticks());
+    if (n < 0) return -EIO;
+    return (ssize_t)n;
+}
+
+static ssize_t gen_stat(char *buf, size_t bufsz) {
+    size_t off = 0;
+    uint32_t ncpu = smp_cpu_count();
+    if (ncpu == 0) ncpu = 1;
+    uint64_t ticks = sched_get_ticks();
+
+    off = procfs_appendf(buf, bufsz, off, "cpu  %llu 0 0 %llu 0 0 0 0 0 0\n",
+                         (unsigned long long)ticks,
+                         (unsigned long long)(ticks / 4));
+    for (uint32_t i = 0; i < ncpu; i++) {
+        off = procfs_appendf(buf, bufsz, off, "cpu%u %llu 0 0 %llu 0 0 0 0 0 0\n",
+                             i,
+                             (unsigned long long)(ticks / ncpu),
+                             (unsigned long long)(ticks / 4 / ncpu));
+    }
+    off = procfs_appendf(buf, bufsz, off, "btime 0\n");
+    off = procfs_appendf(buf, bufsz, off, "processes %u\n", TASK_TABLE_SIZE);
+    return (ssize_t)off;
+}
+
+static ssize_t gen_mounts(char *buf, size_t bufsz) {
+    vfs_mount_info_t mnts[VFS_MAX_MOUNTS];
+    int n = vfs_snapshot_mounts(mnts, VFS_MAX_MOUNTS);
+    size_t off = 0;
+
+    for (int i = 0; i < n; i++) {
+        const char *dev = mnts[i].dev_name;
+        char dev_path[48];
+        if (strcmp(dev, "none") == 0) {
+            strncpy(dev_path, "none", sizeof(dev_path) - 1);
+            dev_path[sizeof(dev_path) - 1] = '\0';
+        } else {
+            ksnprintf(dev_path, sizeof(dev_path), "/dev/%s", dev);
+        }
+        off = procfs_appendf(buf, bufsz, off, "%s %s %s rw 0 0\n",
+                             dev_path, mnts[i].path, mnts[i].fs_name);
+        if (off + 1 >= bufsz) break;
+    }
+    return (ssize_t)off;
+}
+
+static ssize_t gen_partitions(char *buf, size_t bufsz) {
+    size_t off = 0;
+    off = procfs_appendf(buf, bufsz, off, "major minor  #blocks  name\n\n");
+
+    int n = blkdev_count();
+    for (int i = 0; i < n; i++) {
+        blkdev_t *d = blkdev_get_nth(i);
+        if (!d) continue;
+        uint64_t blocks_k = (d->block_count * d->block_size) / 1024;
+        off = procfs_appendf(buf, bufsz, off, " 254 %5d %8llu %s\n",
+                             i,
+                             (unsigned long long)blocks_k,
+                             d->name);
+        if (off + 1 >= bufsz) break;
+    }
+    return (ssize_t)off;
+}
+
+static ssize_t gen_cmdline(char *buf, size_t bufsz) {
+    int n = ksnprintf(buf, bufsz, "root=/dev/vda2 console=tty\n");
+    if (n < 0) return -EIO;
+    return (ssize_t)n;
+}
+
+static char proc_state_letter(task_state_t st) {
+    switch (st) {
+        case TASK_RUNNING:
+        case TASK_RUNNABLE: return 'R';
+        case TASK_SLEEPING:
+        case TASK_BLOCKED: return 'S';
+        case TASK_ZOMBIE: return 'Z';
+        default: return 'S';
+    }
+}
+
+static ssize_t gen_pid_stat(uint32_t pid, char *buf, size_t bufsz) {
+    task_t *t = task_lookup(pid);
+    if (!t) return -ESRCH;
+
+    uint64_t now = sched_get_ticks();
+    uint64_t utime = now / 2;
+    uint64_t stime = now / 2;
+    uint64_t start_time = (now > 100) ? (now - 100) : 1;
+    uint64_t vsize = 16ULL * 1024ULL * 1024ULL;
+    uint64_t rss_pages = 1024;
+
+    int n = ksnprintf(buf, bufsz,
+        "%u (%s) %c %u %u %u 0 0 0 0 0 0 0 %llu %llu 0 0 20 0 1 0 %llu %llu %llu 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        t->pid,
+        t->name,
+        proc_state_letter(t->state),
+        t->ppid,
+        t->pgid,
+        t->sid,
+        (unsigned long long)utime,
+        (unsigned long long)stime,
+        (unsigned long long)start_time,
+        (unsigned long long)vsize,
+        (unsigned long long)rss_pages);
+    if (n < 0) return -EIO;
+    return (ssize_t)n;
+}
+
+static ssize_t gen_pid_cmdline(uint32_t pid, char *buf, size_t bufsz) {
+    task_t *t = task_lookup(pid);
+    if (!t) return -ESRCH;
+    size_t nlen = strlen(t->name);
+    if (nlen + 1 >= bufsz) nlen = bufsz - 2;
+    memcpy(buf, t->name, nlen);
+    buf[nlen] = '\0';
+    return (ssize_t)(nlen + 1);
+}
+
 /* ── VFS operations ──────────────────────────────────────────────────────── */
 
 static vnode_t *procfs_lookup(vnode_t *dir, const char *name) {
@@ -213,6 +440,36 @@ static vnode_t *procfs_lookup(vnode_t *dir, const char *name) {
     procfs_node_t *pn = (procfs_node_t *)dir->fs_data;
 
     if (pn->type == PROC_ROOT) {
+        if (strcmp(name, "net") == 0) {
+            return procfs_alloc_node(PROC_NET_DIR, 0, VFS_S_IFDIR | 0555);
+        }
+        if (strcmp(name, "meminfo") == 0) {
+            return procfs_alloc_node(PROC_MEMINFO, 0, VFS_S_IFREG | 0444);
+        }
+        if (strcmp(name, "uptime") == 0) {
+            return procfs_alloc_node(PROC_UPTIME, 0, VFS_S_IFREG | 0444);
+        }
+        if (strcmp(name, "cpuinfo") == 0) {
+            return procfs_alloc_node(PROC_CPUINFO, 0, VFS_S_IFREG | 0444);
+        }
+        if (strcmp(name, "version") == 0) {
+            return procfs_alloc_node(PROC_VERSION, 0, VFS_S_IFREG | 0444);
+        }
+        if (strcmp(name, "loadavg") == 0) {
+            return procfs_alloc_node(PROC_LOADAVG, 0, VFS_S_IFREG | 0444);
+        }
+        if (strcmp(name, "stat") == 0) {
+            return procfs_alloc_node(PROC_STAT, 0, VFS_S_IFREG | 0444);
+        }
+        if (strcmp(name, "mounts") == 0) {
+            return procfs_alloc_node(PROC_MOUNTS, 0, VFS_S_IFREG | 0444);
+        }
+        if (strcmp(name, "partitions") == 0) {
+            return procfs_alloc_node(PROC_PARTS, 0, VFS_S_IFREG | 0444);
+        }
+        if (strcmp(name, "cmdline") == 0) {
+            return procfs_alloc_node(PROC_CMDLINE, 0, VFS_S_IFREG | 0444);
+        }
         /* /proc/self — symlink */
         if (strcmp(name, "self") == 0) {
             return procfs_alloc_node(PROC_SELF, 0, VFS_S_IFLNK | 0777);
@@ -234,6 +491,22 @@ static vnode_t *procfs_lookup(vnode_t *dir, const char *name) {
         }
         if (strcmp(name, "maps") == 0) {
             return procfs_alloc_node(PROC_MAPS, pn->pid, VFS_S_IFREG | 0444);
+        }
+        if (strcmp(name, "stat") == 0) {
+            return procfs_alloc_node(PROC_PID_STAT, pn->pid, VFS_S_IFREG | 0444);
+        }
+        if (strcmp(name, "cmdline") == 0) {
+            return procfs_alloc_node(PROC_PID_CMD, pn->pid, VFS_S_IFREG | 0444);
+        }
+        if (strcmp(name, "exe") == 0) {
+            return procfs_alloc_node(PROC_PID_EXE, pn->pid, VFS_S_IFLNK | 0777);
+        }
+        return NULL;
+    }
+
+    if (pn->type == PROC_NET_DIR) {
+        if (strcmp(name, "dev") == 0) {
+            return procfs_alloc_node(PROC_NET_DEV, 0, VFS_S_IFREG | 0444);
         }
         return NULL;
     }
@@ -263,6 +536,18 @@ static ssize_t procfs_read(vnode_t *v, void *buf, size_t len, uint64_t off) {
     switch (pn->type) {
         case PROC_STATUS: total = gen_status(pn->pid, tmp, PROCFS_BUF_SIZE); break;
         case PROC_MAPS:   total = gen_maps(pn->pid, tmp, PROCFS_BUF_SIZE); break;
+        case PROC_NET_DEV: total = gen_net_dev(tmp, PROCFS_BUF_SIZE); break;
+        case PROC_MEMINFO: total = gen_meminfo(tmp, PROCFS_BUF_SIZE); break;
+        case PROC_UPTIME: total = gen_uptime(tmp, PROCFS_BUF_SIZE); break;
+        case PROC_CPUINFO: total = gen_cpuinfo(tmp, PROCFS_BUF_SIZE); break;
+        case PROC_VERSION: total = gen_version(tmp, PROCFS_BUF_SIZE); break;
+        case PROC_LOADAVG: total = gen_loadavg(tmp, PROCFS_BUF_SIZE); break;
+        case PROC_STAT: total = gen_stat(tmp, PROCFS_BUF_SIZE); break;
+        case PROC_MOUNTS: total = gen_mounts(tmp, PROCFS_BUF_SIZE); break;
+        case PROC_PARTS: total = gen_partitions(tmp, PROCFS_BUF_SIZE); break;
+        case PROC_CMDLINE: total = gen_cmdline(tmp, PROCFS_BUF_SIZE); break;
+        case PROC_PID_STAT: total = gen_pid_stat(pn->pid, tmp, PROCFS_BUF_SIZE); break;
+        case PROC_PID_CMD: total = gen_pid_cmdline(pn->pid, tmp, PROCFS_BUF_SIZE); break;
         default: kfree(tmp); return -EIO;
     }
 
@@ -298,8 +583,34 @@ static int procfs_readdir(vnode_t *dir, uint64_t *cookie, vfs_dirent_t *out) {
             return 1;
         }
 
-        /* Entries 1..N: iterate task table for live tasks */
-        uint32_t skip = (uint32_t)(idx - 1);
+        /* Entry 1: "net" directory */
+        if (idx == 1) {
+            out->ino  = 0xFFFE;
+            out->type = VFS_DT_DIR;
+            strncpy(out->name, "net", VFS_NAME_MAX);
+            out->name[VFS_NAME_MAX] = '\0';
+            *cookie = 2;
+            return 1;
+        }
+
+        static const char *root_files[] = {
+            "meminfo", "uptime", "cpuinfo", "version",
+            "loadavg", "stat", "mounts", "partitions", "cmdline"
+        };
+        uint64_t root_file_base = 2;
+        uint64_t root_file_count = sizeof(root_files) / sizeof(root_files[0]);
+        if (idx >= root_file_base && idx < root_file_base + root_file_count) {
+            uint64_t file_i = idx - root_file_base;
+            out->ino  = 0xFFF0 - (uint64_t)file_i;
+            out->type = VFS_DT_REG;
+            strncpy(out->name, root_files[file_i], VFS_NAME_MAX);
+            out->name[VFS_NAME_MAX] = '\0';
+            *cookie = idx + 1;
+            return 1;
+        }
+
+        /* Remaining entries: iterate task table for live tasks */
+        uint32_t skip = (uint32_t)(idx - (root_file_base + root_file_count));
         uint32_t found = 0;
         for (uint32_t i = 0; i < TASK_TABLE_SIZE; i++) {
             task_t *t = task_get_from_table(i);
@@ -316,12 +627,22 @@ static int procfs_readdir(vnode_t *dir, uint64_t *cookie, vfs_dirent_t *out) {
         return 0;  /* exhausted */
     }
 
-    if (pn->type == PROC_PID_DIR) {
-        static const char *entries[] = { "status", "maps" };
-        uint64_t idx = *cookie;
-        if (idx >= 2) return 0;
-        out->ino  = (pn->pid << 4) | (idx + 1);
+    if (pn->type == PROC_NET_DIR) {
+        if (*cookie > 0) return 0;
+        out->ino  = 0xFFFD;
         out->type = VFS_DT_REG;
+        strncpy(out->name, "dev", VFS_NAME_MAX);
+        out->name[VFS_NAME_MAX] = '\0';
+        *cookie = 1;
+        return 1;
+    }
+
+    if (pn->type == PROC_PID_DIR) {
+        static const char *entries[] = { "status", "maps", "stat", "cmdline", "exe" };
+        uint64_t idx = *cookie;
+        if (idx >= 5) return 0;
+        out->ino  = (pn->pid << 4) | (idx + 1);
+        out->type = (idx == 4) ? VFS_DT_LNK : VFS_DT_REG;
         strncpy(out->name, entries[idx], VFS_NAME_MAX);
         out->name[VFS_NAME_MAX] = '\0';
         *cookie = idx + 1;
@@ -355,6 +676,16 @@ static int procfs_readlink(vnode_t *v, char *buf, size_t bufsize) {
         if (plen >= bufsize) return -ERANGE;
         memcpy(buf, "/proc/", 6);
         memcpy(buf + 6, pidstr, strlen(pidstr) + 1);
+        return 0;
+    }
+    if (pn->type == PROC_PID_EXE) {
+        task_t *t = task_lookup(pn->pid);
+        if (!t) return -ESRCH;
+        const char *target = "/bin/sh";
+        if (strcmp(t->name, "init") == 0) target = "/bin/sh";
+        size_t tlen = strlen(target);
+        if (tlen + 1 > bufsize) return -ERANGE;
+        memcpy(buf, target, tlen + 1);
         return 0;
     }
     return -EINVAL;

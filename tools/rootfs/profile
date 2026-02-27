@@ -8,7 +8,7 @@ export TMPDIR="/tmp"
 
 [ -z "$TERM" ] && TERM="linux"
 [ -z "$PWD" ] && PWD="/"
-[ -z "$PS1" ] && PS1="# "
+[ -z "$PS1" ] && PS1="uday# "
 
 export TERM
 export PWD

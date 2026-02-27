@@ -74,6 +74,10 @@ typedef struct task {
     uint64_t      sleep_deadline;   /* wake when g_jiffies >= this value         */
     struct task  *sleep_next;       /* sleep-list linked list                    */
 
+    /* ── ITIMER_REAL / alarm(2) ───────────────────────────────────────── */
+    uint64_t      itimer_real_deadline;  /* 0 = disabled, otherwise absolute ms */
+    uint64_t      itimer_real_interval;  /* periodic interval in ms (0 = one-shot) */
+
     /* ── IPC + Signals ──────────────────────────────────────────────────── */
     volatile uint32_t    sig_pending;   /* bitmask: bit N set = signal N pending */
     uint32_t             sig_mask;      /* signal mask (blocked signals)          */

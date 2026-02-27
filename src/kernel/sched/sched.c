@@ -20,6 +20,27 @@ uint32_t g_apic_ticks_per_ms = 0;
 /* Global jiffy counter: incremented 1/ms by BSP timer ISR (~1 ms resolution) */
 static volatile uint64_t g_jiffies = 0;
 
+static void sched_process_itimers(uint64_t now) {
+    for (uint32_t i = 1; i < TASK_TABLE_SIZE; i++) {
+        task_t *t = task_get_from_table(i);
+        if (!t) continue;
+        if (t->state == TASK_DEAD || t->state == TASK_ZOMBIE) continue;
+        uint64_t deadline = __atomic_load_n(&t->itimer_real_deadline, __ATOMIC_RELAXED);
+        if (!deadline || now < deadline) continue;
+
+        signal_send(t, SIGALRM);
+
+        uint64_t interval = __atomic_load_n(&t->itimer_real_interval, __ATOMIC_RELAXED);
+        if (interval == 0) {
+            __atomic_store_n(&t->itimer_real_deadline, 0, __ATOMIC_RELAXED);
+        } else {
+            uint64_t next = deadline;
+            do { next += interval; } while (next <= now);
+            __atomic_store_n(&t->itimer_real_deadline, next, __ATOMIC_RELAXED);
+        }
+    }
+}
+
 #define NPRIO  8    /* 0 = highest priority, 7 = lowest */
 #define TIMESLICE_TICKS  10   /* ticks before priority drop */
 
@@ -112,6 +133,7 @@ static void sched_timer_isr(cpu_regs_t *regs) {
     if (ci && ci->id == 0) {
         uint64_t now = __atomic_add_fetch(&g_jiffies, 1, __ATOMIC_RELAXED);
         ktimer_tick(now);
+        sched_process_itimers(now);
     }
     sched_tick();
 }

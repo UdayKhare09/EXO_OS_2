@@ -12,6 +12,7 @@
 #include "mm/kmalloc.h"
 #include "lib/string.h"
 #include "lib/klog.h"
+#include "drivers/storage/blkdev.h"
 #include "gfx/fbcon.h"
 #include "drivers/input/input.h"
 #include "arch/x86_64/cpu.h"
@@ -30,11 +31,34 @@ static inline uint64_t devfs_rdtsc(void) {
 #define DEV_ZERO     1
 #define DEV_TTY      2
 #define DEV_URANDOM  3
-#define DEV_MAX      4
+#define DEV_RANDOM   4
+#define DEV_FULL     5
+
+typedef struct {
+    const char *name;
+    int dev_type;
+    uint32_t mode;
+    uint32_t dirent_type;
+} devfs_entry_t;
+
+static const devfs_entry_t g_dev_entries[] = {
+    { "null",    DEV_NULL,    VFS_S_IFCHR | 0666, VFS_DT_CHR },
+    { "zero",    DEV_ZERO,    VFS_S_IFCHR | 0666, VFS_DT_CHR },
+    { "tty",     DEV_TTY,     VFS_S_IFCHR | 0666, VFS_DT_CHR },
+    { "urandom", DEV_URANDOM, VFS_S_IFCHR | 0666, VFS_DT_CHR },
+    { "random",  DEV_RANDOM,  VFS_S_IFCHR | 0666, VFS_DT_CHR },
+    { "full",    DEV_FULL,    VFS_S_IFCHR | 0666, VFS_DT_CHR },
+    { "stdin",   DEV_TTY,     VFS_S_IFCHR | 0666, VFS_DT_CHR },
+    { "stdout",  DEV_TTY,     VFS_S_IFCHR | 0666, VFS_DT_CHR },
+    { "stderr",  DEV_TTY,     VFS_S_IFCHR | 0666, VFS_DT_CHR },
+};
+
+#define DEV_MAX ((int)(sizeof(g_dev_entries) / sizeof(g_dev_entries[0])))
 
 /* ── Per-vnode device info ───────────────────────────────────────────────── */
 typedef struct {
     int dev_type;
+    blkdev_t *blk;
 } devfs_node_t;
 
 /* Forward declarations */
@@ -47,13 +71,13 @@ static int      devfs_readdir(vnode_t *dir, uint64_t *cookie, vfs_dirent_t *out)
 static int      devfs_stat(vnode_t *v, vfs_stat_t *st);
 static vnode_t *devfs_mount(fs_inst_t *fsi, blkdev_t *dev);
 static void     devfs_unmount(fs_inst_t *fsi);
+static fs_ops_t devfs_ops;
 
 /* devfs root directory vnode */
 static vnode_t *devfs_root = NULL;
 
 /* Device vnodes */
 static vnode_t *dev_vnodes[DEV_MAX];
-static const char *dev_names[DEV_MAX] = { "null", "zero", "tty", "urandom" };
 
 /* ── PRNG for /dev/urandom ───────────────────────────────────────────────── */
 static uint64_t prng_state = 0x12345678DEADBEEFULL;
@@ -103,7 +127,8 @@ static ssize_t devfs_read(vnode_t *v, void *buf, size_t len, uint64_t off) {
             return (ssize_t)done;
         }
 
-        case DEV_URANDOM: {
+        case DEV_URANDOM:
+        case DEV_RANDOM: {
             uint8_t *dst = (uint8_t *)buf;
             size_t i = 0;
             while (i < len) {
@@ -116,9 +141,45 @@ static ssize_t devfs_read(vnode_t *v, void *buf, size_t len, uint64_t off) {
             return (ssize_t)len;
         }
 
+        case DEV_FULL: {
+            memset(buf, 0, len);
+            return (ssize_t)len;
+        }
+
         default:
-            return -EIO;
+            break;
     }
+
+    if (node->blk) {
+        blkdev_t *b = node->blk;
+        uint32_t bsz = b->block_size ? b->block_size : 512;
+        uint64_t dev_bytes = b->block_count * (uint64_t)bsz;
+        if (off >= dev_bytes) return 0;
+        if (off + len > dev_bytes) len = (size_t)(dev_bytes - off);
+
+        uint8_t *tmp = kmalloc(bsz);
+        if (!tmp) return -ENOMEM;
+
+        size_t done = 0;
+        while (done < len) {
+            uint64_t pos = off + done;
+            uint64_t lba = pos / bsz;
+            uint32_t boff = (uint32_t)(pos % bsz);
+            size_t chunk = len - done;
+            if (chunk > bsz - boff) chunk = bsz - boff;
+
+            if (blkdev_read(b, lba, 1, tmp) < 0) {
+                kfree(tmp);
+                return done ? (ssize_t)done : -EIO;
+            }
+            memcpy((uint8_t *)buf + done, tmp + boff, chunk);
+            done += chunk;
+        }
+        kfree(tmp);
+        return (ssize_t)done;
+    }
+
+    return -EIO;
 }
 
 static ssize_t devfs_write(vnode_t *v, const void *buf, size_t len, uint64_t off) {
@@ -145,27 +206,96 @@ static ssize_t devfs_write(vnode_t *v, const void *buf, size_t len, uint64_t off
         }
 
         case DEV_URANDOM:
+        case DEV_RANDOM:
             /* Seed the PRNG */
             if (len >= 8) {
                 memcpy(&prng_state, buf, 8);
             }
             return (ssize_t)len;
 
+        case DEV_FULL:
+            return -ENOSPC;
+
         default:
-            return -EIO;
+            break;
     }
+
+    if (node->blk) {
+        blkdev_t *b = node->blk;
+        uint32_t bsz = b->block_size ? b->block_size : 512;
+        uint64_t dev_bytes = b->block_count * (uint64_t)bsz;
+        if (off >= dev_bytes) return 0;
+        if (off + len > dev_bytes) len = (size_t)(dev_bytes - off);
+
+        uint8_t *tmp = kmalloc(bsz);
+        if (!tmp) return -ENOMEM;
+
+        size_t done = 0;
+        while (done < len) {
+            uint64_t pos = off + done;
+            uint64_t lba = pos / bsz;
+            uint32_t boff = (uint32_t)(pos % bsz);
+            size_t chunk = len - done;
+            if (chunk > bsz - boff) chunk = bsz - boff;
+
+            if (boff != 0 || chunk != bsz) {
+                if (blkdev_read(b, lba, 1, tmp) < 0) {
+                    kfree(tmp);
+                    return done ? (ssize_t)done : -EIO;
+                }
+                memcpy(tmp + boff, (const uint8_t *)buf + done, chunk);
+                if (blkdev_write(b, lba, 1, tmp) < 0) {
+                    kfree(tmp);
+                    return done ? (ssize_t)done : -EIO;
+                }
+            } else {
+                if (blkdev_write(b, lba, 1, (const uint8_t *)buf + done) < 0) {
+                    kfree(tmp);
+                    return done ? (ssize_t)done : -EIO;
+                }
+            }
+            done += chunk;
+        }
+        kfree(tmp);
+        return (ssize_t)done;
+    }
+
+    return -EIO;
 }
 
 static vnode_t *devfs_lookup(vnode_t *dir, const char *name) {
     if (!dir || !name) return NULL;
     for (int i = 0; i < DEV_MAX; i++) {
-        if (strcmp(name, dev_names[i]) == 0) {
+        if (strcmp(name, g_dev_entries[i].name) == 0) {
             if (dev_vnodes[i]) {
                 vfs_vnode_get(dev_vnodes[i]);
                 return dev_vnodes[i];
             }
         }
     }
+
+    blkdev_t *blk = blkdev_find_by_name(name);
+    if (blk) {
+        vnode_t *v = vfs_alloc_vnode();
+        if (!v) return NULL;
+        devfs_node_t *node = kmalloc(sizeof(devfs_node_t));
+        if (!node) {
+            kfree(v);
+            return NULL;
+        }
+        node->dev_type = -1;
+        node->blk = blk;
+
+        v->ino = 1000 + (uint64_t)blk->dev_id;
+        v->mode = VFS_S_IFBLK | 0660;
+        v->ops = &devfs_ops;
+        v->fsi = dir->fsi;
+        v->fs_data = node;
+        v->refcount = 1;
+        v->size = blk->block_count * (uint64_t)(blk->block_size ? blk->block_size : 512);
+        return v;
+    }
+
     return NULL;
 }
 
@@ -182,11 +312,21 @@ static int devfs_close(vnode_t *v) {
 static int devfs_readdir(vnode_t *dir, uint64_t *cookie, vfs_dirent_t *out) {
     (void)dir;
     uint64_t idx = *cookie;
-    if (idx >= DEV_MAX) return 0;
+    if (idx < DEV_MAX) {
+        out->ino  = idx + 100;
+        out->type = g_dev_entries[idx].dirent_type;
+        strncpy(out->name, g_dev_entries[idx].name, VFS_NAME_MAX);
+        out->name[VFS_NAME_MAX] = '\0';
+        *cookie = idx + 1;
+        return 1;
+    }
 
-    out->ino  = idx + 100;
-    out->type = VFS_DT_CHR;
-    strncpy(out->name, dev_names[idx], VFS_NAME_MAX);
+    uint64_t bidx = idx - DEV_MAX;
+    blkdev_t *blk = blkdev_get_nth((int)bidx);
+    if (!blk) return 0;
+    out->ino = 1000 + blk->dev_id;
+    out->type = VFS_DT_BLK;
+    strncpy(out->name, blk->name, VFS_NAME_MAX);
     out->name[VFS_NAME_MAX] = '\0';
     *cookie = idx + 1;
     return 1;
@@ -197,9 +337,18 @@ static int devfs_stat(vnode_t *v, vfs_stat_t *st) {
     memset(st, 0, sizeof(*st));
     st->mode = v->mode;
     st->ino  = v->ino;
-    st->size = 0;
+    st->size = v->size;
     st->blksize = 4096;
     return 0;
+}
+
+static void devfs_evict(vnode_t *v) {
+    if (!v || !v->fs_data) return;
+    devfs_node_t *node = (devfs_node_t *)v->fs_data;
+    if (node->blk) {
+        kfree(node);
+        v->fs_data = NULL;
+    }
 }
 
 /* ── devfs fs_ops vtable ─────────────────────────────────────────────────── */
@@ -221,7 +370,7 @@ static fs_ops_t devfs_ops = {
     .readlink = NULL,
     .truncate = NULL,
     .sync    = NULL,
-    .evict   = NULL,
+    .evict   = devfs_evict,
     .mount   = devfs_mount,
     .unmount = devfs_unmount,
 };
@@ -246,7 +395,7 @@ static vnode_t *devfs_mount(fs_inst_t *fsi, blkdev_t *dev) {
         vnode_t *v = vfs_alloc_vnode();
         if (!v) continue;
         v->ino  = 100 + i;
-        v->mode = VFS_S_IFCHR | 0666;
+        v->mode = g_dev_entries[i].mode;
         v->ops  = &devfs_ops;
         v->fsi  = fsi;
         v->refcount = 1;
@@ -254,6 +403,7 @@ static vnode_t *devfs_mount(fs_inst_t *fsi, blkdev_t *dev) {
         devfs_node_t *node = kmalloc(sizeof(devfs_node_t));
         if (node) {
             node->dev_type = i;
+            node->blk = NULL;
             v->fs_data = node;
         }
         dev_vnodes[i] = v;
@@ -267,7 +417,8 @@ static void devfs_unmount(fs_inst_t *fsi) {
     (void)fsi;
     for (int i = 0; i < DEV_MAX; i++) {
         if (dev_vnodes[i]) {
-            kfree(dev_vnodes[i]->fs_data);
+            devfs_node_t *n = (devfs_node_t *)dev_vnodes[i]->fs_data;
+            if (n && !n->blk) kfree(dev_vnodes[i]->fs_data);
             kfree(dev_vnodes[i]);
             dev_vnodes[i] = NULL;
         }

@@ -14,6 +14,8 @@
 #include "drivers/net/netdev.h"
 #include "drivers/input/input.h"
 #include "sched/sched.h"
+#include "sched/task.h"
+#include "ipc/signal.h"
 #include "lib/klog.h"
 #include "lib/string.h"
 
@@ -132,6 +134,17 @@ void tty_set_fg_pgid(int pgid) {
     g_tty_fg_pgid = pgid;
 }
 
+void tty_signal_foreground(int sig) {
+    if (sig <= 0 || sig >= NSIGS) return;
+    for (uint32_t i = 1; i < TASK_TABLE_SIZE; i++) {
+        task_t *t = task_get_from_table(i);
+        if (!t) continue;
+        if (t->state == TASK_DEAD || t->state == TASK_ZOMBIE) continue;
+        if ((int)t->pgid == g_tty_fg_pgid)
+            signal_send(t, sig);
+    }
+}
+
 static inline bool is_tty_file(const file_t *f) {
     return f && f->path[0] && strcmp(f->path, "/dev/tty") == 0;
 }
@@ -229,6 +242,7 @@ int64_t sys_recvfrom(int fd, void *buf, size_t len, int flags,
     if (!sk->proto_ops || !sk->proto_ops->recvfrom) return -EINVAL;
     int r = (int)sk->proto_ops->recvfrom(sk, buf, len, flags,
                                          src_addr, addrlen);
+    if (r == -2) return -EINTR;
     if (r == -1) return -EAGAIN;
     return (int64_t)r;
 }

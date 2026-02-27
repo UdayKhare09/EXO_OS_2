@@ -29,6 +29,7 @@ int64_t sys_unlinkat(int dirfd, const char *upath, int flags);
 int64_t sys_renameat(int olddirfd, const char *old_path, int newdirfd, const char *new_path);
 int64_t sys_faccessat(int dirfd, const char *upath, int mode, int flags);
 int64_t sys_symlinkat(const char *target, int newdirfd, const char *linkpath);
+int64_t sys_utimensat(int dirfd, const char *upath, const kernel_timespec_t times[2], int flags);
 
 /* Resolve a possibly-relative user path to an absolute, normalised path.
  * Returns 0 on success; writes result into `out` (size >= VFS_MOUNT_PATH_MAX). */
@@ -460,6 +461,44 @@ int64_t sys_faccessat(int dirfd, const char *upath, int mode, int flags) {
     if ((mode & 4) && !(perm & (0400 | 0040 | 0004))) return -EACCES;
     if ((mode & 2) && !(perm & (0200 | 0020 | 0002))) return -EACCES;
     if ((mode & 1) && !(perm & (0100 | 0010 | 0001))) return -EACCES;
+    return 0;
+}
+
+int64_t sys_utimensat(int dirfd, const char *upath, const kernel_timespec_t times[2], int flags) {
+    (void)times; /* Timestamp precision/control not yet implemented. */
+
+    if (flags & ~AT_SYMLINK_NOFOLLOW) return -EINVAL;
+
+    task_t *t = cur_task();
+    if (!t) return -ESRCH;
+
+    /* futimens(fd, ...) path via utimensat(fd, NULL, ...) */
+    if (!upath) {
+        file_t *f = fd_get(t, dirfd);
+        if (!f) return -EBADF;
+        if (!f->vnode) return -EINVAL;
+
+        uint64_t now = sched_get_ticks() / 1000;
+        f->vnode->atime = (int64_t)now;
+        f->vnode->mtime = (int64_t)now;
+        f->vnode->ctime = (int64_t)now;
+        return 0;
+    }
+
+    char path[VFS_MOUNT_PATH_MAX];
+    int r = resolve_path_at(dirfd, upath, path);
+    if (r < 0) return r;
+
+    int err = 0;
+    bool follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
+    vnode_t *v = vfs_lookup(path, follow, &err);
+    if (!v) return err ? err : -ENOENT;
+
+    uint64_t now = sched_get_ticks() / 1000;
+    v->atime = (int64_t)now;
+    v->mtime = (int64_t)now;
+    v->ctime = (int64_t)now;
+    vfs_vnode_put(v);
     return 0;
 }
 

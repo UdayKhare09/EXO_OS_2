@@ -56,6 +56,7 @@
 #define SYS_UMASK       95
 #define SYS_GETRLIMIT   97
 #define SYS_TIMES       100
+#define SYS_FUTIMESAT   261
 #define SYS_GETUID      102
 #define SYS_GETGID      104
 #define SYS_GETEUID     107
@@ -81,6 +82,7 @@
 #define SYS_FACCESSAT   269
 #define SYS_SET_ROBUST_LIST 273
 #define SYS_GET_ROBUST_LIST 274
+#define SYS_UTIMENSAT   280
 #define SYS_DUP3        292
 #define SYS_PIPE2       293
 #define SYS_PRLIMIT64   302
