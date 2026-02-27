@@ -85,10 +85,13 @@ typedef struct task {
     uint64_t      brk_base;         /* start of heap (set by ELF loader)         */
     uint64_t      brk_current;      /* current brk position                      */
     uint64_t      mmap_next;        /* next free address for mmap                */
+    uint8_t       owns_address_space; /* 1 if task owns/destroys its CR3         */
 
     /* ── Thread support ──────────────────────────────────────────────────── */
     uint64_t      fs_base;          /* FS base (TLS pointer for user-space)      */
     uint64_t     *clear_child_tid;  /* set_tid_address: write 0 + futex on exit  */
+    uint64_t      robust_list_head; /* set_robust_list head pointer (user VA)    */
+    uint64_t      robust_list_len;  /* ABI size for robust list head             */
 
     /* ── Filesystem ──────────────────────────────────────────────────────── */
     struct file         *fd_table[TASK_FD_TABLE_SIZE];   /* open files        */

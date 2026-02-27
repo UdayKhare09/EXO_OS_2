@@ -240,6 +240,7 @@ int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
     /* Create a FRESH address space for the new image.
      * This ensures no stale mappings from the old process image survive. */
     uintptr_t old_cr3 = cur->cr3;
+    uint8_t old_owns_mm = cur->owns_address_space;
     uintptr_t new_cr3 = vmm_create_address_space();
     if (!new_cr3) {
         kfree(buf); kfree(argv_buf); kfree(envp_buf);
@@ -262,8 +263,9 @@ int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
     __asm__ volatile("mov %0, %%cr3" : : "r"(new_cr3) : "memory");
 
     /* Now safe to tear down the old address space (we are no longer using it) */
-    if (old_cr3 && old_cr3 != vmm_get_kernel_pml4())
+    if (old_owns_mm && old_cr3 && old_cr3 != vmm_get_kernel_pml4())
         vmm_destroy_address_space(old_cr3);
+    cur->owns_address_space = 1;
 
     /* Reset mmap bump pointer */
     cur->mmap_next = USER_MMAP_BASE;
@@ -683,6 +685,10 @@ int64_t sys_clone(uint64_t flags, uint64_t stack, uint64_t parent_tid_ptr,
     bool share_files  = (flags & CLONE_FILES) != 0;
     bool is_thread    = (flags & CLONE_THREAD) != 0;
 
+    /* Linux-required flag coupling for thread groups */
+    if ((flags & CLONE_SIGHAND) && !share_vm) return -EINVAL;
+    if (is_thread && (!share_vm || !(flags & CLONE_SIGHAND))) return -EINVAL;
+
     uintptr_t child_pml4;
     task_t *child;
 
@@ -691,6 +697,7 @@ int64_t sys_clone(uint64_t flags, uint64_t stack, uint64_t parent_tid_ptr,
         child_pml4 = parent->cr3;
         child = task_create_user(parent->name, child_pml4, 0, 0, parent->cpu_id);
         if (!child) return -ENOMEM;
+        child->owns_address_space = 0;
     } else {
         /* New process: COW clone */
         child_pml4 = vmm_clone_address_space(parent->cr3);
@@ -700,6 +707,7 @@ int64_t sys_clone(uint64_t flags, uint64_t stack, uint64_t parent_tid_ptr,
             vmm_destroy_address_space(child_pml4);
             return -ENOMEM;
         }
+        child->owns_address_space = 1;
     }
 
     child->ppid   = parent->pid;
@@ -783,6 +791,9 @@ int64_t sys_clone(uint64_t flags, uint64_t stack, uint64_t parent_tid_ptr,
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 #define FUTEX_HASH_SIZE 64
+#define FUTEX_WAIT_BITSET 9
+#define FUTEX_WAKE_BITSET 10
+#define FUTEX_BITSET_MATCH_ANY 0xFFFFFFFFu
 
 typedef struct futex_entry {
     uintptr_t  key;
@@ -815,9 +826,58 @@ static futex_entry_t *futex_find_or_create(uintptr_t cr3, uintptr_t uaddr) {
     return e;
 }
 
+static int copy_user_bytes(uintptr_t cr3, const void *user_src, void *dst, size_t len) {
+    if (!user_src || !dst) return -EFAULT;
+
+    uintptr_t up = (uintptr_t)user_src;
+    uint8_t *out = (uint8_t *)dst;
+    for (size_t i = 0; i < len; i++) {
+        uint64_t *pte = vmm_get_pte(cr3, up + i);
+        if (!pte || !(*pte & VMM_PRESENT)) return -EFAULT;
+        uintptr_t phys = (*pte) & VMM_PTE_ADDR_MASK;
+        uintptr_t off = (up + i) & (PAGE_SIZE - 1);
+        out[i] = *(uint8_t *)(vmm_phys_to_virt(phys) + off);
+    }
+    return 0;
+}
+
+static int futex_parse_timeout_deadline(uintptr_t cr3,
+                                        const kernel_timespec_t *timeout,
+                                        uint64_t *deadline_out) {
+    if (!timeout) {
+        *deadline_out = 0;
+        return 0;
+    }
+
+    kernel_timespec_t ts;
+    int cr = copy_user_bytes(cr3, timeout, &ts, sizeof(ts));
+    if (cr < 0) return cr;
+
+    int64_t sec = ts.tv_sec;
+    int64_t nsec = ts.tv_nsec;
+
+    if (sec == 0 && nsec == 0) return -ETIMEDOUT;
+
+    int valid_native = (sec >= 0 && nsec >= 0 && nsec < 1000000000LL);
+    if (!valid_native) {
+        int64_t sec32 = (int32_t)(sec & 0xFFFFFFFF);
+        int64_t nsec32 = (int32_t)(nsec & 0xFFFFFFFF);
+        if (sec32 == 0 && nsec32 == 0) return -ETIMEDOUT;
+        if (!(sec32 >= 0 && nsec32 >= 0 && nsec32 < 1000000000LL))
+            return -EINVAL;
+        sec = sec32;
+        nsec = nsec32;
+    }
+
+    uint64_t timeout_ms = (uint64_t)sec * 1000ULL + (uint64_t)(nsec / 1000000LL);
+    if (timeout_ms == 0) return -ETIMEDOUT;
+    *deadline_out = sched_get_ticks() + timeout_ms;
+    return 0;
+}
+
 int64_t sys_futex(uint32_t *uaddr, int op, uint32_t val,
                   const kernel_timespec_t *timeout, uint32_t *uaddr2, uint32_t val3) {
-    (void)timeout; (void)uaddr2; (void)val3;
+    (void)uaddr2;
     if (!uaddr) return -EFAULT;
 
     task_t *cur = sched_current();
@@ -825,8 +885,12 @@ int64_t sys_futex(uint32_t *uaddr, int op, uint32_t val,
 
     int futex_op = op & 0x7F;
 
+    uint64_t timeout_deadline = 0;
+
     switch (futex_op) {
         case 0: { /* FUTEX_WAIT */
+            int tr = futex_parse_timeout_deadline(cur->cr3, timeout, &timeout_deadline);
+            if (tr < 0) return tr;
             futex_lock_acquire();
             if (__atomic_load_n(uaddr, __ATOMIC_SEQ_CST) != val) {
                 futex_lock_release();
@@ -835,6 +899,16 @@ int64_t sys_futex(uint32_t *uaddr, int op, uint32_t val,
             futex_entry_t *e = futex_find_or_create(cur->cr3, (uintptr_t)uaddr);
             futex_lock_release();
             if (!e) return -ENOMEM;
+
+            if (timeout) {
+                while (__atomic_load_n(uaddr, __ATOMIC_SEQ_CST) == val) {
+                    uint64_t now = sched_get_ticks();
+                    if (now >= timeout_deadline) return -ETIMEDOUT;
+                    sched_sleep(1);
+                }
+                return 0;
+            }
+
             waitq_wait(&e->wq);
             return 0;
         }
@@ -852,7 +926,106 @@ int64_t sys_futex(uint32_t *uaddr, int op, uint32_t val,
             return woken;
         }
 
+        case FUTEX_WAIT_BITSET: {
+            kernel_timespec_t ts_dbg = {0, 0};
+            int dbg_cr = timeout ? copy_user_bytes(cur->cr3, timeout, &ts_dbg, sizeof(ts_dbg)) : 0;
+            KLOG_INFO("futex: WAIT_BITSET uaddr=%p val=%u mask=0x%08x timeout=%p sec=%lld nsec=%lld\n",
+                      (void *)uaddr,
+                      val,
+                      (unsigned int)val3,
+                      (void *)timeout,
+                      timeout ? (long long)(dbg_cr < 0 ? -1LL : ts_dbg.tv_sec) : -1LL,
+                      timeout ? (long long)(dbg_cr < 0 ? -1LL : ts_dbg.tv_nsec) : -1LL);
+            int tr = futex_parse_timeout_deadline(cur->cr3, timeout, &timeout_deadline);
+            if (tr < 0) return tr;
+            if (val3 == 0) return -EINVAL;
+            futex_lock_acquire();
+            if (__atomic_load_n(uaddr, __ATOMIC_SEQ_CST) != val) {
+                futex_lock_release();
+                return -EAGAIN;
+            }
+            futex_entry_t *e = futex_find_or_create(cur->cr3, (uintptr_t)uaddr);
+            futex_lock_release();
+            if (!e) return -ENOMEM;
+
+            if (timeout) {
+                while (__atomic_load_n(uaddr, __ATOMIC_SEQ_CST) == val) {
+                    uint64_t now = sched_get_ticks();
+                    if (now >= timeout_deadline) return -ETIMEDOUT;
+                    sched_sleep(1);
+                }
+                return 0;
+            }
+
+            waitq_wait(&e->wq);
+            return 0;
+        }
+
+        case FUTEX_WAKE_BITSET: {
+            if (val3 == 0) return -EINVAL;
+            futex_lock_acquire();
+            futex_entry_t *e = futex_find_or_create(cur->cr3, (uintptr_t)uaddr);
+            futex_lock_release();
+            if (!e) return 0;
+            if ((val3 & FUTEX_BITSET_MATCH_ANY) == 0) return 0;
+            int woken = 0;
+            for (uint32_t i = 0; i < val; i++) {
+                waitq_wake_one(&e->wq);
+                woken++;
+            }
+            return woken;
+        }
+
         default:
             return -ENOSYS;
     }
+}
+
+int64_t sys_gettid(void) {
+    task_t *cur = sched_current();
+    if (!cur) return -ESRCH;
+    return (int64_t)cur->tid;
+}
+
+int64_t sys_tgkill(int tgid, int tid, int sig) {
+    if (tgid <= 0 || tid <= 0) return -EINVAL;
+    if (sig < 0 || sig >= NSIGS) return -EINVAL;
+
+    task_t *target = task_lookup((uint32_t)tid);
+    if (!target || target->state == TASK_DEAD) return -ESRCH;
+    if ((int)target->pid != tgid) return -ESRCH;
+
+    if (sig == 0) return 0; /* existence check */
+    signal_send(target, sig);
+    return 0;
+}
+
+int64_t sys_set_robust_list(uint64_t head, uint64_t len) {
+    task_t *cur = sched_current();
+    if (!cur) return -ESRCH;
+
+    /* Linux x86_64 robust_list_head is 24 bytes. */
+    if (len != 24) return -EINVAL;
+
+    cur->robust_list_head = head;
+    cur->robust_list_len = len;
+    return 0;
+}
+
+int64_t sys_get_robust_list(int pid, uint64_t *head_ptr, uint64_t *len_ptr) {
+    if (!head_ptr || !len_ptr) return -EFAULT;
+
+    task_t *target;
+    if (pid == 0) {
+        target = sched_current();
+    } else {
+        if (pid < 0) return -EINVAL;
+        target = task_lookup((uint32_t)pid);
+    }
+
+    if (!target || target->state == TASK_DEAD) return -ESRCH;
+
+    *head_ptr = target->robust_list_head;
+    *len_ptr = target->robust_list_len;
+    return 0;
 }

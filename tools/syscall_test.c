@@ -85,6 +85,7 @@ static long syscall6(long nr, long a1, long a2, long a3,
 #define SYS_GETGID        104
 #define SYS_GETEUID       107
 #define SYS_GETEGID       108
+#define SYS_GETTID        186
 #define SYS_OPENAT        257
 #define SYS_MKDIRAT       258
 #define SYS_RENAMEAT      264
@@ -96,19 +97,26 @@ static long syscall6(long nr, long a1, long a2, long a3,
 #define SYS_UNLINK        87
 #define SYS_GETDENTS64    217
 #define SYS_SET_TID_ADDRESS 218
+#define SYS_FUTEX         202
 #define SYS_CLOCK_GETTIME 228
 #define SYS_EXIT_GROUP    231
+#define SYS_TGKILL        234
 #define SYS_UMASK         95
 #define SYS_DUP3          292
 #define SYS_FSTATAT       262
 #define SYS_UNLINKAT      263
 #define SYS_FACCESSAT     269
+#define SYS_SET_ROBUST_LIST 273
+#define SYS_GET_ROBUST_LIST 274
 #define SYS_PIPE          22
 #define SYS_RENAME        82
 #define SYS_ARCH_PRCTL    158
 
 /* errno values used by ABI conformance checks */
 #define EBADF             9
+#define EAGAIN            11
+#define EINVAL            22
+#define ETIMEDOUT         110
 
 /* Open flags */
 #define O_RDONLY   0
@@ -119,6 +127,11 @@ static long syscall6(long nr, long a1, long a2, long a3,
 
 #define AT_FDCWD   -100
 #define AT_REMOVEDIR 0x200
+
+#define FUTEX_WAIT         0
+#define FUTEX_WAKE         1
+#define FUTEX_WAIT_BITSET  9
+#define FUTEX_WAKE_BITSET  10
 
 /* mmap flags */
 #define PROT_READ    1
@@ -443,6 +456,47 @@ static void test_ids(void) {
     test_result("getegid() == 0", egid == 0);
 }
 
+static void test_tid_and_tgkill(void) {
+    long pid = syscall0(SYS_GETPID);
+    long tid = syscall0(SYS_GETTID);
+    test_result("gettid() > 0", tid > 0);
+    test_result("single-thread pid == tid", pid == tid);
+
+    long r = syscall3(SYS_TGKILL, pid, tid, 0);
+    test_result("tgkill(pid, tid, 0) returns 0", r == 0);
+}
+
+static void test_robust_list(void) {
+    unsigned long robust_head[3] = {0, 0, 0};
+    unsigned long out_head = 0;
+    unsigned long out_len = 0;
+
+    long r = syscall2(SYS_SET_ROBUST_LIST, (long)robust_head, 24);
+    test_result("set_robust_list(head,24) returns 0", r == 0);
+
+    r = syscall3(SYS_GET_ROBUST_LIST, 0, (long)&out_head, (long)&out_len);
+    test_result("get_robust_list(0,...) returns 0", r == 0);
+    test_result("get_robust_list head matches", out_head == (unsigned long)robust_head);
+    test_result("get_robust_list len is 24", out_len == 24);
+}
+
+static void test_futex_phase2(void) {
+    volatile uint32_t fut = 1;
+    struct timespec ts;
+
+    long r = syscall6(SYS_FUTEX, (long)&fut, FUTEX_WAIT, 0, 0, 0, 0);
+    test_result("futex WAIT mismatch returns -EAGAIN", r == -EAGAIN);
+
+    ts.tv_sec = 0;
+    ts.tv_nsec = 0;
+    r = syscall6(SYS_FUTEX, (long)&fut, FUTEX_WAIT_BITSET, 1,
+                 (long)&ts, 0, (long)-1);
+    test_result("futex WAIT_BITSET zero-timeout returns -ETIMEDOUT", r == -ETIMEDOUT);
+
+    r = syscall6(SYS_FUTEX, (long)&fut, FUTEX_WAKE_BITSET, 1, 0, 0, 0);
+    test_result("futex WAKE_BITSET zero mask returns -EINVAL", r == -EINVAL);
+}
+
 /* ── getcwd ──────────────────────────────────────────────────────────── */
 static void test_getcwd(void) {
     char buf[256];
@@ -763,8 +817,11 @@ void _start(void) {
 
     println("\n\033[1;33m  -- Process --\033[0m");
     test_pid();
+    test_tid_and_tgkill();
     test_ids();
     test_set_tid_address();
+    test_robust_list();
+    test_futex_phase2();
     test_arch_prctl();
 
     println("\n\033[1;33m  -- I/O misc --\033[0m");

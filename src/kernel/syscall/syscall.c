@@ -83,6 +83,10 @@ int64_t sys_mmap(uint64_t addr, uint64_t len, int prot, int flags,
                  int fd, int64_t offset);
 int64_t sys_munmap(uint64_t addr, uint64_t len);
 int64_t sys_mprotect(uint64_t addr, uint64_t len, int prot);
+int64_t sys_gettid(void);
+int64_t sys_tgkill(int tgid, int tid, int sig);
+int64_t sys_set_robust_list(uint64_t head, uint64_t len);
+int64_t sys_get_robust_list(int pid, uint64_t *head_ptr, uint64_t *len_ptr);
 
 /* ── Syscall table ───────────────────────────────────────────────────────── */
 typedef int64_t (*syscall_fn_t)(uint64_t, uint64_t, uint64_t,
@@ -199,6 +203,8 @@ static int64_t sc_getsockopt(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_
 static int64_t sc_getpid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;
       task_t *t = sched_current(); return t ? (int64_t)t->pid : 0; }
+static int64_t sc_gettid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+        { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; return sys_gettid(); }
 static int64_t sc_getppid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;
       task_t *t = sched_current(); return t ? (int64_t)t->ppid : 0; }
@@ -311,6 +317,21 @@ static int64_t sc_kill(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,ui
     return 0;
 }
 
+static int64_t sc_tgkill(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)d;(void)e;(void)f;
+    return sys_tgkill((int)a, (int)b, (int)c);
+}
+
+static int64_t sc_set_robust_list(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)c;(void)d;(void)e;(void)f;
+    return sys_set_robust_list(a, b);
+}
+
+static int64_t sc_get_robust_list(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)d;(void)e;(void)f;
+    return sys_get_robust_list((int)a, (uint64_t *)b, (uint64_t *)c);
+}
+
 static int64_t sc_wait4(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { (void)e;(void)f; return sys_wait4((int)a,(int*)b,(int)c,(void*)d); }
 
@@ -366,8 +387,11 @@ static int64_t sc_clone(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,u
 extern int64_t sys_futex(uint32_t *uaddr, int op, uint32_t val,
                          const kernel_timespec_t *timeout, uint32_t *uaddr2, uint32_t val3);
 static int64_t sc_futex(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
-    return sys_futex((uint32_t *)a, (int)b, (uint32_t)c,
-                     (const kernel_timespec_t *)d, (uint32_t *)e, (uint32_t)f);
+    int64_t r = sys_futex((uint32_t *)a, (int)b, (uint32_t)c,
+                          (const kernel_timespec_t *)d, (uint32_t *)e, (uint32_t)f);
+    KLOG_ERR("futex_sc: uaddr=%p op=%llu val=%llu timeout=%p uaddr2=%p val3=0x%llx ret=%lld\n",
+             (void *)a, b, c, (void *)d, (void *)e, f, r);
+    return r;
 }
 
 /* Readlink syscall */
@@ -426,11 +450,13 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_DUP]       = sc_dup,
     [SYS_DUP2]      = sc_dup2,
     [SYS_GETPID]    = sc_getpid,
+    [SYS_GETTID]    = sc_gettid,
     [SYS_FORK]      = sc_fork,
     [SYS_EXECVE]    = sc_execve,
     [SYS_EXIT]      = sc_exit,
     [SYS_WAIT4]     = sc_wait4,
     [SYS_KILL]      = sc_kill,
+    [SYS_TGKILL]    = sc_tgkill,
     [SYS_GETCWD]    = sc_getcwd,
     [SYS_CHDIR]     = sc_chdir,
     [SYS_RENAME]    = sc_rename,
@@ -450,6 +476,8 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_ARCH_PRCTL]= sc_arch_prctl,
     [SYS_GETDENTS64]= sc_getdents64,
     [SYS_SET_TID_ADDRESS] = sc_set_tid_address,
+    [SYS_SET_ROBUST_LIST] = sc_set_robust_list,
+    [SYS_GET_ROBUST_LIST] = sc_get_robust_list,
     [SYS_CLOCK_GETTIME]   = sc_clock_gettime,
     [SYS_EXIT_GROUP]= sc_exit_group,
     [SYS_DUP3]      = sc_dup3,
@@ -509,7 +537,6 @@ void syscall_dispatch_fast(cpu_regs_t *regs) {
     /* Identical dispatch logic — the asm stub already built a cpu_regs_t frame */
     uint64_t nr = regs->rax;
 
-    KLOG_DEBUG("syscall_fast: nr=%llu rip=%p\n", nr, (void *)regs->rip);
 
     if (nr == SYS_FORK || nr == SYS_CLONE) g_fork_regs = regs;
     if (nr == SYS_RT_SIGRETURN) g_sigreturn_regs = regs;
@@ -523,7 +550,6 @@ void syscall_dispatch_fast(cpu_regs_t *regs) {
         regs->rax = (uint64_t)-ENOSYS;
     }
 
-    KLOG_DEBUG("syscall_fast: nr=%llu returned %lld\n", nr, (int64_t)regs->rax);
 
     /* Deliver pending signals on return to user-space */
     task_t *cur = sched_current();

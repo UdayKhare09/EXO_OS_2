@@ -49,9 +49,11 @@
 #define SYS_GETEGID     108
 #define SYS_GETPPID     110
 #define SYS_ARCH_PRCTL  158
+#define SYS_GETTID      186
 #define SYS_FUTEX       202
 #define SYS_GETDENTS64  217
 #define SYS_SET_TID_ADDRESS 218
+#define SYS_TGKILL      234
 #define SYS_CLOCK_GETTIME   228
 #define SYS_EXIT_GROUP  231
 #define SYS_FSTATAT     262
@@ -59,6 +61,8 @@
 #define SYS_SYMLINKAT   266
 #define SYS_READLINKAT  267
 #define SYS_FACCESSAT   269
+#define SYS_SET_ROBUST_LIST 273
+#define SYS_GET_ROBUST_LIST 274
 #define SYS_DUP3        292
 #define SYS_PIPE2       293
 

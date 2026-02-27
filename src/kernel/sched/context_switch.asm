@@ -171,11 +171,31 @@ syscall_entry:
     push r14
     push r15
 
+    ; Protect user FP/SIMD state across syscall C code. The kernel is built
+    ; with SSE/AVX enabled, so without this user XMM/YMM registers can be
+    ; clobbered by the syscall path.
+    mov  rcx, [gs:24]                  ; cpu_info->isr_xsave_buf
+    test rcx, rcx
+    jz   .syscall_call_dispatch
+    mov  eax, 7                        ; x87(1) | SSE(2) | AVX(4)
+    xor  edx, edx
+    xsave64 [rcx]
+
     ; Call C dispatcher:  void syscall_dispatch_fast(cpu_regs_t *regs)
+.syscall_call_dispatch:
     mov  rdi, rsp
     call syscall_dispatch_fast
 
+    ; Restore user FP/SIMD state saved above.
+    mov  rcx, [gs:24]
+    test rcx, rcx
+    jz   .syscall_restore_gp
+    mov  eax, 7
+    xor  edx, edx
+    xrstor64 [rcx]
+
     ; Restore GP registers
+.syscall_restore_gp:
     pop  r15
     pop  r14
     pop  r13

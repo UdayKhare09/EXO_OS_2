@@ -101,6 +101,7 @@ static task_t *task_alloc_common(const char *name, uint32_t cpu_id) {
     t->brk_base     = USER_HEAP_BASE;
     t->brk_current  = USER_HEAP_BASE;
     t->mmap_next    = USER_MMAP_BASE;
+    t->owns_address_space = 0;
     t->fs_base      = 0;
     t->clear_child_tid = NULL;
 
@@ -130,6 +131,7 @@ task_t *task_create(const char *name, task_entry_t entry, void *arg,
     t->rsp    = stack_virt_top;
     t->cr3    = read_cr3();
     t->is_user = 0;
+    t->owns_address_space = 0;
 
     KLOG_DEBUG("task: created kernel '%s' tid=%u cpu=%u rsp=%p\n",
                t->name, t->tid, t->cpu_id, (void *)t->rsp);
@@ -155,6 +157,7 @@ task_t *task_create_user(const char *name, uintptr_t pml4_phys,
     t->rsp     = stack_virt_top;
     t->cr3     = pml4_phys;
     t->is_user = 1;
+    t->owns_address_space = 1;
 
     KLOG_DEBUG("task: created user '%s' tid=%u cpu=%u entry=%p ustack=%p\n",
                t->name, t->tid, t->cpu_id,
@@ -180,7 +183,7 @@ void task_destroy(task_t *t) {
     t->vma_list = NULL;
 
     /* Destroy user address space (if process had its own) */
-    if (t->is_user && t->cr3 != vmm_get_kernel_pml4()) {
+    if (t->is_user && t->owns_address_space && t->cr3 != vmm_get_kernel_pml4()) {
         vmm_destroy_address_space(t->cr3);
     }
 
