@@ -509,22 +509,40 @@ retry:
  * ═══════════════════════════════════════════════════════════════════════════ */
 int64_t sys_mmap(uint64_t addr, uint64_t len, int prot, int flags,
                  int fd, int64_t offset) {
-    (void)fd; (void)offset;  /* file-backed mmap not yet supported */
-
     task_t *cur = sched_current();
     if (!cur) return -ESRCH;
 
     if (len == 0) return -EINVAL;
 
-    /* Only anonymous mappings for now */
-    if (!(flags & MAP_ANONYMOUS))
-        return -ENOSYS;
+    bool is_anon = (flags & MAP_ANONYMOUS) != 0;
+    file_t *map_file = NULL;
+    vnode_t *map_vnode = NULL;
+
+    if (!is_anon) {
+        if (flags & MAP_SHARED)
+            return -ENOSYS;
+        if (!(flags & MAP_PRIVATE))
+            return -EINVAL;
+        if (offset < 0 || (offset & (PAGE_SIZE - 1)))
+            return -EINVAL;
+
+        map_file = fd_get(cur, fd);
+        if (!map_file) return -EBADF;
+        if ((map_file->flags & O_ACCMODE) == O_WRONLY) return -EACCES;
+
+        map_vnode = map_file->vnode;
+        if (!map_vnode || !map_vnode->ops || !map_vnode->ops->read)
+            return -EINVAL;
+        if (!VFS_S_ISREG(map_vnode->mode))
+            return -EINVAL;
+    }
 
     /* Page-align length */
     len = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
     /* Choose address */
     uint64_t map_addr;
+    uint64_t old_mmap_next = cur->mmap_next;
     if ((flags & MAP_FIXED) && addr) {
         map_addr = addr & ~(PAGE_SIZE - 1);
     } else {
@@ -537,13 +555,41 @@ int64_t sys_mmap(uint64_t addr, uint64_t len, int prot, int flags,
     if (prot & PROT_WRITE) pflags |= VMM_WRITE;
     if (!(prot & PROT_EXEC)) pflags |= VMM_NX;
 
-    /* Map pages (demand-paging would be better, but allocate now for simplicity) */
+    uint64_t mapped_len = 0;
+
+    /* Map pages (eager population) */
     for (uint64_t off = 0; off < len; off += PAGE_SIZE) {
         uintptr_t pg = pmm_alloc_pages(1);
-        if (!pg) return -ENOMEM;
+        if (!pg) {
+            if (!(flags & MAP_FIXED)) cur->mmap_next = old_mmap_next;
+            for (uint64_t u = 0; u < mapped_len; u += PAGE_SIZE) {
+                uintptr_t phys = vmm_unmap_page_in(cur->cr3, map_addr + u);
+                if (phys) pmm_free_pages(phys, 1);
+            }
+            return -ENOMEM;
+        }
         /* Zero the page */
         memset((void *)vmm_phys_to_virt(pg), 0, PAGE_SIZE);
         vmm_map_page_in(cur->cr3, map_addr + off, pg, pflags);
+
+        if (!is_anon) {
+            uint64_t file_off = (uint64_t)offset + off;
+            if (file_off < map_vnode->size) {
+                size_t to_read = (size_t)(map_vnode->size - file_off);
+                if (to_read > PAGE_SIZE) to_read = PAGE_SIZE;
+                ssize_t rd = map_vnode->ops->read(map_vnode,
+                    (void *)vmm_phys_to_virt(pg), to_read, file_off);
+                if (rd < 0) {
+                    if (!(flags & MAP_FIXED)) cur->mmap_next = old_mmap_next;
+                    for (uint64_t u = 0; u <= off; u += PAGE_SIZE) {
+                        uintptr_t phys = vmm_unmap_page_in(cur->cr3, map_addr + u);
+                        if (phys) pmm_free_pages(phys, 1);
+                    }
+                    return rd;
+                }
+            }
+        }
+        mapped_len += PAGE_SIZE;
     }
 
     /* Track VMA */
@@ -551,7 +597,8 @@ int64_t sys_mmap(uint64_t addr, uint64_t len, int prot, int flags,
     if (v) {
         v->start = map_addr;
         v->end   = map_addr + len;
-        v->flags = VMA_ANON | VMA_USER;
+        v->flags = VMA_USER;
+        if (is_anon) v->flags |= VMA_ANON;
         if (prot & PROT_READ)  v->flags |= VMA_READ;
         if (prot & PROT_WRITE) v->flags |= VMA_WRITE;
         if (prot & PROT_EXEC)  v->flags |= VMA_EXEC;
@@ -927,15 +974,6 @@ int64_t sys_futex(uint32_t *uaddr, int op, uint32_t val,
         }
 
         case FUTEX_WAIT_BITSET: {
-            kernel_timespec_t ts_dbg = {0, 0};
-            int dbg_cr = timeout ? copy_user_bytes(cur->cr3, timeout, &ts_dbg, sizeof(ts_dbg)) : 0;
-            KLOG_INFO("futex: WAIT_BITSET uaddr=%p val=%u mask=0x%08x timeout=%p sec=%lld nsec=%lld\n",
-                      (void *)uaddr,
-                      val,
-                      (unsigned int)val3,
-                      (void *)timeout,
-                      timeout ? (long long)(dbg_cr < 0 ? -1LL : ts_dbg.tv_sec) : -1LL,
-                      timeout ? (long long)(dbg_cr < 0 ? -1LL : ts_dbg.tv_nsec) : -1LL);
             int tr = futex_parse_timeout_deadline(cur->cr3, timeout, &timeout_deadline);
             if (tr < 0) return tr;
             if (val3 == 0) return -EINVAL;

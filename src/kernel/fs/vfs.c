@@ -159,6 +159,15 @@ static mount_t *find_mount_exact(const char *resolved_path) {
     return NULL;
 }
 
+static void trim_resolved_parent(char *resolved) {
+    if (!resolved || resolved[0] == '\0') return;
+    char *last_slash = strrchr(resolved, '/');
+    if (last_slash && last_slash != resolved)
+        *last_slash = '\0';
+    else
+        resolved[0] = '\0';
+}
+
 /* ── Path resolution ─────────────────────────────────────────────────────── */
 #define MAX_SYMLINK_DEPTH 8
 
@@ -194,10 +203,12 @@ vnode_t *vfs_lookup(const char *path, bool follow_last_link, int *err_out) {
     char component[VFS_NAME_MAX + 1];
     /* Track the resolved path so we can match mount points by path */
     char resolved[VFS_MOUNT_PATH_MAX];
-    if (start_mount && strcmp(start_mount->path, "/") != 0)
-        strncpy(resolved, start_mount->path, VFS_MOUNT_PATH_MAX);
-    else
+    if (start_mount && strcmp(start_mount->path, "/") != 0) {
+        strncpy(resolved, start_mount->path, VFS_MOUNT_PATH_MAX - 1);
+        resolved[VFS_MOUNT_PATH_MAX - 1] = '\0';
+    } else {
         resolved[0] = '\0';  /* will become "/" after first append */
+    }
 
     while (*p) {
         /* Skip redundant slashes */
@@ -222,14 +233,39 @@ vnode_t *vfs_lookup(const char *path, bool follow_last_link, int *err_out) {
         /* Handle special names */
         if (strcmp(component, ".") == 0) continue;
         if (strcmp(component, "..") == 0) {
-            /* For now: treat ".." at root as staying at root */
-            /* TODO: proper parent tracking across mountpoints */
-            /* Trim last component from resolved path */
-            char *last_slash = strrchr(resolved, '/');
-            if (last_slash && last_slash != resolved)
-                *last_slash = '\0';
-            else
-                resolved[0] = '\0';
+            /* If currently at a mounted root (non-/), cross back to parent mount path. */
+            mount_t *at_mount = find_mount_exact(resolved);
+            if (at_mount && strcmp(at_mount->path, "/") != 0) {
+                trim_resolved_parent(resolved);
+
+                char parent_path[VFS_MOUNT_PATH_MAX];
+                if (resolved[0] == '\0') strcpy(parent_path, "/");
+                else {
+                    strncpy(parent_path, resolved, sizeof(parent_path) - 1);
+                    parent_path[sizeof(parent_path) - 1] = '\0';
+                }
+
+                int sub_err = 0;
+                vnode_t *parent_v = vfs_lookup(parent_path, true, &sub_err);
+                if (!parent_v) {
+                    vfs_vnode_put(cur);
+                    if (err_out) *err_out = sub_err ? sub_err : -ENOENT;
+                    return NULL;
+                }
+                vfs_vnode_put(cur);
+                cur = parent_v;
+                continue;
+            }
+
+            /* Regular in-filesystem parent traversal. */
+            if (cur->ops && cur->ops->lookup) {
+                vnode_t *parent_v = cur->ops->lookup(cur, "..");
+                if (parent_v) {
+                    vfs_vnode_put(cur);
+                    cur = parent_v;
+                }
+            }
+            trim_resolved_parent(resolved);
             continue;
         }
 

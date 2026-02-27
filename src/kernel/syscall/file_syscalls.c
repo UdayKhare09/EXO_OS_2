@@ -21,6 +21,7 @@
 
 /* ── Internal helpers ────────────────────────────────────────────────────── */
 static void fill_linux_stat(linux_stat_t *lst, const vfs_stat_t *st);
+int64_t sys_read(int fd, void *buf, uint64_t count);
 int64_t sys_fstatat(int dirfd, const char *upath, linux_stat_t *buf, int flags);
 int64_t sys_mkdirat(int dirfd, const char *upath, uint32_t mode);
 int64_t sys_unlinkat(int dirfd, const char *upath, int flags);
@@ -62,6 +63,57 @@ static int resolve_path_at(int dirfd, const char *upath, char *out) {
 }
 
 static inline task_t *cur_task(void) { return sched_current(); }
+
+int64_t sys_pread64(int fd, void *buf, uint64_t count, int64_t offset) {
+    if (!buf || count == 0) return 0;
+    if (offset < 0) return -EINVAL;
+
+    task_t *t = cur_task();
+    file_t *f = fd_get(t, fd);
+    if (!f) return -EBADF;
+    if ((f->flags & O_ACCMODE) == O_WRONLY) return -EACCES;
+    if (!f->vnode) return -ESPIPE;
+
+    vnode_t *v = f->vnode;
+    if (!v || !v->ops || !v->ops->read) return -EINVAL;
+    if (VFS_S_ISDIR(v->mode)) return -EISDIR;
+
+    ssize_t n = v->ops->read(v, buf, (size_t)count, (uint64_t)offset);
+    if (n < 0) return n;
+    return (int64_t)n;
+}
+
+int64_t sys_pwrite64(int fd, const void *buf, uint64_t count, int64_t offset) {
+    if (!buf || count == 0) return 0;
+    if (offset < 0) return -EINVAL;
+
+    task_t *t = cur_task();
+    file_t *f = fd_get(t, fd);
+    if (!f) return -EBADF;
+    if ((f->flags & O_ACCMODE) == O_RDONLY) return -EACCES;
+    if (!f->vnode) return -ESPIPE;
+
+    vnode_t *v = f->vnode;
+    if (!v || !v->ops || !v->ops->write) return -EINVAL;
+    if (VFS_S_ISDIR(v->mode)) return -EISDIR;
+
+    ssize_t n = v->ops->write(v, buf, (size_t)count, (uint64_t)offset);
+    if (n < 0) return n;
+    return (int64_t)n;
+}
+
+int64_t sys_readv(int fd, const iovec_t *iov, int iovcnt) {
+    if (!iov || iovcnt < 0) return -EINVAL;
+    int64_t total = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        if (iov[i].iov_len == 0) continue;
+        int64_t r = sys_read(fd, iov[i].iov_base, iov[i].iov_len);
+        if (r < 0) return total > 0 ? total : r;
+        total += r;
+        if ((uint64_t)r < iov[i].iov_len) break;
+    }
+    return total;
+}
 
 /* ── sys_read ────────────────────────────────────────────────────────────── */
 int64_t sys_read(int fd, void *buf, uint64_t count) {

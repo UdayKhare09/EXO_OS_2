@@ -11,9 +11,87 @@
 #include "syscall.h"
 #include "net/socket.h"
 #include "net/socket_defs.h"
+#include "drivers/input/input.h"
 #include "sched/sched.h"
 #include "lib/klog.h"
 #include "lib/string.h"
+
+/* ioctl requests (Linux ABI subset) */
+#define TCGETS      0x5401
+#define TCSETS      0x5402
+#define TIOCGWINSZ  0x5413
+#define FIONBIO     0x5421
+
+typedef uint32_t tcflag_t;
+typedef uint8_t  cc_t;
+typedef uint32_t speed_t;
+
+#define NCCS 19
+
+typedef struct {
+    tcflag_t c_iflag;
+    tcflag_t c_oflag;
+    tcflag_t c_cflag;
+    tcflag_t c_lflag;
+    cc_t     c_line;
+    cc_t     c_cc[NCCS];
+    speed_t  c_ispeed;
+    speed_t  c_ospeed;
+} kernel_termios_t;
+
+typedef struct {
+    uint16_t ws_row;
+    uint16_t ws_col;
+    uint16_t ws_xpixel;
+    uint16_t ws_ypixel;
+} kernel_winsize_t;
+
+static kernel_termios_t g_tty_termios = {
+    .c_iflag = 0x00000500U,
+    .c_oflag = 0x00000005U,
+    .c_cflag = 0x000000BFU,
+    .c_lflag = 0x00008A3BU,
+    .c_line = 0,
+    .c_cc = { 3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0, 0, 0 },
+    .c_ispeed = 38400,
+    .c_ospeed = 38400,
+};
+
+static inline bool is_tty_file(const file_t *f) {
+    return f && f->path[0] && strcmp(f->path, "/dev/tty") == 0;
+}
+
+static void sync_socket_nonblock(file_t *f) {
+    if (!f || f->f_ops != &g_socket_file_ops) return;
+    socket_t *sk = (socket_t *)f->private_data;
+    if (!sk) return;
+    sk->nonblock = (f->flags & O_NONBLOCK) ? 1 : 0;
+}
+
+static int tty_ioctl(file_t *f, unsigned long cmd, unsigned long arg) {
+    (void)f;
+    if (!arg) return -EINVAL;
+
+    if (cmd == TCGETS) {
+        kernel_termios_t *user_t = (kernel_termios_t *)(uintptr_t)arg;
+        *user_t = g_tty_termios;
+        return 0;
+    }
+    if (cmd == TCSETS) {
+        const kernel_termios_t *user_t = (const kernel_termios_t *)(uintptr_t)arg;
+        g_tty_termios = *user_t;
+        return 0;
+    }
+    if (cmd == TIOCGWINSZ) {
+        kernel_winsize_t *ws = (kernel_winsize_t *)(uintptr_t)arg;
+        ws->ws_row = 25;
+        ws->ws_col = 80;
+        ws->ws_xpixel = 0;
+        ws->ws_ypixel = 0;
+        return 0;
+    }
+    return -EINVAL;
+}
 
 /* ── socket(2) ───────────────────────────────────────────────────────────── */
 int64_t sys_socket(int domain, int type, int protocol) {
@@ -148,10 +226,11 @@ int64_t sys_poll(struct pollfd *fds, uint64_t nfds, int timeout) {
     if (!fds || nfds == 0) return 0;
 
     task_t *cur = sched_current();
-    int ready = 0;
+    int ready;
+    uint64_t start_ticks = sched_get_ticks();
+    uint64_t deadline = (timeout > 0) ? (start_ticks + (uint64_t)timeout) : 0;
 
-    /* simple poll implementation: check once, optionally block */
-    for (uint64_t attempt = 0; ; attempt++) {
+    for (;;) {
         ready = 0;
         for (uint64_t i = 0; i < nfds; i++) {
             fds[i].revents = 0;
@@ -164,12 +243,27 @@ int64_t sys_poll(struct pollfd *fds, uint64_t nfds, int timeout) {
             if (f->f_ops && f->f_ops->poll) {
                 fds[i].revents = (int16_t)f->f_ops->poll(f, fds[i].events);
                 if (fds[i].revents) ready++;
+            } else if (is_tty_file(f)) {
+                int mask = 0;
+                if ((fds[i].events & (POLLIN | POLLRDNORM)) && input_tty_char_available())
+                    mask |= (POLLIN | POLLRDNORM);
+                if (fds[i].events & (POLLOUT | POLLWRNORM))
+                    mask |= (POLLOUT | POLLWRNORM);
+                fds[i].revents = (int16_t)mask;
+                if (mask) ready++;
             }
         }
-        if (ready > 0 || timeout == 0) break;
-        /* block briefly and retry */
-        if (timeout > 0 && attempt > 0) break; /* simplified: try twice */
-        sched_sleep(timeout > 0 ? (uint32_t)timeout : 10);
+        if (ready > 0) break;
+        if (timeout == 0) break;
+
+        if (timeout > 0) {
+            uint64_t now = sched_get_ticks();
+            if (now >= deadline) break;
+            uint64_t remain = deadline - now;
+            sched_sleep((uint32_t)(remain > 10 ? 10 : remain));
+        } else {
+            sched_sleep(10);
+        }
     }
     return (int64_t)ready;
 }
@@ -179,7 +273,23 @@ int64_t sys_ioctl(int fd, unsigned long cmd, unsigned long arg) {
     task_t *cur = sched_current();
     file_t *f = fd_get(cur, fd);
     if (!f) return -EBADF;
+
+    if (cmd == FIONBIO) {
+        if (!arg) return -EINVAL;
+        int nb = *(int *)(uintptr_t)arg;
+        if (nb)
+            f->flags |= O_NONBLOCK;
+        else
+            f->flags &= ~O_NONBLOCK;
+        sync_socket_nonblock(f);
+        return 0;
+    }
+
     if (f->f_ops && f->f_ops->ioctl)
         return (int64_t)f->f_ops->ioctl(f, cmd, arg);
+
+    if (is_tty_file(f))
+        return (int64_t)tty_ioctl(f, cmd, arg);
+
     return -EINVAL;
 }

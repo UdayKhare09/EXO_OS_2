@@ -27,6 +27,9 @@
 /* ── Forward declarations to file_syscalls.c ────────────────────────────── */
 int64_t sys_read(int fd, void *buf, uint64_t count);
 int64_t sys_write(int fd, const void *buf, uint64_t count);
+int64_t sys_readv(int fd, const iovec_t *iov, int iovcnt);
+int64_t sys_pread64(int fd, void *buf, uint64_t count, int64_t offset);
+int64_t sys_pwrite64(int fd, const void *buf, uint64_t count, int64_t offset);
 int64_t sys_open(const char *path, int flags, uint32_t mode);
 int64_t sys_openat(int dirfd, const char *path, int flags, uint32_t mode);
 int64_t sys_close(int fd);
@@ -96,6 +99,10 @@ static int64_t sc_read(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,ui
     { (void)d;(void)e;(void)f; return sys_read((int)a,(void*)b,c); }
 static int64_t sc_write(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { (void)d;(void)e;(void)f; return sys_write((int)a,(const void*)b,c); }
+static int64_t sc_pread64(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)e;(void)f; return sys_pread64((int)a,(void*)b,c,(int64_t)d); }
+static int64_t sc_pwrite64(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)e;(void)f; return sys_pwrite64((int)a,(const void*)b,c,(int64_t)d); }
 static int64_t sc_open(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { (void)d;(void)e;(void)f; return sys_open((const char*)a,(int)b,(uint32_t)c); }
 static int64_t sc_openat(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
@@ -266,9 +273,213 @@ static int64_t sc_writev(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,
     return total;
 }
 
+static int64_t sc_readv(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)d;(void)e;(void)f;
+    return sys_readv((int)a, (const iovec_t *)b, (int)c);
+}
+
 static int64_t sc_access(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
     (void)c;(void)d;(void)e;(void)f;
     return sys_faccessat(AT_FDCWD, (const char *)a, (int)b, 0);
+}
+
+typedef struct {
+    int64_t tv_sec;
+    int64_t tv_usec;
+} kernel_timeval_t;
+
+typedef struct {
+    int64_t tms_utime;
+    int64_t tms_stime;
+    int64_t tms_cutime;
+    int64_t tms_cstime;
+} kernel_tms_t;
+
+#define CLOCK_REALTIME 0
+#define CLOCK_MONOTONIC 1
+#define TIMER_ABSTIME 1
+
+static int64_t sc_sched_yield(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;
+    sched_tick();
+    return 0;
+}
+
+static int64_t sc_nanosleep(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)c;(void)d;(void)e;(void)f;
+    const kernel_timespec_t *req = (const kernel_timespec_t *)a;
+    kernel_timespec_t *rem = (kernel_timespec_t *)b;
+    if (!req) return -EFAULT;
+    if (req->tv_sec < 0 || req->tv_nsec < 0 || req->tv_nsec >= 1000000000LL)
+        return -EINVAL;
+
+    uint64_t ms = (uint64_t)req->tv_sec * 1000ULL + (uint64_t)(req->tv_nsec / 1000000LL);
+    if (ms == 0 && req->tv_nsec > 0)
+        ms = 1;
+    if (ms > 0)
+        sched_sleep((uint32_t)ms);
+
+    if (rem) {
+        rem->tv_sec = 0;
+        rem->tv_nsec = 0;
+    }
+    return 0;
+}
+
+static int64_t sc_clock_nanosleep(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)e;(void)f;
+    int clock_id = (int)a;
+    int flags = (int)b;
+    const kernel_timespec_t *req = (const kernel_timespec_t *)c;
+    kernel_timespec_t *rem = (kernel_timespec_t *)d;
+
+    if (!req) return -EFAULT;
+    if (clock_id != CLOCK_REALTIME && clock_id != CLOCK_MONOTONIC) return -EINVAL;
+    if (flags & ~TIMER_ABSTIME) return -EINVAL;
+    if (req->tv_sec < 0 || req->tv_nsec < 0 || req->tv_nsec >= 1000000000LL) return -EINVAL;
+
+    uint64_t sleep_ms = 0;
+    if (flags & TIMER_ABSTIME) {
+        uint64_t now_ms = sched_get_ticks();
+        uint64_t abs_ms = (uint64_t)req->tv_sec * 1000ULL + (uint64_t)(req->tv_nsec / 1000000ULL);
+        if (abs_ms > now_ms)
+            sleep_ms = abs_ms - now_ms;
+    } else {
+        sleep_ms = (uint64_t)req->tv_sec * 1000ULL + (uint64_t)(req->tv_nsec / 1000000ULL);
+        if (sleep_ms == 0 && req->tv_nsec > 0)
+            sleep_ms = 1;
+    }
+
+    if (sleep_ms > 0)
+        sched_sleep((uint32_t)sleep_ms);
+
+    if (rem) {
+        rem->tv_sec = 0;
+        rem->tv_nsec = 0;
+    }
+    return 0;
+}
+
+static int64_t sc_times(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)b;(void)c;(void)d;(void)e;(void)f;
+    kernel_tms_t *tbuf = (kernel_tms_t *)a;
+    uint64_t ticks_ms = sched_get_ticks();
+    int64_t ticks_100hz = (int64_t)(ticks_ms / 10ULL);
+
+    if (tbuf) {
+        tbuf->tms_utime = ticks_100hz;
+        tbuf->tms_stime = 0;
+        tbuf->tms_cutime = 0;
+        tbuf->tms_cstime = 0;
+    }
+    return ticks_100hz;
+}
+
+static int64_t sc_gettimeofday(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)c;(void)d;(void)e;(void)f;
+    kernel_timeval_t *tv = (kernel_timeval_t *)a;
+    if (!tv) return -EFAULT;
+
+    uint64_t ticks = sched_get_ticks();
+    tv->tv_sec = (int64_t)(ticks / 1000ULL);
+    tv->tv_usec = (int64_t)((ticks % 1000ULL) * 1000ULL);
+
+    (void)b;
+    return 0;
+}
+
+typedef struct {
+    uint64_t rlim_cur;
+    uint64_t rlim_max;
+} kernel_rlimit_t;
+
+enum {
+    RLIMIT_CPU = 0,
+    RLIMIT_FSIZE = 1,
+    RLIMIT_DATA = 2,
+    RLIMIT_STACK = 3,
+    RLIMIT_CORE = 4,
+    RLIMIT_RSS = 5,
+    RLIMIT_NPROC = 6,
+    RLIMIT_NOFILE = 7,
+    RLIMIT_MEMLOCK = 8,
+    RLIMIT_AS = 9,
+    RLIMIT_LOCKS = 10,
+    RLIMIT_SIGPENDING = 11,
+    RLIMIT_MSGQUEUE = 12,
+    RLIMIT_NICE = 13,
+    RLIMIT_RTPRIO = 14,
+    RLIMIT_RTTIME = 15,
+};
+
+static int rlimit_default_for(int resource, kernel_rlimit_t *out) {
+    if (!out) return -EFAULT;
+    out->rlim_cur = ~0ULL;
+    out->rlim_max = ~0ULL;
+
+    switch (resource) {
+        case RLIMIT_NOFILE:
+            out->rlim_cur = TASK_FD_TABLE_SIZE;
+            out->rlim_max = TASK_FD_TABLE_SIZE;
+            return 0;
+        case RLIMIT_STACK:
+            out->rlim_cur = TASK_STACK_SIZE;
+            out->rlim_max = TASK_STACK_SIZE;
+            return 0;
+        case RLIMIT_AS:
+        case RLIMIT_DATA:
+        case RLIMIT_CPU:
+        case RLIMIT_FSIZE:
+        case RLIMIT_CORE:
+        case RLIMIT_RSS:
+        case RLIMIT_NPROC:
+        case RLIMIT_MEMLOCK:
+        case RLIMIT_LOCKS:
+        case RLIMIT_SIGPENDING:
+        case RLIMIT_MSGQUEUE:
+        case RLIMIT_NICE:
+        case RLIMIT_RTPRIO:
+        case RLIMIT_RTTIME:
+            return 0;
+        default:
+            return -EINVAL;
+    }
+}
+
+static int64_t sc_getrlimit(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)c;(void)d;(void)e;(void)f;
+    int resource = (int)a;
+    kernel_rlimit_t *rlim = (kernel_rlimit_t *)b;
+    if (!rlim) return -EFAULT;
+    return rlimit_default_for(resource, rlim);
+}
+
+static int64_t sc_prlimit64(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)e;(void)f;
+    int pid = (int)a;
+    int resource = (int)b;
+    const kernel_rlimit_t *new_limit = (const kernel_rlimit_t *)c;
+    kernel_rlimit_t *old_limit = (kernel_rlimit_t *)d;
+
+    task_t *cur = sched_current();
+    if (!cur) return -ESRCH;
+    if (pid != 0 && pid != (int)cur->pid) return -ESRCH;
+
+    kernel_rlimit_t def;
+    int rr = rlimit_default_for(resource, &def);
+    if (rr < 0) return rr;
+
+    if (old_limit)
+        *old_limit = def;
+
+    if (new_limit) {
+        if (new_limit->rlim_cur > new_limit->rlim_max)
+            return -EINVAL;
+        if (new_limit->rlim_cur > def.rlim_max || new_limit->rlim_max > def.rlim_max)
+            return -EPERM;
+    }
+
+    return 0;
 }
 
 static int64_t sc_faccessat(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
@@ -315,6 +526,69 @@ static int64_t sc_kill(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,ui
     if (!target) return -ESRCH;
     signal_send(target, (int)b);
     return 0;
+}
+
+typedef struct {
+    char sysname[65];
+    char nodename[65];
+    char release[65];
+    char version[65];
+    char machine[65];
+    char domainname[65];
+} kernel_utsname_t;
+
+static int64_t sc_uname(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)b;(void)c;(void)d;(void)e;(void)f;
+    kernel_utsname_t *u = (kernel_utsname_t *)a;
+    if (!u) return -EFAULT;
+
+    memset(u, 0, sizeof(*u));
+    strncpy(u->sysname, "Linux", sizeof(u->sysname) - 1);
+    strncpy(u->nodename, "exo", sizeof(u->nodename) - 1);
+    strncpy(u->release, "0.1.0", sizeof(u->release) - 1);
+    strncpy(u->version, "EXO_OS", sizeof(u->version) - 1);
+    strncpy(u->machine, "x86_64", sizeof(u->machine) - 1);
+    strncpy(u->domainname, "localdomain", sizeof(u->domainname) - 1);
+    return 0;
+}
+
+static uint64_t g_getrandom_state = 0x9E3779B97F4A7C15ULL;
+
+static inline uint64_t gr_rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+static inline uint64_t getrandom_next(void) {
+    uint64_t x = g_getrandom_state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    g_getrandom_state = x + gr_rdtsc();
+    return x * 0x2545F4914F6CDD1DULL;
+}
+
+static int64_t sc_getrandom(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)d;(void)e;(void)f;
+    void *buf = (void *)a;
+    uint64_t len = b;
+    unsigned int flags = (unsigned int)c;
+
+    if (!buf && len > 0) return -EFAULT;
+    if (flags & ~0x3U) return -EINVAL;
+    if (len == 0) return 0;
+
+    uint8_t *out = (uint8_t *)buf;
+    uint64_t done = 0;
+    while (done < len) {
+        uint64_t r = getrandom_next();
+        uint64_t chunk = len - done;
+        if (chunk > 8) chunk = 8;
+        memcpy(out + done, &r, (size_t)chunk);
+        done += chunk;
+    }
+    return (int64_t)done;
 }
 
 static int64_t sc_tgkill(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
@@ -387,11 +661,8 @@ static int64_t sc_clone(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,u
 extern int64_t sys_futex(uint32_t *uaddr, int op, uint32_t val,
                          const kernel_timespec_t *timeout, uint32_t *uaddr2, uint32_t val3);
 static int64_t sc_futex(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
-    int64_t r = sys_futex((uint32_t *)a, (int)b, (uint32_t)c,
-                          (const kernel_timespec_t *)d, (uint32_t *)e, (uint32_t)f);
-    KLOG_ERR("futex_sc: uaddr=%p op=%llu val=%llu timeout=%p uaddr2=%p val3=0x%llx ret=%lld\n",
-             (void *)a, b, c, (void *)d, (void *)e, f, r);
-    return r;
+    return sys_futex((uint32_t *)a, (int)b, (uint32_t)c,
+                     (const kernel_timespec_t *)d, (uint32_t *)e, (uint32_t)f);
 }
 
 /* Readlink syscall */
@@ -434,6 +705,9 @@ static int64_t sc_fstatat(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e
 static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_READ]      = sc_read,
     [SYS_WRITE]     = sc_write,
+    [SYS_PREAD64]   = sc_pread64,
+    [SYS_PWRITE64]  = sc_pwrite64,
+    [SYS_READV]     = sc_readv,
     [SYS_OPEN]      = sc_open,
     [SYS_OPENAT]    = sc_openat,
     [SYS_CLOSE]     = sc_close,
@@ -445,17 +719,21 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_MPROTECT]  = sc_mprotect,
     [SYS_MUNMAP]    = sc_munmap,
     [SYS_BRK]       = sc_brk,
+    [SYS_GETTIMEOFDAY] = sc_gettimeofday,
     [SYS_WRITEV]    = sc_writev,
     [SYS_ACCESS]    = sc_access,
+    [SYS_SCHED_YIELD] = sc_sched_yield,
     [SYS_DUP]       = sc_dup,
     [SYS_DUP2]      = sc_dup2,
     [SYS_GETPID]    = sc_getpid,
+    [SYS_NANOSLEEP] = sc_nanosleep,
     [SYS_GETTID]    = sc_gettid,
     [SYS_FORK]      = sc_fork,
     [SYS_EXECVE]    = sc_execve,
     [SYS_EXIT]      = sc_exit,
     [SYS_WAIT4]     = sc_wait4,
     [SYS_KILL]      = sc_kill,
+    [SYS_UNAME]     = sc_uname,
     [SYS_TGKILL]    = sc_tgkill,
     [SYS_GETCWD]    = sc_getcwd,
     [SYS_CHDIR]     = sc_chdir,
@@ -468,6 +746,8 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_UNLINKAT]  = sc_unlinkat,
     [SYS_SYMLINKAT] = sc_symlinkat,
     [SYS_UMASK]     = sc_umask,
+    [SYS_GETRLIMIT] = sc_getrlimit,
+    [SYS_TIMES]     = sc_times,
     [SYS_GETUID]    = sc_getuid,
     [SYS_GETGID]    = sc_getgid,
     [SYS_GETEUID]   = sc_getuid,
@@ -479,8 +759,11 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_SET_ROBUST_LIST] = sc_set_robust_list,
     [SYS_GET_ROBUST_LIST] = sc_get_robust_list,
     [SYS_CLOCK_GETTIME]   = sc_clock_gettime,
+    [SYS_CLOCK_NANOSLEEP] = sc_clock_nanosleep,
     [SYS_EXIT_GROUP]= sc_exit_group,
     [SYS_DUP3]      = sc_dup3,
+    [SYS_PRLIMIT64] = sc_prlimit64,
+    [SYS_GETRANDOM] = sc_getrandom,
     [SYS_POLL]      = sc_poll,
     [SYS_IOCTL]     = sc_ioctl,
     [SYS_SOCKET]    = sc_socket,

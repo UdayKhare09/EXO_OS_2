@@ -63,6 +63,10 @@ bool input_poll(input_event_t *out);
 /* Convert HID boot keycode to ASCII (0 if non-printable)                 */
 char input_keycode_to_ascii(uint8_t keycode, uint8_t modifiers);
 
+/* TTY character queue (fed from key-press events).                        */
+bool input_tty_char_available(void);
+int  input_tty_getchar_nonblock(char *out_ch);
+
 /* Global rings (exported so WM / fbcon can read directly)                */
 extern input_ring_t g_kbd_ring;
 extern input_ring_t g_mouse_ring;

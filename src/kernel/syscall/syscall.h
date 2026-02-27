@@ -19,11 +19,17 @@
 #define SYS_RT_SIGACTION   13
 #define SYS_RT_SIGPROCMASK 14
 #define SYS_RT_SIGRETURN   15
+#define SYS_PREAD64     17
+#define SYS_PWRITE64    18
+#define SYS_READV       19
+#define SYS_GETTIMEOFDAY   96
 #define SYS_WRITEV      20
 #define SYS_ACCESS       21
 #define SYS_PIPE         22
+#define SYS_SCHED_YIELD  24
 #define SYS_DUP         32
 #define SYS_DUP2        33
+#define SYS_NANOSLEEP   35
 #define SYS_GETPID      39
 #define SYS_CLONE       56
 #define SYS_FORK        57
@@ -31,6 +37,7 @@
 #define SYS_EXIT        60
 #define SYS_WAIT4       61
 #define SYS_KILL        62
+#define SYS_UNAME       63
 #define SYS_OPENAT      257
 #define SYS_MKDIRAT     258
 #define SYS_RENAMEAT    264
@@ -43,6 +50,8 @@
 #define SYS_UNLINK      87
 #define SYS_READLINK    89
 #define SYS_UMASK       95
+#define SYS_GETRLIMIT   97
+#define SYS_TIMES       100
 #define SYS_GETUID      102
 #define SYS_GETGID      104
 #define SYS_GETEUID     107
@@ -55,6 +64,7 @@
 #define SYS_SET_TID_ADDRESS 218
 #define SYS_TGKILL      234
 #define SYS_CLOCK_GETTIME   228
+#define SYS_CLOCK_NANOSLEEP 230
 #define SYS_EXIT_GROUP  231
 #define SYS_FSTATAT     262
 #define SYS_UNLINKAT    263
@@ -65,6 +75,8 @@
 #define SYS_GET_ROBUST_LIST 274
 #define SYS_DUP3        292
 #define SYS_PIPE2       293
+#define SYS_PRLIMIT64   302
+#define SYS_GETRANDOM   318
 
 /* *at constants */
 #define AT_FDCWD        (-100)

@@ -70,15 +70,24 @@ static long syscall6(long nr, long a1, long a2, long a3,
 #define SYS_STAT          4
 #define SYS_FSTAT         5
 #define SYS_LSTAT         6
+#define SYS_POLL          7
 #define SYS_LSEEK         8
 #define SYS_MMAP          9
 #define SYS_MPROTECT      10
 #define SYS_MUNMAP        11
 #define SYS_BRK           12
+#define SYS_PREAD64       17
+#define SYS_PWRITE64      18
+#define SYS_READV         19
+#define SYS_GETTIMEOFDAY  96
+#define SYS_TIMES         100
 #define SYS_WRITEV        20
+#define SYS_IOCTL         16
 #define SYS_ACCESS        21
 #define SYS_DUP           32
 #define SYS_DUP2          33
+#define SYS_SCHED_YIELD   24
+#define SYS_NANOSLEEP     35
 #define SYS_GETPID        39
 #define SYS_GETPPID       110
 #define SYS_GETUID        102
@@ -99,10 +108,15 @@ static long syscall6(long nr, long a1, long a2, long a3,
 #define SYS_SET_TID_ADDRESS 218
 #define SYS_FUTEX         202
 #define SYS_CLOCK_GETTIME 228
+#define SYS_CLOCK_NANOSLEEP 230
 #define SYS_EXIT_GROUP    231
 #define SYS_TGKILL        234
 #define SYS_UMASK         95
+#define SYS_GETRLIMIT     97
+#define SYS_UNAME         63
 #define SYS_DUP3          292
+#define SYS_PRLIMIT64     302
+#define SYS_GETRANDOM     318
 #define SYS_FSTATAT       262
 #define SYS_UNLINKAT      263
 #define SYS_FACCESSAT     269
@@ -124,6 +138,7 @@ static long syscall6(long nr, long a1, long a2, long a3,
 #define O_RDWR     2
 #define O_CREAT    0100
 #define O_TRUNC    01000
+#define O_NONBLOCK 04000
 
 #define AT_FDCWD   -100
 #define AT_REMOVEDIR 0x200
@@ -132,6 +147,16 @@ static long syscall6(long nr, long a1, long a2, long a3,
 #define FUTEX_WAKE         1
 #define FUTEX_WAIT_BITSET  9
 #define FUTEX_WAKE_BITSET  10
+
+/* poll/ioctl bits */
+#define POLLIN     0x0001
+#define POLLOUT    0x0004
+#define POLLHUP    0x0010
+
+#define TCGETS     0x5401
+#define TCSETS     0x5402
+#define TIOCGWINSZ 0x5413
+#define FIONBIO    0x5421
 
 /* mmap flags */
 #define PROT_READ    1
@@ -160,6 +185,66 @@ struct iovec {
 struct timespec {
     long tv_sec;
     long tv_nsec;
+};
+
+struct timeval {
+    long tv_sec;
+    long tv_usec;
+};
+
+struct tms {
+    long tms_utime;
+    long tms_stime;
+    long tms_cutime;
+    long tms_cstime;
+};
+
+#define TIMER_ABSTIME 1
+
+struct utsname {
+    char sysname[65];
+    char nodename[65];
+    char release[65];
+    char version[65];
+    char machine[65];
+    char domainname[65];
+};
+
+struct rlimit {
+    unsigned long rlim_cur;
+    unsigned long rlim_max;
+};
+
+#define RLIMIT_NOFILE 7
+
+typedef unsigned int   tcflag_t;
+typedef unsigned char  cc_t;
+typedef unsigned int   speed_t;
+
+#define NCCS 19
+
+struct termios {
+    tcflag_t c_iflag;
+    tcflag_t c_oflag;
+    tcflag_t c_cflag;
+    tcflag_t c_lflag;
+    cc_t     c_line;
+    cc_t     c_cc[NCCS];
+    speed_t  c_ispeed;
+    speed_t  c_ospeed;
+};
+
+struct winsize {
+    unsigned short ws_row;
+    unsigned short ws_col;
+    unsigned short ws_xpixel;
+    unsigned short ws_ypixel;
+};
+
+struct pollfd {
+    int   fd;
+    short events;
+    short revents;
 };
 
 /* Minimal linux_stat (128 bytes, matches kernel struct) */
@@ -359,6 +444,57 @@ static void test_mmap_munmap(void) {
     }
 }
 
+/* ── file-backed mmap (MAP_PRIVATE) ─────────────────────────────────── */
+static void test_mmap_file_private(void) {
+    static const char path[] = "/tmp/sctest_mmap_file.bin";
+    static const char data[] = "mmap_file_payload";
+
+    int fd = (int)syscall3(SYS_OPEN, (long)path,
+                           O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (fd < 0) {
+        test_result("mmap file: open/create", 0);
+        return;
+    }
+
+    long w = syscall3(SYS_WRITE, fd, (long)data, (long)(sizeof(data) - 1));
+    test_result("mmap file: write seed data", w == (long)(sizeof(data) - 1));
+    if (w < 0) {
+        syscall1(SYS_CLOSE, fd);
+        return;
+    }
+
+    long addr = syscall6(SYS_MMAP, 0, 4096,
+                         PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE,
+                         fd, 0);
+    int ok = (addr > 0 && addr != -1);
+    test_result("mmap file: MAP_PRIVATE mapping succeeds", ok);
+
+    if (ok) {
+        volatile char *p = (volatile char *)addr;
+        int same = 1;
+        for (size_t i = 0; i < sizeof(data) - 1; i++) {
+            if (p[i] != data[i]) {
+                same = 0;
+                break;
+            }
+        }
+        test_result("mmap file: mapped bytes match file", same);
+
+        p[0] = 'X';
+
+        long s = syscall3(SYS_LSEEK, fd, 0, 0);
+        char c = 0;
+        long r = (s >= 0) ? syscall3(SYS_READ, fd, (long)&c, 1) : -1;
+        test_result("mmap file: private write doesn't modify file", (r == 1) && (c == data[0]));
+
+        syscall2(SYS_MUNMAP, addr, 4096);
+    }
+
+    syscall1(SYS_CLOSE, fd);
+    syscall1(SYS_UNLINK, (long)path);
+}
+
 /* ── mprotect ────────────────────────────────────────────────────────── */
 static void test_mprotect(void) {
     long addr = syscall6(SYS_MMAP, 0, 4096,
@@ -399,6 +535,76 @@ static void test_writev(void) {
     long r = syscall3(SYS_WRITEV, 1, (long)iov, 2);
     long expected = (long)(sizeof(p1)-1 + sizeof(p2)-1);
     test_result("writev(stdout, iov, 2) returns total bytes", r == expected);
+}
+
+static void test_readv(void) {
+    int p[2] = {-1, -1};
+    long r = syscall1(SYS_PIPE, (long)p);
+    if (r != 0) {
+        test_result("readv: pipe setup", 0);
+        return;
+    }
+
+    static const char msg[] = "abcdef";
+    r = syscall3(SYS_WRITE, p[1], (long)msg, 6);
+    if (r != 6) {
+        test_result("readv: seed pipe data", 0);
+        syscall1(SYS_CLOSE, p[0]);
+        syscall1(SYS_CLOSE, p[1]);
+        return;
+    }
+
+    char a[3], b[3];
+    struct iovec iov[2] = {
+        { a, 3 },
+        { b, 3 },
+    };
+
+    r = syscall3(SYS_READV, p[0], (long)iov, 2);
+    test_result("readv(pipe, iov, 2) returns 6", r == 6);
+    int ok = (a[0]=='a' && a[1]=='b' && a[2]=='c' &&
+              b[0]=='d' && b[1]=='e' && b[2]=='f');
+    test_result("readv splits data across iovecs", ok);
+
+    syscall1(SYS_CLOSE, p[0]);
+    syscall1(SYS_CLOSE, p[1]);
+}
+
+static void test_pread_pwrite(void) {
+    static const char path[] = "/tmp/sctest_pread_pwrite";
+    int fd = (int)syscall3(SYS_OPEN, (long)path, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (fd < 0) {
+        test_result("pread/pwrite: open temp file", 0);
+        return;
+    }
+
+    static const char seed[] = "abcdef";
+    long r = syscall3(SYS_WRITE, fd, (long)seed, 6);
+    test_result("pread/pwrite: seed write", r == 6);
+
+    char pbuf[3] = {0,0,0};
+    r = syscall4(SYS_PREAD64, fd, (long)pbuf, 3, 2);
+    test_result("pread64(fd,3,off=2) returns 3", r == 3);
+    test_result("pread64 reads expected bytes", pbuf[0]=='c' && pbuf[1]=='d' && pbuf[2]=='e');
+
+    r = syscall3(SYS_LSEEK, fd, 0, 0);
+    char first = 0;
+    long rr = syscall3(SYS_READ, fd, (long)&first, 1);
+    test_result("pread64 does not advance file offset", rr == 1 && first == 'a');
+
+    static const char patch[] = "ZZ";
+    r = syscall4(SYS_PWRITE64, fd, (long)patch, 2, 1);
+    test_result("pwrite64(fd,2,off=1) returns 2", r == 2);
+
+    syscall3(SYS_LSEEK, fd, 0, 0);
+    char all[6] = {0};
+    rr = syscall3(SYS_READ, fd, (long)all, 6);
+    test_result("pwrite64 writes at offset", rr == 6 &&
+                all[0]=='a' && all[1]=='Z' && all[2]=='Z' &&
+                all[3]=='d' && all[4]=='e' && all[5]=='f');
+
+    syscall1(SYS_CLOSE, fd);
+    syscall1(SYS_UNLINK, (long)path);
 }
 
 /* ── access ──────────────────────────────────────────────────────────── */
@@ -630,6 +836,95 @@ static void test_clock_gettime(void) {
     print("."); print_long(ts.tv_nsec / 1000000); println("s");
 }
 
+static long timespec_to_ms(const struct timespec *ts) {
+    return ts->tv_sec * 1000 + ts->tv_nsec / 1000000;
+}
+
+/* ── sched_yield ─────────────────────────────────────────────────────── */
+static void test_sched_yield(void) {
+    long r = syscall0(SYS_SCHED_YIELD);
+    test_result("sched_yield() returns 0", r == 0);
+}
+
+/* ── gettimeofday ────────────────────────────────────────────────────── */
+static void test_gettimeofday(void) {
+    struct timeval tv;
+    my_memset(&tv, 0, sizeof(tv));
+    long r = syscall2(SYS_GETTIMEOFDAY, (long)&tv, 0);
+    test_result("gettimeofday() returns 0", r == 0);
+    test_result("gettimeofday: tv_usec in range", tv.tv_usec >= 0 && tv.tv_usec < 1000000);
+}
+
+/* ── nanosleep ───────────────────────────────────────────────────────── */
+static void test_nanosleep(void) {
+    struct timespec before, after, req;
+    my_memset(&before, 0, sizeof(before));
+    my_memset(&after, 0, sizeof(after));
+
+    long r = syscall2(SYS_CLOCK_GETTIME, 1 /*CLOCK_MONOTONIC*/, (long)&before);
+    if (r != 0) {
+        test_result("nanosleep pre clock_gettime", 0);
+        return;
+    }
+
+    req.tv_sec = 0;
+    req.tv_nsec = 10 * 1000 * 1000;
+    r = syscall2(SYS_NANOSLEEP, (long)&req, 0);
+    test_result("nanosleep(10ms) returns 0", r == 0);
+
+    r = syscall2(SYS_CLOCK_GETTIME, 1 /*CLOCK_MONOTONIC*/, (long)&after);
+    if (r != 0) {
+        test_result("nanosleep post clock_gettime", 0);
+        return;
+    }
+
+    long delta = timespec_to_ms(&after) - timespec_to_ms(&before);
+    test_result("nanosleep advances monotonic clock", delta >= 1);
+}
+
+static void test_clock_nanosleep(void) {
+    struct timespec before, after, req;
+    my_memset(&before, 0, sizeof(before));
+    my_memset(&after, 0, sizeof(after));
+
+    long r = syscall2(SYS_CLOCK_GETTIME, 1 /*CLOCK_MONOTONIC*/, (long)&before);
+    if (r != 0) {
+        test_result("clock_nanosleep pre clock_gettime", 0);
+        return;
+    }
+
+    req.tv_sec = 0;
+    req.tv_nsec = 5 * 1000 * 1000;
+    r = syscall4(SYS_CLOCK_NANOSLEEP, 1 /*CLOCK_MONOTONIC*/, 0, (long)&req, 0);
+    test_result("clock_nanosleep(relative) returns 0", r == 0);
+
+    r = syscall2(SYS_CLOCK_GETTIME, 1 /*CLOCK_MONOTONIC*/, (long)&after);
+    if (r != 0) {
+        test_result("clock_nanosleep post clock_gettime", 0);
+        return;
+    }
+
+    long delta = timespec_to_ms(&after) - timespec_to_ms(&before);
+    test_result("clock_nanosleep advances monotonic clock", delta >= 1);
+
+    req.tv_sec = after.tv_sec;
+    req.tv_nsec = after.tv_nsec + 5 * 1000 * 1000;
+    if (req.tv_nsec >= 1000000000L) {
+        req.tv_sec += 1;
+        req.tv_nsec -= 1000000000L;
+    }
+    r = syscall4(SYS_CLOCK_NANOSLEEP, 1 /*CLOCK_MONOTONIC*/, TIMER_ABSTIME, (long)&req, 0);
+    test_result("clock_nanosleep(TIMER_ABSTIME) returns 0", r == 0);
+}
+
+static void test_times(void) {
+    struct tms tm;
+    my_memset(&tm, 0, sizeof(tm));
+    long r = syscall1(SYS_TIMES, (long)&tm);
+    test_result("times() returns non-negative clock ticks", r >= 0);
+    test_result("times(): user time non-negative", tm.tms_utime >= 0);
+}
+
 /* ── getdents64 ──────────────────────────────────────────────────────── */
 static void test_getdents64(void) {
     int fd = (int)syscall3(SYS_OPEN, (long)"/dev", O_RDONLY, 0);
@@ -727,6 +1022,105 @@ static void test_pipe(void) {
     }
 }
 
+/* ── poll ────────────────────────────────────────────────────────────── */
+static void test_poll_phase3(void) {
+    int pipefd[2] = {-1, -1};
+    long r = syscall1(SYS_PIPE, (long)pipefd);
+    if (r != 0) {
+        test_result("poll: pipe setup", 0);
+        return;
+    }
+
+    struct pollfd pfd;
+    pfd.fd = pipefd[0];
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+
+    r = syscall3(SYS_POLL, (long)&pfd, 1, 0);
+    test_result("poll(empty pipe, timeout=0) returns 0", r == 0);
+
+    char ch = 'x';
+    r = syscall3(SYS_WRITE, pipefd[1], (long)&ch, 1);
+    test_result("poll: write 1 byte into pipe", r == 1);
+
+    pfd.revents = 0;
+    r = syscall3(SYS_POLL, (long)&pfd, 1, 0);
+    test_result("poll(pipe readable) returns 1", r == 1);
+    test_result("poll(pipe readable) has POLLIN", (pfd.revents & POLLIN) != 0);
+
+    char out;
+    syscall3(SYS_READ, pipefd[0], (long)&out, 1);
+    syscall1(SYS_CLOSE, pipefd[1]);
+
+    pfd.revents = 0;
+    r = syscall3(SYS_POLL, (long)&pfd, 1, 0);
+    test_result("poll(pipe read end after writer close) has POLLHUP", (r == 1) && ((pfd.revents & POLLHUP) != 0));
+
+    syscall1(SYS_CLOSE, pipefd[0]);
+
+    int tty = (int)syscall3(SYS_OPEN, (long)"/dev/tty", O_RDWR, 0);
+    if (tty >= 0) {
+        struct pollfd tp;
+        tp.fd = tty;
+        tp.events = POLLOUT;
+        tp.revents = 0;
+        r = syscall3(SYS_POLL, (long)&tp, 1, 0);
+        test_result("poll(/dev/tty, POLLOUT, 0) returns writable", (r == 1) && ((tp.revents & POLLOUT) != 0));
+        syscall1(SYS_CLOSE, tty);
+    } else {
+        test_result("poll tty test: open /dev/tty", 0);
+    }
+}
+
+/* ── ioctl (tty + FIONBIO) ──────────────────────────────────────────── */
+static void test_ioctl_phase3(void) {
+    int tty = (int)syscall3(SYS_OPEN, (long)"/dev/tty", O_RDWR, 0);
+    if (tty < 0) {
+        test_result("ioctl: open /dev/tty", 0);
+        return;
+    }
+
+    struct termios tio;
+    my_memset(&tio, 0, sizeof(tio));
+    long r = syscall3(SYS_IOCTL, tty, TCGETS, (long)&tio);
+    test_result("ioctl(TCGETS) on /dev/tty returns 0", r == 0);
+
+    tcflag_t old_lflag = tio.c_lflag;
+    tio.c_lflag ^= 0x2;
+    r = syscall3(SYS_IOCTL, tty, TCSETS, (long)&tio);
+    test_result("ioctl(TCSETS) on /dev/tty returns 0", r == 0);
+
+    struct termios tio2;
+    my_memset(&tio2, 0, sizeof(tio2));
+    r = syscall3(SYS_IOCTL, tty, TCGETS, (long)&tio2);
+    test_result("ioctl(TCGETS) reflects updated c_lflag", (r == 0) && (tio2.c_lflag == (old_lflag ^ 0x2)));
+
+    struct winsize ws;
+    my_memset(&ws, 0, sizeof(ws));
+    r = syscall3(SYS_IOCTL, tty, TIOCGWINSZ, (long)&ws);
+    test_result("ioctl(TIOCGWINSZ) returns 0", r == 0);
+    test_result("winsize rows/cols are non-zero", ws.ws_row > 0 && ws.ws_col > 0);
+    syscall1(SYS_CLOSE, tty);
+
+    int pipefd[2] = {-1, -1};
+    r = syscall1(SYS_PIPE, (long)pipefd);
+    if (r != 0) {
+        test_result("ioctl(FIONBIO): pipe setup", 0);
+        return;
+    }
+
+    int nb = 1;
+    r = syscall3(SYS_IOCTL, pipefd[0], FIONBIO, (long)&nb);
+    test_result("ioctl(FIONBIO) on pipe read end returns 0", r == 0);
+
+    char c = 0;
+    r = syscall3(SYS_READ, pipefd[0], (long)&c, 1);
+    test_result("nonblocking pipe read on empty pipe returns -EAGAIN", r == -EAGAIN);
+
+    syscall1(SYS_CLOSE, pipefd[0]);
+    syscall1(SYS_CLOSE, pipefd[1]);
+}
+
 /* ── arch_prctl (FS base / TLS) ──────────────────────────────────────── */
 static void test_arch_prctl(void) {
     long dummy = 0xDEADBEEF;
@@ -759,6 +1153,46 @@ static void test_urandom(void) {
     } else {
         test_result("open(/dev/urandom)", 0);
     }
+}
+
+/* ── uname / getrandom ──────────────────────────────────────────────── */
+static void test_uname_getrandom(void) {
+    struct utsname u;
+    my_memset(&u, 0, sizeof(u));
+    long r = syscall1(SYS_UNAME, (long)&u);
+    test_result("uname() returns 0", r == 0);
+    test_result("uname().machine is non-empty", u.machine[0] != '\0');
+
+    unsigned char a[16], b[16];
+    my_memset(a, 0, sizeof(a));
+    my_memset(b, 0, sizeof(b));
+    long ra = syscall3(SYS_GETRANDOM, (long)a, sizeof(a), 0);
+    long rb = syscall3(SYS_GETRANDOM, (long)b, sizeof(b), 0);
+    test_result("getrandom(16) returns 16", ra == 16 && rb == 16);
+
+    int different = 0;
+    for (int i = 0; i < 16; i++) {
+        if (a[i] != b[i]) { different = 1; break; }
+    }
+    test_result("getrandom outputs vary", different);
+}
+
+static void test_rlimits(void) {
+    struct rlimit rl;
+    my_memset(&rl, 0, sizeof(rl));
+    long r = syscall2(SYS_GETRLIMIT, RLIMIT_NOFILE, (long)&rl);
+    test_result("getrlimit(RLIMIT_NOFILE) returns 0", r == 0);
+    test_result("getrlimit returns sane nofile", rl.rlim_cur > 0 && rl.rlim_max >= rl.rlim_cur);
+
+    struct rlimit old;
+    my_memset(&old, 0, sizeof(old));
+    r = syscall4(SYS_PRLIMIT64, 0, RLIMIT_NOFILE, 0, (long)&old);
+    test_result("prlimit64(self, RLIMIT_NOFILE, NULL, old) returns 0", r == 0);
+    test_result("prlimit64 old matches getrlimit", old.rlim_cur == rl.rlim_cur && old.rlim_max == rl.rlim_max);
+
+    struct rlimit bad = { .rlim_cur = old.rlim_max + 1, .rlim_max = old.rlim_max };
+    r = syscall4(SYS_PRLIMIT64, 0, RLIMIT_NOFILE, (long)&bad, 0);
+    test_result("prlimit64 rejects cur > max", r == -EINVAL);
 }
 
 /* ── Multiple opens / fd exhaustion safety ───────────────────────────── */
@@ -812,6 +1246,7 @@ void _start(void) {
 
     println("\n\033[1;33m  -- Memory --\033[0m");
     test_mmap_munmap();
+    test_mmap_file_private();
     test_mprotect();
     test_brk();
 
@@ -826,12 +1261,23 @@ void _start(void) {
 
     println("\n\033[1;33m  -- I/O misc --\033[0m");
     test_writev();
+    test_readv();
+    test_pread_pwrite();
     test_access();
     test_dup_dup2();
     test_dup3();
     test_fcntl();
+    test_poll_phase3();
+    test_ioctl_phase3();
     test_umask();
+    test_uname_getrandom();
+    test_rlimits();
     test_clock_gettime();
+    test_gettimeofday();
+    test_times();
+    test_sched_yield();
+    test_nanosleep();
+    test_clock_nanosleep();
     test_fd_limits();
     test_errno_contract();
 

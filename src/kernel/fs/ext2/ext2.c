@@ -355,6 +355,67 @@ static void ext2_free_inode(ext2_sb_t *sb, uint32_t ino) {
     ext2_write_bgd(sb, group, &bgd);
 }
 
+static bool ext2_indirect_block_empty(ext2_sb_t *sb, uint32_t blk) {
+    if (!blk) return true;
+    uint8_t *tmp = ext2_alloc_block_tmp(sb);
+    if (!tmp) return false;
+    if (ext2_read_block_partial(sb, blk, 0, tmp, sb->block_size) < 0) {
+        kfree(tmp);
+        return false;
+    }
+    uint32_t *entries = (uint32_t *)tmp;
+    uint32_t count = sb->block_size / 4;
+    bool empty = true;
+    for (uint32_t i = 0; i < count; i++) {
+        if (entries[i] != 0) { empty = false; break; }
+    }
+    kfree(tmp);
+    return empty;
+}
+
+static void ext2_free_indirect_tree(ext2_sb_t *sb, uint32_t blk, int level) {
+    if (!blk || level <= 0) return;
+
+    uint8_t *tmp = ext2_alloc_block_tmp(sb);
+    if (!tmp) return;
+    if (ext2_read_block_partial(sb, blk, 0, tmp, sb->block_size) < 0) {
+        kfree(tmp);
+        return;
+    }
+
+    uint32_t *entries = (uint32_t *)tmp;
+    uint32_t count = sb->block_size / 4;
+    for (uint32_t i = 0; i < count; i++) {
+        if (!entries[i]) continue;
+        if (level == 1) ext2_free_block(sb, entries[i]);
+        else ext2_free_indirect_tree(sb, entries[i], level - 1);
+    }
+    kfree(tmp);
+    ext2_free_block(sb, blk);
+}
+
+static void ext2_inode_free_all_blocks(ext2_sb_t *sb, ext2_inode_t *inode) {
+    for (int i = 0; i < 12; i++) {
+        if (inode->i_block[i]) {
+            ext2_free_block(sb, inode->i_block[i]);
+            inode->i_block[i] = 0;
+        }
+    }
+    if (inode->i_block[12]) {
+        ext2_free_indirect_tree(sb, inode->i_block[12], 1);
+        inode->i_block[12] = 0;
+    }
+    if (inode->i_block[13]) {
+        ext2_free_indirect_tree(sb, inode->i_block[13], 2);
+        inode->i_block[13] = 0;
+    }
+    if (inode->i_block[14]) {
+        ext2_free_indirect_tree(sb, inode->i_block[14], 3);
+        inode->i_block[14] = 0;
+    }
+    inode->i_blocks = 0;
+}
+
 /* ── Block mapping (logical → physical) ──────────────────────────────────── */
 /* Number of 32-bit block pointers per indirect block */
 #define PTR_PER_BLK(sb) ((sb)->block_size / 4)
@@ -444,6 +505,83 @@ static int ext2_inode_set_block(ext2_sb_t *sb, ext2_inode_t *inode,
         return ext2_write_block_partial(sb, b1, idx2 * 4, &phys_blk, 4);
     }
     return -ENOSPC; /* triple indirect not needed for typical files */
+}
+
+static uint32_t ext2_inode_clear_block(ext2_sb_t *sb, ext2_inode_t *inode,
+                                       uint32_t log_blk) {
+    uint32_t ppb = PTR_PER_BLK(sb);
+
+    if (log_blk < 12) {
+        uint32_t old = inode->i_block[log_blk];
+        inode->i_block[log_blk] = 0;
+        return old;
+    }
+    log_blk -= 12;
+
+    if (log_blk < ppb) {
+        if (!inode->i_block[12]) return 0;
+        uint32_t zero = 0, old = 0;
+        if (ext2_read_block_partial(sb, inode->i_block[12], log_blk * 4, &old, 4) < 0)
+            return 0;
+        if (!old) return 0;
+        ext2_write_block_partial(sb, inode->i_block[12], log_blk * 4, &zero, 4);
+        if (ext2_indirect_block_empty(sb, inode->i_block[12])) {
+            ext2_free_block(sb, inode->i_block[12]);
+            inode->i_block[12] = 0;
+        }
+        return old;
+    }
+    log_blk -= ppb;
+
+    if (log_blk < ppb * ppb) {
+        if (!inode->i_block[13]) return 0;
+        uint32_t idx1 = log_blk / ppb;
+        uint32_t idx2 = log_blk % ppb;
+        uint32_t b1 = 0, old = 0, zero = 0;
+        if (ext2_read_block_partial(sb, inode->i_block[13], idx1 * 4, &b1, 4) < 0 || !b1)
+            return 0;
+        if (ext2_read_block_partial(sb, b1, idx2 * 4, &old, 4) < 0 || !old)
+            return 0;
+        ext2_write_block_partial(sb, b1, idx2 * 4, &zero, 4);
+        if (ext2_indirect_block_empty(sb, b1)) {
+            ext2_free_block(sb, b1);
+            ext2_write_block_partial(sb, inode->i_block[13], idx1 * 4, &zero, 4);
+        }
+        if (inode->i_block[13] && ext2_indirect_block_empty(sb, inode->i_block[13])) {
+            ext2_free_block(sb, inode->i_block[13]);
+            inode->i_block[13] = 0;
+        }
+        return old;
+    }
+    log_blk -= ppb * ppb;
+
+    if (!inode->i_block[14]) return 0;
+    uint32_t idx1 = log_blk / (ppb * ppb);
+    uint32_t idx2 = (log_blk / ppb) % ppb;
+    uint32_t idx3 = log_blk % ppb;
+    uint32_t b1 = 0, b2 = 0, old = 0, zero = 0;
+
+    if (ext2_read_block_partial(sb, inode->i_block[14], idx1 * 4, &b1, 4) < 0 || !b1)
+        return 0;
+    if (ext2_read_block_partial(sb, b1, idx2 * 4, &b2, 4) < 0 || !b2)
+        return 0;
+    if (ext2_read_block_partial(sb, b2, idx3 * 4, &old, 4) < 0 || !old)
+        return 0;
+
+    ext2_write_block_partial(sb, b2, idx3 * 4, &zero, 4);
+    if (ext2_indirect_block_empty(sb, b2)) {
+        ext2_free_block(sb, b2);
+        ext2_write_block_partial(sb, b1, idx2 * 4, &zero, 4);
+    }
+    if (ext2_indirect_block_empty(sb, b1)) {
+        ext2_free_block(sb, b1);
+        ext2_write_block_partial(sb, inode->i_block[14], idx1 * 4, &zero, 4);
+    }
+    if (inode->i_block[14] && ext2_indirect_block_empty(sb, inode->i_block[14])) {
+        ext2_free_block(sb, inode->i_block[14]);
+        inode->i_block[14] = 0;
+    }
+    return old;
 }
 
 /* ── Get superblock from fsi ─────────────────────────────────────────────── */
@@ -808,11 +946,8 @@ static int ext2_unlink(vnode_t *parent, const char *name) {
                     if (ext2_read_inode(sb, victim_ino, &vi) == 0) {
                         if (vi.i_links_count > 0) vi.i_links_count--;
                         if (vi.i_links_count == 0) {
-                            /* Free all data blocks */
-                            for (int bi = 0; bi < 12; bi++) {
-                                if (vi.i_block[bi]) ext2_free_block(sb, vi.i_block[bi]);
-                            }
-                            /* TODO: free indirect blocks (omitted for brevity) */
+                            ext2_inode_free_all_blocks(sb, &vi);
+                            vi.i_size = 0;
                             ext2_free_inode(sb, victim_ino);
                         } else {
                             ext2_write_inode(sb, victim_ino, &vi);
@@ -889,16 +1024,27 @@ static int ext2_truncate(vnode_t *v, uint64_t size) {
     ext2_sb_t   *sb = get_sb(v);
     ext2_inode_t inode;
     if (ext2_read_inode(sb, get_ino(v), &inode) < 0) return -EIO;
-    /* Simple: only shrink to 0 or within direct blocks for now */
-    if (size == 0) {
-        for (int i = 0; i < 12; i++) {
-            if (inode.i_block[i]) { ext2_free_block(sb, inode.i_block[i]); inode.i_block[i]=0; }
+
+    if (size < inode.i_size) {
+        if (size == 0) {
+            ext2_inode_free_all_blocks(sb, &inode);
+        } else {
+            uint32_t old_blocks = (inode.i_size + sb->block_size - 1) / sb->block_size;
+            uint32_t new_blocks = ((uint32_t)size + sb->block_size - 1) / sb->block_size;
+            for (uint32_t lb = new_blocks; lb < old_blocks; lb++) {
+                uint32_t old = ext2_inode_clear_block(sb, &inode, lb);
+                if (old) {
+                    ext2_free_block(sb, old);
+                    if (inode.i_blocks >= sb->sectors_per_block)
+                        inode.i_blocks -= sb->sectors_per_block;
+                    else
+                        inode.i_blocks = 0;
+                }
+            }
         }
-        inode.i_size   = 0;
-        inode.i_blocks = 0;
-    } else {
-        inode.i_size = (uint32_t)size;
     }
+
+    inode.i_size = (uint32_t)size;
     v->size = inode.i_size;
     return ext2_write_inode(sb, get_ino(v), &inode);
 }

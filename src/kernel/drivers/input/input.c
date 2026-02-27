@@ -6,11 +6,27 @@
 input_ring_t g_kbd_ring;
 input_ring_t g_mouse_ring;
 
+#define TTY_CHAR_RING_SIZE 256u
+static char g_tty_chars[TTY_CHAR_RING_SIZE];
+static volatile uint32_t g_tty_head;
+static volatile uint32_t g_tty_tail;
+
+static inline void tty_char_push(char ch) {
+    uint32_t h = g_tty_head;
+    uint32_t next = (h + 1) & (TTY_CHAR_RING_SIZE - 1);
+    if (next == g_tty_tail) return;
+    g_tty_chars[h] = ch;
+    cpu_mfence();
+    g_tty_head = next;
+}
+
 void input_init(void) {
     g_kbd_ring.head   = 0;
     g_kbd_ring.tail   = 0;
     g_mouse_ring.head = 0;
     g_mouse_ring.tail = 0;
+    g_tty_head = 0;
+    g_tty_tail = 0;
     KLOG_INFO("input: event rings initialised (%u slots each)\n",
               INPUT_RING_SIZE);
 }
@@ -44,6 +60,11 @@ void input_push_key(uint8_t modifiers, uint8_t keycode, uint8_t state) {
     };
     if (!ring_push(&g_kbd_ring, &ev))
         KLOG_WARN("input: keyboard ring full, event dropped\n");
+
+    if (state == INPUT_KEY_PRESS) {
+        char ch = input_keycode_to_ascii(keycode, modifiers);
+        if (ch) tty_char_push(ch);
+    }
 }
 
 void input_push_mouse(uint8_t buttons, int8_t dx, int8_t dy, int8_t scroll) {
@@ -104,4 +125,18 @@ char input_keycode_to_ascii(uint8_t keycode, uint8_t modifiers) {
     if (keycode >= 0x40) return 0;
     if (modifiers & MOD_SHIFT) return keycode_shifted[keycode];
     return keycode_normal[keycode];
+}
+
+bool input_tty_char_available(void) {
+    return g_tty_tail != g_tty_head;
+}
+
+int input_tty_getchar_nonblock(char *out_ch) {
+    if (!out_ch) return 0;
+    uint32_t t = g_tty_tail;
+    if (t == g_tty_head) return -1;
+    *out_ch = g_tty_chars[t];
+    cpu_mfence();
+    g_tty_tail = (t + 1) & (TTY_CHAR_RING_SIZE - 1);
+    return 0;
 }

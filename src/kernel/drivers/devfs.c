@@ -13,7 +13,9 @@
 #include "lib/string.h"
 #include "lib/klog.h"
 #include "gfx/fbcon.h"
+#include "drivers/input/input.h"
 #include "arch/x86_64/cpu.h"
+#include "sched/sched.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -82,9 +84,23 @@ static ssize_t devfs_read(vnode_t *v, void *buf, size_t len, uint64_t off) {
             return (ssize_t)len;
         }
 
-        case DEV_TTY:
-            /* TODO: read from input subsystem */
-            return 0;
+        case DEV_TTY: {
+            if (len == 0) return 0;
+            char *dst = (char *)buf;
+            size_t done = 0;
+
+            while (done < len) {
+                char ch = 0;
+                if (input_tty_getchar_nonblock(&ch) == 0) {
+                    dst[done++] = ch;
+                    if (ch == '\n') break;
+                    continue;
+                }
+                if (done > 0) break;
+                sched_sleep(1);
+            }
+            return (ssize_t)done;
+        }
 
         case DEV_URANDOM: {
             uint8_t *dst = (uint8_t *)buf;

@@ -10,6 +10,7 @@
 #include "sched/waitq.h"
 #include "fs/vfs.h"
 #include "fs/fd.h"
+#include "net/socket_defs.h"
 #include "mm/kmalloc.h"
 #include "lib/string.h"
 #include "lib/klog.h"
@@ -61,6 +62,10 @@ static ssize_t pipe_read_op(file_t *f, void *buf, size_t count) {
             pipe_unlock(p);
             return 0; /* EOF — no more writers */
         }
+        if (f->flags & O_NONBLOCK) {
+            pipe_unlock(p);
+            return -EAGAIN;
+        }
         pipe_unlock(p);
         /* Block until data arrives */
         waitq_wait(&p->read_wq);
@@ -101,6 +106,10 @@ static ssize_t pipe_write_op(file_t *f, const void *buf, size_t count) {
         pipe_unlock(p);
         waitq_wake_one(&p->read_wq);  /* wake blocked readers */
         if (total < count) {
+            if (f->flags & O_NONBLOCK) {
+                if (total > 0) return (ssize_t)total;
+                return -EAGAIN;
+            }
             waitq_wait(&p->write_wq);  /* wait for space */
         }
     }
@@ -122,6 +131,35 @@ static int pipe_close_read(file_t *f) {
     return 0;
 }
 
+static int pipe_poll_read(file_t *f, int events) {
+    pipe_t *p = (pipe_t *)f->private_data;
+    if (!p) return POLLERR;
+
+    int revents = 0;
+    pipe_lock(p);
+    if ((events & (POLLIN | POLLRDNORM)) && p->count > 0)
+        revents |= (POLLIN | POLLRDNORM);
+    if (p->writers == 0)
+        revents |= POLLHUP;
+    pipe_unlock(p);
+    return revents;
+}
+
+static int pipe_poll_write(file_t *f, int events) {
+    pipe_t *p = (pipe_t *)f->private_data;
+    if (!p) return POLLERR;
+
+    int revents = 0;
+    pipe_lock(p);
+    if (p->readers == 0) {
+        revents |= POLLERR;
+    } else if ((events & (POLLOUT | POLLWRNORM)) && p->count < PIPE_BUF_SIZE) {
+        revents |= (POLLOUT | POLLWRNORM);
+    }
+    pipe_unlock(p);
+    return revents;
+}
+
 /* ── file_ops close for write end ────────────────────────────────────────── */
 static int pipe_close_write(file_t *f) {
     pipe_t *p = (pipe_t *)f->private_data;
@@ -140,7 +178,7 @@ static file_ops_t pipe_read_ops = {
     .read  = pipe_read_op,
     .write = NULL,           /* can't write to read end */
     .close = pipe_close_read,
-    .poll  = NULL,
+    .poll  = pipe_poll_read,
     .ioctl = NULL,
 };
 
@@ -148,7 +186,7 @@ static file_ops_t pipe_write_ops = {
     .read  = NULL,           /* can't read from write end */
     .write = pipe_write_op,
     .close = pipe_close_write,
-    .poll  = NULL,
+    .poll  = pipe_poll_write,
     .ioctl = NULL,
 };
 
@@ -175,10 +213,19 @@ int64_t sys_pipe2(int pipefd[2], int flags) {
     if (!wf) { file_put(rf); kfree(p); return -ENOMEM; }
 
     int rfd = fd_alloc(cur, rf);
-    if (rfd < 0) { file_put(rf); file_put(wf); kfree(p); return -EMFILE; }
+    if (rfd < 0) {
+        file_put(rf);
+        file_put(wf);
+        return -EMFILE;
+    }
 
     int wfd = fd_alloc(cur, wf);
-    if (wfd < 0) { fd_close(cur, rfd); file_put(wf); kfree(p); return -EMFILE; }
+    if (wfd < 0) {
+        fd_close(cur, rfd);
+        file_put(rf);
+        file_put(wf);
+        return -EMFILE;
+    }
 
     if (flags & 0x80000) {  /* O_CLOEXEC */
         rf->fd_flags |= FD_CLOEXEC;
@@ -187,6 +234,10 @@ int64_t sys_pipe2(int pipefd[2], int flags) {
 
     pipefd[0] = rfd;
     pipefd[1] = wfd;
+
+    /* Drop creator refs; fd table now owns the live references. */
+    file_put(rf);
+    file_put(wf);
 
     KLOG_DEBUG("pipe2: created pipe rd=%d wr=%d\n", rfd, wfd);
     return 0;
