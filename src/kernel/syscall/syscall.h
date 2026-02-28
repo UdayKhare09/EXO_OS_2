@@ -63,6 +63,7 @@
 #define SYS_UMASK       95
 #define SYS_GETRLIMIT   97
 #define SYS_TIMES       100
+#define SYS_MOUNT      165
 #define SYS_FUTIMESAT   261
 #define SYS_GETUID      102
 #define SYS_GETGID      104

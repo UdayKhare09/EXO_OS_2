@@ -64,6 +64,8 @@ int64_t sys_unlink(const char *path);
 int64_t sys_rename(const char *old, const char *newp);
 int64_t sys_getdents64(int fd, void *dirp, uint64_t count);
 int64_t sys_brk(uint64_t addr);
+int64_t sys_mount(const char *source, const char *target, const char *fstype,
+                  uint64_t flags, const void *data);
 
 /* ── Forward declarations to net_syscalls.c ─────────────────────────────── */
 struct sockaddr;
@@ -208,6 +210,8 @@ static int64_t sc_fchownat(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t 
     { (void)f; return sys_fchownat((int)a, (const char*)b, (int)c, (int)d, (int)e); }
 static int64_t sc_getdents64(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { (void)d;(void)e;(void)f; return sys_getdents64((int)a,(void*)b,c); }
+static int64_t sc_mount(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)f; return sys_mount((const char*)a,(const char*)b,(const char*)c,d,(const void*)e); }
 
 /* ── Network syscall wrappers ────────────────────────────────────────────── */
 static int64_t sc_poll(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
@@ -1117,6 +1121,7 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_GETSID]    = sc_getsid,
     [SYS_ARCH_PRCTL]= sc_arch_prctl,
     [SYS_SYNC]      = sc_sync,
+    [SYS_MOUNT]     = sc_mount,
     [SYS_GETDENTS64]= sc_getdents64,
     [SYS_SET_TID_ADDRESS] = sc_set_tid_address,
     [SYS_SET_ROBUST_LIST] = sc_set_robust_list,

@@ -40,9 +40,10 @@
 #define PROC_MOUNTS   13   /* /proc/mounts              */
 #define PROC_PARTS    14   /* /proc/partitions          */
 #define PROC_CMDLINE  15   /* /proc/cmdline             */
-#define PROC_PID_STAT 16   /* /proc/<pid>/stat          */
-#define PROC_PID_CMD  17   /* /proc/<pid>/cmdline       */
-#define PROC_PID_EXE  18   /* /proc/<pid>/exe symlink   */
+#define PROC_FILESYSTEMS 16 /* /proc/filesystems         */
+#define PROC_PID_STAT 17   /* /proc/<pid>/stat          */
+#define PROC_PID_CMD  18   /* /proc/<pid>/cmdline       */
+#define PROC_PID_EXE  19   /* /proc/<pid>/exe symlink   */
 
 /* ── Per-vnode data ──────────────────────────────────────────────────────── */
 typedef struct {
@@ -384,6 +385,17 @@ static ssize_t gen_cmdline(char *buf, size_t bufsz) {
     return (ssize_t)n;
 }
 
+static ssize_t gen_filesystems(char *buf, size_t bufsz) {
+    size_t off = 0;
+    off = procfs_appendf(buf, bufsz, off, "\text2\n");
+    off = procfs_appendf(buf, bufsz, off, "\tfat32\n");
+    off = procfs_appendf(buf, bufsz, off, "nodev\ttmpfs\n");
+    off = procfs_appendf(buf, bufsz, off, "nodev\tprocfs\n");
+    off = procfs_appendf(buf, bufsz, off, "nodev\tsysfs\n");
+    off = procfs_appendf(buf, bufsz, off, "nodev\tdevfs\n");
+    return (ssize_t)off;
+}
+
 static char proc_state_letter(task_state_t st) {
     switch (st) {
         case TASK_RUNNING:
@@ -470,6 +482,9 @@ static vnode_t *procfs_lookup(vnode_t *dir, const char *name) {
         if (strcmp(name, "cmdline") == 0) {
             return procfs_alloc_node(PROC_CMDLINE, 0, VFS_S_IFREG | 0444);
         }
+        if (strcmp(name, "filesystems") == 0) {
+            return procfs_alloc_node(PROC_FILESYSTEMS, 0, VFS_S_IFREG | 0444);
+        }
         /* /proc/self — symlink */
         if (strcmp(name, "self") == 0) {
             return procfs_alloc_node(PROC_SELF, 0, VFS_S_IFLNK | 0777);
@@ -546,6 +561,7 @@ static ssize_t procfs_read(vnode_t *v, void *buf, size_t len, uint64_t off) {
         case PROC_MOUNTS: total = gen_mounts(tmp, PROCFS_BUF_SIZE); break;
         case PROC_PARTS: total = gen_partitions(tmp, PROCFS_BUF_SIZE); break;
         case PROC_CMDLINE: total = gen_cmdline(tmp, PROCFS_BUF_SIZE); break;
+        case PROC_FILESYSTEMS: total = gen_filesystems(tmp, PROCFS_BUF_SIZE); break;
         case PROC_PID_STAT: total = gen_pid_stat(pn->pid, tmp, PROCFS_BUF_SIZE); break;
         case PROC_PID_CMD: total = gen_pid_cmdline(pn->pid, tmp, PROCFS_BUF_SIZE); break;
         default: kfree(tmp); return -EIO;
@@ -595,7 +611,7 @@ static int procfs_readdir(vnode_t *dir, uint64_t *cookie, vfs_dirent_t *out) {
 
         static const char *root_files[] = {
             "meminfo", "uptime", "cpuinfo", "version",
-            "loadavg", "stat", "mounts", "partitions", "cmdline"
+            "loadavg", "stat", "mounts", "partitions", "cmdline", "filesystems"
         };
         uint64_t root_file_base = 2;
         uint64_t root_file_count = sizeof(root_files) / sizeof(root_files[0]);

@@ -38,6 +38,7 @@ typedef struct fs_inst fs_inst_t;
 #define VFS_S_ISREG(m)  (((m) & VFS_S_IFMT) == VFS_S_IFREG)
 #define VFS_S_ISDIR(m)  (((m) & VFS_S_IFMT) == VFS_S_IFDIR)
 #define VFS_S_ISLNK(m)  (((m) & VFS_S_IFMT) == VFS_S_IFLNK)
+#define VFS_S_ISBLK(m)  (((m) & VFS_S_IFMT) == VFS_S_IFBLK)
 
 /* Permission bits */
 #define VFS_S_IRWXU 0700

@@ -859,6 +859,124 @@ int64_t sys_getdents64(int fd, void *dirp, uint64_t count) {
     return (int64_t)written;
 }
 
+/* ── sys_mount ───────────────────────────────────────────────────────────── */
+int64_t sys_mount(const char *source, const char *target, const char *fstype,
+                  uint64_t flags, const void *data) {
+    (void)flags;
+    (void)data;
+
+    task_t *t = cur_task();
+    if (!t) return -ESRCH;
+    if (t->uid != 0) return -EPERM;
+    if (!target || !target[0]) return -EINVAL;
+
+    KLOG_INFO("mount: src='%s' tgt='%s' type='%s' flags=0x%llx\n",
+              source ? source : "", target,
+              (fstype && fstype[0]) ? fstype : "(auto)",
+              (unsigned long long)flags);
+
+    char target_path[VFS_MOUNT_PATH_MAX];
+    int rc = resolve_path(target, target_path);
+    if (rc < 0) {
+        KLOG_WARN("mount: resolve target '%s' failed rc=%d\n", target, rc);
+        return rc;
+    }
+
+    int lerr = 0;
+    vnode_t *mnt = vfs_lookup(target_path, true, &lerr);
+    if (!mnt) {
+        int err = lerr ? lerr : -ENOENT;
+        KLOG_WARN("mount: target lookup '%s' failed rc=%d\n", target_path, err);
+        return err;
+    }
+    if (!VFS_S_ISDIR(mnt->mode)) {
+        vfs_vnode_put(mnt);
+        KLOG_WARN("mount: target '%s' is not a directory\n", target_path);
+        return -ENOTDIR;
+    }
+    vfs_vnode_put(mnt);
+
+    blkdev_t *dev = NULL;
+    if (source && source[0]) {
+        char src_path[VFS_MOUNT_PATH_MAX];
+        const char *src_use = source;
+
+        /* Normalize source path so mount accepts both absolute and relative
+         * device paths consistently (e.g. "/dev/vda3", "./dev/vda3"). */
+        if (source[0] == '/' || source[0] == '.') {
+            int src_rc = resolve_path(source, src_path);
+            if (src_rc < 0) {
+                KLOG_WARN("mount: resolve source '%s' failed rc=%d\n", source, src_rc);
+                return src_rc;
+            }
+            src_use = src_path;
+        }
+
+        const char *name = src_use;
+        if (strncmp(name, "/dev/", 5) == 0) {
+            int derr = 0;
+            vnode_t *dv = vfs_lookup(src_use, true, &derr);
+            if (!dv) {
+                int err = derr ? derr : -ENOENT;
+                KLOG_WARN("mount: source lookup '%s' failed rc=%d\n", src_use, err);
+                return err;
+            }
+            if (!VFS_S_ISBLK(dv->mode)) {
+                vfs_vnode_put(dv);
+                KLOG_WARN("mount: source '%s' is not a block device\n", src_use);
+                return -EINVAL;
+            }
+            vfs_vnode_put(dv);
+            name += 5;
+        }
+
+        while (*name == '/') name++;
+        if (!name[0]) return -EINVAL;
+
+        char dev_name[32];
+        size_t ni = 0;
+        while (name[ni] && name[ni] != '/' && ni < sizeof(dev_name) - 1) {
+            dev_name[ni] = name[ni];
+            ni++;
+        }
+        dev_name[ni] = '\0';
+        if (!dev_name[0]) return -EINVAL;
+
+        dev = blkdev_find_by_name(dev_name);
+        if (!dev) {
+            KLOG_WARN("mount: block device '%s' not found\n", dev_name);
+            return -ENOENT;
+        }
+    }
+
+    bool auto_fs = (!fstype || !fstype[0] || strcmp(fstype, "auto") == 0);
+    if (!auto_fs) {
+        rc = vfs_mount(target_path, dev, fstype);
+        if (rc < 0)
+            KLOG_WARN("mount: vfs_mount(%s,%s,%s) failed rc=%d\n",
+                      target_path, source ? source : "", fstype, rc);
+        return rc;
+    }
+
+    if (dev) {
+        static const char *const fs_try[] = {"ext2", "fat32"};
+        for (size_t i = 0; i < sizeof(fs_try) / sizeof(fs_try[0]); i++) {
+            rc = vfs_mount(target_path, dev, fs_try[i]);
+            if (rc == 0) {
+                KLOG_INFO("mount: auto-detected fs '%s' for '%s'\n", fs_try[i], source);
+                return 0;
+            }
+        }
+        KLOG_WARN("mount: auto-detect failed for '%s'\n", source ? source : "");
+        return -EINVAL;
+    }
+
+    rc = vfs_mount(target_path, NULL, "tmpfs");
+    if (rc < 0)
+        KLOG_WARN("mount: tmpfs mount on '%s' failed rc=%d\n", target_path, rc);
+    return rc;
+}
+
 /* ── sys_brk ─────────────────────────────────────────────────────────────── */
 int64_t sys_brk(uint64_t addr) {
     task_t *cur = sched_current();

@@ -1,7 +1,8 @@
 # EXO_OS Root Makefile
-# Limine 8 (UEFI) bootloader — GPT disk image with two partitions:
+# Limine 8 (UEFI) bootloader — GPT disk image with three partitions:
 #   p1: EFI System (FAT32, 64 MiB)  → /boot
 #   p2: Linux Root (ext2)            → /
+#   p3: Linux Data (ext2)            → /mnt
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 ARCH      := x86_64
@@ -23,11 +24,19 @@ DISK_SIZE_MB := 256
 EFI_START    := 2048
 EFI_END      := 133119
 EFI_SECTORS  := $(shell echo $$(($(EFI_END) - $(EFI_START) + 1)))
-# p2: Linux root — sector 133120 to end
-ROOT_START   := 133120
+# p2: Linux root — fixed-size partition
+ROOT_START    := 133120
+ROOT_SIZE_MB  := 128
+ROOT_SECTORS  := $(shell echo $$(($(ROOT_SIZE_MB) * 2048)))
+ROOT_END      := $(shell echo $$(($(ROOT_START) + $(ROOT_SECTORS) - 1)))
+# p3: Linux data — remainder up to backup GPT
+DATA_START    := $(shell echo $$(($(ROOT_END) + 1)))
+DATA_END      := $(shell echo $$((($(DISK_SIZE_MB) * 2048) - 34)))
+DATA_SECTORS  := $(shell echo $$(($(DATA_END) - $(DATA_START) + 1)))
 
 EFI_IMG  := $(BUILD_DIR)/efi.img
 ROOT_IMG := $(BUILD_DIR)/root.img
+DATA_IMG := $(BUILD_DIR)/data.img
 
 # ── OVMF firmware ─────────────────────────────────────────────────────────────
 OVMF_CODE      := /usr/share/edk2/x64/OVMF_CODE.4m.fd
@@ -309,10 +318,9 @@ $(ROOT_IMG): $(LIBC_DYNAMIC_BINS) $(LIBC_DYNAMIC_LIBS) $(MUSL_RUNTIME_STAMP) \
 			 $(BUSYBOX_BIN) $(EXTERNAL_BIN_STAMP) \
 		     $(ROOTFS_PROFILE) $(ROOTFS_ENV_FILE) $(ROOTFS_PASSWD) $(ROOTFS_GROUP) $(ROOTFS_RESOLV)
 	@echo ">>> Building root partition (ext2)..."
-	$(eval ROOT_SECTORS := $(shell echo $$(($(DISK_SIZE_MB) * 2048 - $(ROOT_START) - 33))))
 	dd if=/dev/zero of=$@ bs=512 count=$(ROOT_SECTORS) 2>/dev/null
 	mkfs.ext2 -q -L "EXOOS_ROOT" -b 4096 $@
-	$(foreach d, dev tmp boot proc sys sys/bus sys/bus/usb sys/bus/usb/devices sys/bus/pci sys/bus/pci/devices home home/root etc etc/ssl etc/ssl/certs bin lib usr usr/bin usr/sbin usr/share usr/share/terminfo usr/share/terminfo/l sbin var run, \
+	$(foreach d, dev tmp boot proc sys sys/bus sys/bus/usb sys/bus/usb/devices sys/bus/pci sys/bus/pci/devices home home/root etc etc/ssl etc/ssl/certs bin lib usr usr/bin usr/sbin usr/share usr/share/terminfo usr/share/terminfo/l sbin var run mnt, \
 	    debugfs -w -R "mkdir $(d)" $@ 2>/dev/null || true ;)
 	debugfs -w -R "write $(LIBC_HELLO_DYN_BIN)  home/root/hello_dynamic"   $@ 2>/dev/null
 	debugfs -w -R "write $(LIBC_DLOPEN_TEST_BIN)  home/root/dlopen_test"   $@ 2>/dev/null
@@ -348,15 +356,23 @@ $(ROOT_IMG): $(LIBC_DYNAMIC_BINS) $(LIBC_DYNAMIC_LIBS) $(MUSL_RUNTIME_STAMP) \
 	    echo "!!! warning: linux terminfo entry not found on host; nano may fail with TERM=linux"; \
 	fi
 
+# ── Data partition (ext2) ─────────────────────────────────────────────────────
+$(DATA_IMG):
+	@echo ">>> Building data partition (ext2)..."
+	dd if=/dev/zero of=$@ bs=512 count=$(DATA_SECTORS) 2>/dev/null
+	mkfs.ext2 -q -L "EXOOS_DATA" -b 4096 $@
+
 # ── GPT disk image ────────────────────────────────────────────────────────────
-$(DISK_IMG): $(EFI_IMG) $(ROOT_IMG)
+$(DISK_IMG): $(EFI_IMG) $(ROOT_IMG) $(DATA_IMG)
 	@echo ">>> Assembling $(DISK_SIZE_MB) MiB GPT disk image..."
 	dd if=/dev/zero of=$@ bs=1M count=$(DISK_SIZE_MB) 2>/dev/null
 	sgdisk -Z $@ >/dev/null 2>&1
 	sgdisk -n 1:$(EFI_START):$(EFI_END) -t 1:ef00 -c 1:"EFI System" $@ >/dev/null
-	sgdisk -n 2:$(ROOT_START):0         -t 2:8300 -c 2:"Linux Root"  $@ >/dev/null
+	sgdisk -n 2:$(ROOT_START):$(ROOT_END) -t 2:8300 -c 2:"Linux Root"  $@ >/dev/null
+	sgdisk -n 3:$(DATA_START):$(DATA_END) -t 3:8300 -c 3:"Linux Data"  $@ >/dev/null
 	dd if=$(EFI_IMG)  of=$@ bs=512 seek=$(EFI_START)  conv=notrunc 2>/dev/null
 	dd if=$(ROOT_IMG) of=$@ bs=512 seek=$(ROOT_START) conv=notrunc 2>/dev/null
+	dd if=$(DATA_IMG) of=$@ bs=512 seek=$(DATA_START) conv=notrunc 2>/dev/null
 	@echo ">>> Disk image ready: $@"
 
 # ── OVMF vars (writable per-VM copy) ─────────────────────────────────────────
@@ -373,7 +389,7 @@ run-debug: $(DISK_IMG) $(OVMF_VARS)
 # ── Clean ─────────────────────────────────────────────────────────────────────
 clean:
 	rm -rf $(BUILD_DIR)/obj $(KERNEL_ELF) $(DISK_IMG) \
-	       $(EFI_IMG) $(ROOT_IMG) $(BUILD_DIR)/limine.h \
+	       $(EFI_IMG) $(ROOT_IMG) $(DATA_IMG) $(BUILD_DIR)/limine.h \
 	       $(FONT_DATA_C) $(FONT_DATA_OBJ) $(OVMF_VARS) \
 	       $(LIBC_SMOKE_DIR)
 
