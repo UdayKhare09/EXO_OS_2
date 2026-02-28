@@ -85,6 +85,12 @@ sig_handler_t signal_get(struct task *t, int sig);
 /* ── Delivery ────────────────────────────────────────────────────────────── */
 void signal_send(struct task *t, int sig);
 
+/* Send signal to every non-kthread task whose pgid matches */
+void signal_send_pgrp(uint32_t pgid, int sig);
+
+/* Send signal to every non-kthread task whose sid matches */
+void signal_send_session(uint32_t sid, int sig);
+
 /* Dispatch pending signals for task `t`. For kernel tasks, handlers are
  * called directly. For user tasks, this is a no-op (delivery happens
  * in the syscall return path via signal_deliver_user). */

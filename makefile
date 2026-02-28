@@ -303,6 +303,22 @@ busybox-build:   $(BUSYBOX_BIN)
 external-bins-build: $(EXTERNAL_BIN_STAMP)
 curl-build: external-bins-build
 
+# ── init binary (musl static — installed as /sbin/init in the root image) ────
+INIT_SRC := tools/init.c
+INIT_BIN := $(BUILD_DIR)/init
+
+$(INIT_BIN): $(INIT_SRC) check-musl
+	@mkdir -p $(dir $@)
+	$(MUSL_SMOKE_CC) --target=x86_64-linux-musl \
+	    -O2 -fno-stack-protector -static -nostdlib \
+	    -isystem $(MUSL_INC_DIR) \
+	    $(MUSL_LIB_DIR)/crt1.o \
+	    $(MUSL_LIB_DIR)/crti.o \
+	    -o $@ $< \
+	    -L$(MUSL_LIB_DIR) \
+	    -Wl,--start-group -lc -lgcc -Wl,--end-group \
+	    $(MUSL_LIB_DIR)/crtn.o
+
 # ── EFI partition (FAT32, no root needed — mtools) ────────────────────────────
 $(EFI_IMG): $(KERNEL_ELF) $(LIMINE_DIR)/limine.h
 	@echo ">>> Building EFI partition (FAT32, $(EFI_SECTORS) sectors)..."
@@ -315,7 +331,7 @@ $(EFI_IMG): $(KERNEL_ELF) $(LIMINE_DIR)/limine.h
 
 # ── Root partition (ext2, no root needed — debugfs) ───────────────────────────
 $(ROOT_IMG): $(LIBC_DYNAMIC_BINS) $(LIBC_DYNAMIC_LIBS) $(MUSL_RUNTIME_STAMP) \
-			 $(BUSYBOX_BIN) $(EXTERNAL_BIN_STAMP) \
+			 $(BUSYBOX_BIN) $(EXTERNAL_BIN_STAMP) $(INIT_BIN) \
 		     $(ROOTFS_PROFILE) $(ROOTFS_ENV_FILE) $(ROOTFS_PASSWD) $(ROOTFS_GROUP) $(ROOTFS_RESOLV)
 	@echo ">>> Building root partition (ext2)..."
 	dd if=/dev/zero of=$@ bs=512 count=$(ROOT_SECTORS) 2>/dev/null
@@ -327,6 +343,7 @@ $(ROOT_IMG): $(LIBC_DYNAMIC_BINS) $(LIBC_DYNAMIC_LIBS) $(MUSL_RUNTIME_STAMP) \
 	debugfs -w -R "write $(LIBC_LIBTEST_SO)  lib/libtest.so"   $@ 2>/dev/null
 	debugfs -w -R "write $(BUSYBOX_BIN)         bin/busybox"       $@ 2>/dev/null
 	debugfs -w -R "write $(BUSYBOX_BIN)         bin/sh"            $@ 2>/dev/null
+	debugfs -w -R "write $(INIT_BIN)            sbin/init"         $@ 2>/dev/null
 	debugfs -w -R "write $(MUSL_RUNTIME_DIR)/ld-musl-x86_64.so.1 lib/ld-musl-x86_64.so.1" $@ 2>/dev/null
 	debugfs -w -R "write $(MUSL_RUNTIME_DIR)/libc.so lib/libc.so" $@ 2>/dev/null
 	debugfs -w -R "write $(MUSL_RUNTIME_DIR)/libdl.so lib/libdl.so" $@ 2>/dev/null

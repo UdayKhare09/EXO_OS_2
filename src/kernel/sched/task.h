@@ -76,6 +76,9 @@ typedef struct task {
     struct task  *child_next;       /* next sibling (in parent's children list) */
     int           exit_status;      /* set by sys_exit(), read by wait()        */
     uint8_t       is_user;          /* 1 = user-mode process, 0 = kernel task   */
+    uint8_t       is_kthread;       /* 1 = kernel thread (hidden from /proc, etc) */
+    void         *ctty_pty;         /* controlling terminal PTY pair (opaque ptr to pty_pair_t) */
+    uint8_t       ctty_is_raw;      /* 1 = controlling TTY is in raw (non-canonical) mode */
 
     /* ── Scheduling (MLFQ) ──────────────────────────────────────────────── */
     uint8_t       priority;         /* 0=highest, 7=lowest                       */
@@ -140,3 +143,6 @@ task_t *task_lookup(uint32_t tid);
 
 /* Access task table for enumeration (read-only) */
 task_t *task_get_from_table(uint32_t index);
+
+/* Global pointer to PID 1 (set once the first user process is spawned) */
+extern task_t *g_init_task;

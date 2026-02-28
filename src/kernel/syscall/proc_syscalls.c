@@ -759,6 +759,13 @@ int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
     strncpy(cur->exe_path, exec_path, TASK_CWD_MAX - 1);
     cur->exe_path[TASK_CWD_MAX - 1] = '\0';
 
+    const char *base = exec_path;
+    for (const char *p = exec_path; *p; ++p)
+        if (*p == '/') base = p + 1;
+    if (!*base) base = exec_path;
+    strncpy(cur->name, base, TASK_NAME_MAX - 1);
+    cur->name[TASK_NAME_MAX - 1] = '\0';
+
     /* Jump to user-mode at the new entry point via user_mode_trampoline */
     extern void user_mode_trampoline(void);
 

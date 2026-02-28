@@ -45,7 +45,16 @@ extern void task_trampoline(void);   /* defined in context_switch.asm */
 /* User-mode entry trampoline: sets up iretq frame to jump to ring 3 */
 extern void user_mode_trampoline(void);  /* defined in context_switch.asm */
 
-static uint32_t next_tid = 1;
+/* User tasks get TIDs 1..USER_TID_MAX; kernel threads get TIDs
+ * (TASK_TABLE_SIZE-1) counting down to KTHREAD_TID_MIN.  Both ranges
+ * fit inside task_table[] so task_lookup() works for either. */
+#define USER_TID_MAX    511u
+#define KTHREAD_TID_MIN 512u
+static uint32_t next_user_tid    = 1;
+static uint32_t next_kthread_tid = TASK_TABLE_SIZE - 1;
+
+/* PID 1 user process: set once, used for orphan reparenting */
+task_t *g_init_task = NULL;
 
 static void task_release_shared_mappings(task_t *t) {
     if (!t || !t->cr3) return;
@@ -68,8 +77,10 @@ static void task_release_shared_mappings(task_t *t) {
     }
 }
 
-/* Shared init for both kernel and user tasks */
-static task_t *task_alloc_common(const char *name, uint32_t cpu_id) {
+/* Shared init for both kernel and user tasks.
+ * is_kthread=1 => allocate from the high TID pool (hidden from /proc).
+ * is_kthread=0 => allocate from the low user TID pool. */
+static task_t *task_alloc_common(const char *name, uint32_t cpu_id, int is_kthread) {
     uintptr_t task_page = pmm_alloc_pages(1);
     if (!task_page) return NULL;
     task_t *t = (task_t *)vmm_phys_to_virt(task_page);
@@ -91,7 +102,13 @@ static task_t *task_alloc_common(const char *name, uint32_t cpu_id) {
     memset(t->fpu_state, 0, PAGE_SIZE);
 
     t->state  = TASK_RUNNABLE;
-    t->tid    = next_tid++;
+    if (is_kthread) {
+        if (next_kthread_tid < KTHREAD_TID_MIN) next_kthread_tid = KTHREAD_TID_MIN;
+        t->tid = next_kthread_tid--;
+    } else {
+        if (next_user_tid > USER_TID_MAX) next_user_tid = 1;
+        t->tid = next_user_tid++;
+    }
     t->pid    = t->tid;   /* default: PID == TID */
     t->cpu_id = cpu_id;
     t->next   = NULL;
@@ -108,8 +125,11 @@ static task_t *task_alloc_common(const char *name, uint32_t cpu_id) {
     t->parent = NULL;
     t->children   = NULL;
     t->child_next = NULL;
-    t->exit_status = 0;
-    t->is_user  = 0;
+    t->exit_status  = 0;
+    t->is_user      = 0;
+    t->is_kthread   = (uint8_t)(is_kthread ? 1 : 0);
+    t->ctty_pty     = NULL;
+    t->ctty_is_raw  = 0;
 
     /* Priority scheduler fields */
     t->priority        = 4;
@@ -142,7 +162,7 @@ static task_t *task_alloc_common(const char *name, uint32_t cpu_id) {
 
 task_t *task_create(const char *name, task_entry_t entry, void *arg,
                     uint32_t cpu_id) {
-    task_t *t = task_alloc_common(name, cpu_id);
+    task_t *t = task_alloc_common(name, cpu_id, /*is_kthread=*/1);
     if (!t) return NULL;
 
     uintptr_t stack_virt_top = vmm_phys_to_virt(t->stack_phys) + TASK_STACK_SIZE;
@@ -168,7 +188,7 @@ task_t *task_create(const char *name, task_entry_t entry, void *arg,
 task_t *task_create_user(const char *name, uintptr_t pml4_phys,
                          uintptr_t user_entry, uintptr_t user_stack_top,
                          uint32_t cpu_id) {
-    task_t *t = task_alloc_common(name, cpu_id);
+    task_t *t = task_alloc_common(name, cpu_id, /*is_kthread=*/0);
     if (!t) return NULL;
 
     uintptr_t stack_virt_top = vmm_phys_to_virt(t->stack_phys) + TASK_STACK_SIZE;
@@ -183,8 +203,13 @@ task_t *task_create_user(const char *name, uintptr_t pml4_phys,
 
     t->rsp     = stack_virt_top;
     t->cr3     = pml4_phys;
-    t->is_user = 1;
+    t->is_user    = 1;
+    t->is_kthread = 0;
     t->owns_address_space = 1;
+
+    /* First user process ever created is init (PID 1). */
+    if (t->pid == 1 && g_init_task == NULL)
+        g_init_task = t;
 
     KLOG_DEBUG("task: created user '%s' tid=%u cpu=%u entry=%p ustack=%p\n",
                t->name, t->tid, t->cpu_id,

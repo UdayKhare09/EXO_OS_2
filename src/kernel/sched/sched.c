@@ -316,13 +316,33 @@ void sched_task_exit(void) {
     cpu_sched_t *cs = &cpu_scheds[ci->id];
     task_t *cur = cs->current;
 
+    /* Reparent any children of this task to init (PID 1).
+     * This prevents dangling ->parent pointers when child exits later. */
+    if (g_init_task && cur != g_init_task) {
+        task_t *child = cur->children;
+        while (child) {
+            task_t *next_child = child->child_next;
+            child->parent     = g_init_task;
+            child->ppid       = g_init_task->pid;
+            /* Link into init's children list */
+            child->child_next = g_init_task->children;
+            g_init_task->children = child;
+            child = next_child;
+        }
+        cur->children = NULL;
+        /* If we reparented any zombies, wake init so it can reap them */
+        signal_send(g_init_task, SIGCHLD);
+    }
+
     /* Threads in the same thread-group (pid == parent->pid) are reaped
      * immediately; only real child processes become zombies for wait4(). */
     if (cur->parent) {
         if (cur->pid == cur->parent->pid)
             cur->state = TASK_DEAD;
-        else
+        else {
             cur->state = TASK_ZOMBIE;
+            signal_send(cur->parent, SIGCHLD);
+        }
     } else {
         cur->state = TASK_DEAD;
     }

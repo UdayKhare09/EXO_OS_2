@@ -260,10 +260,25 @@ static int pty_master_ioctl(file_t *f, unsigned long cmd, unsigned long arg) {
     }
     if (cmd == TIOCSCTTY) {
         task_t *cur = sched_current();
-        if (cur) p->fg_pgid = (int)cur->pgid;
+        if (cur) {
+            p->fg_pgid = (int)cur->pgid;
+            /* Assign controlling terminal to every task in caller's session */
+            for (uint32_t i = 1; i < TASK_TABLE_SIZE; i++) {
+                task_t *t = task_get_from_table(i);
+                if (!t || t->is_kthread) continue;
+                if (t->sid == cur->sid)
+                    t->ctty_pty = (void *)p;
+            }
+        }
         return 0;
     }
     if (cmd == TIOCNOTTY) {
+        task_t *cur = sched_current();
+        if (cur) {
+            /* Detach only this task from its controlling terminal */
+            cur->ctty_pty    = NULL;
+            cur->ctty_is_raw = 0;
+        }
         return 0;
     }
     return -EINVAL;

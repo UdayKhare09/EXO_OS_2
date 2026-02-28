@@ -203,6 +203,8 @@ static bool vfs_path_exists(const char *path) {
     return true;
 }
 
+static bool read_small_text_file(const char *path, char *buf, size_t buf_sz)
+__attribute__((unused));
 static bool read_small_text_file(const char *path, char *buf, size_t buf_sz) {
     if (!buf || buf_sz < 2) return false;
     int err = 0;
@@ -220,6 +222,8 @@ static bool read_small_text_file(const char *path, char *buf, size_t buf_sz) {
     return true;
 }
 
+/* Suppress unused-function warnings: these may be used by future code */
+__attribute__((unused))
 static bool parse_shell_from_environment(const char *text, char *out, size_t out_sz) {
     if (!text || !out || out_sz < 2) return false;
     const char *p = text;
@@ -248,20 +252,6 @@ static bool parse_shell_from_environment(const char *text, char *out, size_t out
         return true;
     }
     return false;
-}
-
-static void pick_user_shell_path(char *out, size_t out_sz) {
-    if (!out || out_sz < 2) return;
-    strncpy(out, "/bin/sh", out_sz - 1);
-    out[out_sz - 1] = '\0';
-
-    char envbuf[512];
-    char configured[VFS_MOUNT_PATH_MAX];
-    if (read_small_text_file("/etc/environment", envbuf, sizeof(envbuf)) &&
-        parse_shell_from_environment(envbuf, configured, sizeof(configured))) {
-        strncpy(out, configured, out_sz - 1);
-        out[out_sz - 1] = '\0';
-    }
 }
 
 static launcher_t *launcher_create_quiet(fbcon_t *con) {
@@ -378,7 +368,13 @@ static void launcher_exec_path(launcher_t *launcher, const char *args) {
     })
 
     const char *argv0_str = fullpath;
-    if (strcmp(fullpath, "/bin/sh") == 0)
+    /* For /sbin/init: plain "init" (not a login shell).
+     * For /bin/sh launched by init itself: init.c sets argv0="-sh";
+     *   if the kernel is launching the shell directly as a fallback,
+     *   treat it as a login shell. */
+    if (strcmp(fullpath, "/sbin/init") == 0)
+        argv0_str = "init";
+    else if (strcmp(fullpath, "/bin/sh") == 0)
         argv0_str = "-sh";
     uintptr_t argv0_addr = EXEC_PUSH_STR(argv0_str);
 
@@ -410,22 +406,52 @@ static void launcher_exec_path(launcher_t *launcher, const char *args) {
     for (size_t i = 0; i < sizeof(env_list) / sizeof(env_list[0]); i++)
         env_addrs[env_count++] = EXEC_PUSH_STR(env_list[i]);
 
+    /* AT_RANDOM: 16 bytes of random data (we fill with a simple pseudo-random) */
+    sp      -= 16;
+    sp      &= ~0xFULL;
+    uint64_t random_addr = sp;
+    {
+        uint64_t *rp_virt = NULL;
+        uint64_t *pte2 = vmm_get_pte(pml4, sp);
+        if (pte2) {
+            uintptr_t ph2 = (*pte2) & 0x000FFFFFFFFFF000ULL;
+            uintptr_t of2 = sp & (PAGE_SIZE - 1);
+            rp_virt = (uint64_t *)(vmm_phys_to_virt(ph2) + of2);
+            /* Fill 16 bytes with deterministic pseudo-random (fine for boot) */
+            rp_virt[0] = 0xDEADBEEFCAFEBABEULL ^ (uint64_t)(uintptr_t)fullpath;
+            rp_virt[1] = 0xFEEDFACEFACEFEEDULL ^ (uint64_t)sp;
+        }
+    }
+
+    /* AT_EXECFN: the executable path string */
+    uintptr_t execfn_addr = EXEC_PUSH_STR(fullpath);
+
     sp &= ~0xFULL;
 
-    EXEC_PUSH(0);
-    EXEC_PUSH(0);
-    EXEC_PUSH(0);
-    EXEC_PUSH(23);
-    EXEC_PUSH(info.entry);
-    EXEC_PUSH(9);
-    EXEC_PUSH(PAGE_SIZE);
-    EXEC_PUSH(6);
-    EXEC_PUSH(info.phdr_size);
-    EXEC_PUSH(4);
-    EXEC_PUSH(info.phdr_count);
-    EXEC_PUSH(5);
-    EXEC_PUSH(info.phdr_vaddr);
-    EXEC_PUSH(3);
+    /* Auxiliary vector (AT_NULL terminator first, pushed in reverse) */
+    EXEC_PUSH(0);   EXEC_PUSH(0);    /* AT_NULL */
+
+    EXEC_PUSH(execfn_addr);          /* AT_EXECFN value */
+    EXEC_PUSH(31);                   /* AT_EXECFN = 31  */
+
+    EXEC_PUSH(random_addr);          /* AT_RANDOM value */
+    EXEC_PUSH(25);                   /* AT_RANDOM = 25  */
+
+    EXEC_PUSH(0);    EXEC_PUSH(14);  /* AT_EGID  = 14 */
+    EXEC_PUSH(0);    EXEC_PUSH(13);  /* AT_GID   = 13 */
+    EXEC_PUSH(0);    EXEC_PUSH(12);  /* AT_EUID  = 12 */
+    EXEC_PUSH(0);    EXEC_PUSH(11);  /* AT_UID   = 11 */
+    EXEC_PUSH(0);    EXEC_PUSH(23);  /* AT_SECURE = 23 */
+    EXEC_PUSH(info.entry);           /* AT_ENTRY value */
+    EXEC_PUSH(9);                    /* AT_ENTRY = 9   */
+    EXEC_PUSH(PAGE_SIZE);            /* AT_PAGESZ value */
+    EXEC_PUSH(6);                    /* AT_PAGESZ = 6   */
+    EXEC_PUSH(info.phdr_size);       /* AT_PHENT value */
+    EXEC_PUSH(4);                    /* AT_PHENT = 4   */
+    EXEC_PUSH(info.phdr_count);      /* AT_PHNUM value */
+    EXEC_PUSH(5);                    /* AT_PHNUM = 5   */
+    EXEC_PUSH(info.phdr_vaddr);      /* AT_PHDR value  */
+    EXEC_PUSH(3);                    /* AT_PHDR = 3    */
 
     EXEC_PUSH(0);
     for (int i = env_count - 1; i >= 0; i--)
@@ -477,12 +503,23 @@ static void launcher_exec_path(launcher_t *launcher, const char *args) {
 
     tty_set_fg_pgid((int)t->pgid);
 
-    t->parent = sched_current();
+    /* PID 1 has no parent in the process tree.  All other processes spawned
+     * by the kernel launcher get the current kernel thread as parent (so
+     * that SIGCHLD + zombie reaping work for intra-kernel launches). */
+    if (t->pid == 1) {
+        t->parent = NULL;
+        t->ppid   = 0;
+    } else {
+        t->parent = sched_current();
+    }
     uint32_t child_tid = t->tid;
 
     sched_add_task(t, cpu);
 
-    {
+    /* For PID 1 the kernel launcher does NOT wait — init manages its own
+     * children.  For any other process the kernel launcher blocks until the
+     * child exits so it can clean up the zombie. */
+    if (t->pid != 1) {
         task_t *ct;
         for (;;) {
             ct = task_lookup(child_tid);
@@ -498,18 +535,32 @@ static void launcher_exec_path(launcher_t *launcher, const char *args) {
     }
 }
 
-/* ── Init task: launch configured user-space shell ──────────────────────── */
+/* ── Init task: launch /sbin/init (PID 1) ────────────────────────────────── */
 static void init_task(void *arg) {
     (void)arg;
 
-    char shell_path[VFS_MOUNT_PATH_MAX];
-    pick_user_shell_path(shell_path, sizeof(shell_path));
-    KLOG_INFO("init: waiting for shell '%s'...\n", shell_path);
+    /* Preferred init binary; fall back to /bin/sh if not present */
+    static const char *const candidates[] = {
+        "/sbin/init",
+        "/bin/sh",
+        NULL,
+    };
 
-    while (!vfs_path_exists(shell_path)) {
+    const char *init_path = NULL;
+
+    /* Wait for the filesystem to be ready */
+    for (;;) {
+        for (int i = 0; candidates[i]; i++) {
+            if (vfs_path_exists(candidates[i])) {
+                init_path = candidates[i];
+                break;
+            }
+        }
+        if (init_path) break;
         sched_sleep(10);
-        pick_user_shell_path(shell_path, sizeof(shell_path));
     }
+
+    KLOG_INFO("init: launching '%s'\n", init_path);
 
     /* Small grace period for USB/HID to come up */
     sched_sleep(200);
@@ -517,16 +568,16 @@ static void init_task(void *arg) {
     fbcon_t *con = fbcon_get();
     launcher_t *launcher = launcher_create_quiet(con);
     if (!launcher) {
-        KLOG_ERR("init: failed to create launcher shell context\n");
+        KLOG_ERR("init: failed to create launcher context\n");
         return;
     }
 
-    for (;;) {
-        launcher_exec_path(launcher, shell_path);
-        KLOG_WARN("init: %s exited; restarting in 1s\n", shell_path);
-        sched_sleep(1000);
-        pick_user_shell_path(shell_path, sizeof(shell_path));
-    }
+    /* Launch /sbin/init as PID 1. launcher_exec_path deliberately returns
+     * immediately for PID 1 (init supervises its own children). */
+    launcher_exec_path(launcher, init_path);
+
+    /* Init task has nothing else to do once PID 1 is running. */
+    for (;;) sched_sleep(10000);
 }
 
 /* ── Kernel entry point ─────────────────────────────────────────────────── */
@@ -691,7 +742,7 @@ void kmain(void) {
 
 
 
-    sched_spawn("init",         init_task,         NULL);
+    sched_spawn("kinit",        init_task,         NULL);
     sched_spawn("usb-init",     usb_init_task,     NULL);
     sched_spawn("storage-init", storage_init_task, NULL);
     sched_spawn("net-init",     net_init_task,     NULL);

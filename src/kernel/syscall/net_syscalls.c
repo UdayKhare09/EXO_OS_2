@@ -152,6 +152,11 @@ void tty_set_fg_pgid(int pgid) {
     g_tty_fg_pgid = pgid;
 }
 
+uint8_t tty_get_cc(int idx) {
+    if (idx < 0 || idx >= 19) return 0;
+    return g_tty_termios.c_cc[idx];
+}
+
 void tty_signal_foreground(int sig) {
     if (sig <= 0 || sig >= NSIGS) return;
     for (uint32_t i = 1; i < TASK_TABLE_SIZE; i++) {
@@ -185,24 +190,26 @@ static void sync_socket_nonblock(file_t *f) {
 
 static int tty_ioctl(file_t *f, unsigned long cmd, unsigned long arg) {
     (void)f;
-    if (!arg) return -EINVAL;
-
     if (cmd == TCGETS) {
+        if (!arg) return -EINVAL;
         kernel_termios_t *user_t = (kernel_termios_t *)(uintptr_t)arg;
         *user_t = g_tty_termios;
         return 0;
     }
     if (cmd == TCSETS || cmd == TCSETSW || cmd == TCSETSF) {
+        if (!arg) return -EINVAL;
         const kernel_termios_t *user_t = (const kernel_termios_t *)(uintptr_t)arg;
         g_tty_termios = *user_t;
         return 0;
     }
     if (cmd == TIOCGPGRP) {
+        if (!arg) return -EINVAL;
         int *pgid = (int *)(uintptr_t)arg;
         *pgid = g_tty_fg_pgid;
         return 0;
     }
     if (cmd == TIOCSPGRP) {
+        if (!arg) return -EINVAL;
         int new_pgid = *(int *)(uintptr_t)arg;
         if (new_pgid <= 0)
             return -EINVAL;
@@ -210,6 +217,7 @@ static int tty_ioctl(file_t *f, unsigned long cmd, unsigned long arg) {
         return 0;
     }
     if (cmd == TIOCGWINSZ) {
+        if (!arg) return -EINVAL;
         kernel_winsize_t *ws = (kernel_winsize_t *)(uintptr_t)arg;
         int rows = fbcon_text_rows();
         int cols = fbcon_text_cols();
@@ -222,6 +230,7 @@ static int tty_ioctl(file_t *f, unsigned long cmd, unsigned long arg) {
         return 0;
     }
     if (cmd == TIOCSWINSZ) {
+        if (!arg) return -EINVAL;
         /* update window size and deliver SIGWINCH to foreground process group */
         const kernel_winsize_t *ws = (const kernel_winsize_t *)(uintptr_t)arg;
         (void)ws; /* fbcon drives real dimensions; just signal SIGWINCH */

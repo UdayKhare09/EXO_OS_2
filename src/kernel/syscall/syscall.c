@@ -853,9 +853,31 @@ static int64_t sc_dup3(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,ui
 
 static int64_t sc_kill(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
     (void)c;(void)d;(void)e;(void)f;
-    task_t *target = task_lookup((uint32_t)a);
-    if (!target) return -ESRCH;
-    signal_send(target, (int)b);
+    int32_t pid = (int32_t)(uint32_t)a;
+    int     sig = (int)(uint32_t)b;
+    task_t *cur = sched_current();
+
+    if (pid > 0) {
+        /* Signal specific process */
+        task_t *target = task_lookup((uint32_t)pid);
+        if (!target || target->is_kthread) return -ESRCH;
+        signal_send(target, sig);
+    } else if (pid == 0) {
+        /* Signal every process in the caller's process group */
+        if (!cur) return -ESRCH;
+        signal_send_pgrp(cur->pgid, sig);
+    } else if (pid == -1) {
+        /* Signal every user process except PID 1 and caller */
+        for (uint32_t i = 1; i < TASK_TABLE_SIZE; i++) {
+            task_t *t = task_get_from_table(i);
+            if (!t || t->is_kthread || t->pid == 1) continue;
+            if (cur && t->pid == cur->pid)  continue;
+            signal_send(t, sig);
+        }
+    } else {
+        /* pid < -1: signal process group (-pid) */
+        signal_send_pgrp((uint32_t)(-pid), sig);
+    }
     return 0;
 }
 

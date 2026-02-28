@@ -19,18 +19,27 @@
 #include "arch/x86_64/cpu.h"
 #include "sched/sched.h"
 #include "drivers/pty.h"
+#include "ipc/signal.h"
 #include <stdint.h>
 #include <stddef.h>
 
-#define TTY_IFLAG_ICRNL 0x00000100U
-#define TTY_OFLAG_OPOST 0x00000001U
-#define TTY_OFLAG_ONLCR 0x00000004U
+#define TTY_IFLAG_ICRNL  0x00000100U
+#define TTY_OFLAG_OPOST  0x00000001U
+#define TTY_OFLAG_ONLCR  0x00000004U
 #define TTY_LFLAG_ICANON 0x00000002U
+#define TTY_LFLAG_ISIG   0x00000001U   /* generate signals on VINTR/VQUIT/VSUSP */
+
+/* c_cc indices (POSIX) */
+#define TTY_VINTR  0   /* ^C  → SIGINT  */
+#define TTY_VQUIT  1   /* ^\  → SIGQUIT */
+#define TTY_VSUSP 10   /* ^Z  → SIGTSTP */
 
 /* Exposed by syscall/net_syscalls.c */
 extern uint32_t tty_get_iflag(void);
 extern uint32_t tty_get_oflag(void);
 extern uint32_t tty_get_lflag(void);
+extern uint8_t  tty_get_cc(int idx);
+extern void     tty_signal_foreground(int sig);
 
 static inline uint64_t devfs_rdtsc(void) {
     uint32_t lo, hi;
@@ -174,14 +183,34 @@ static ssize_t devfs_read(vnode_t *v, void *buf, size_t len, uint64_t off) {
             uint32_t iflag = tty_get_iflag();
             uint32_t lflag = tty_get_lflag();
             bool canonical = (lflag & TTY_LFLAG_ICANON) != 0;
-            bool map_crnl = (iflag & TTY_IFLAG_ICRNL) != 0;
+            bool isig      = (lflag & TTY_LFLAG_ISIG)   != 0;
+            bool map_crnl  = (iflag & TTY_IFLAG_ICRNL)  != 0;
+
+            /* Pre-load signal chars from termios (defaults: ^C, ^\, ^Z) */
+            char vintr = isig ? (char)tty_get_cc(TTY_VINTR) : 0;
+            char vquit = isig ? (char)tty_get_cc(TTY_VQUIT) : 0;
+            char vsusp = isig ? (char)tty_get_cc(TTY_VSUSP) : 0;
 
             while (done < len) {
                 char ch = 0;
                 if (input_tty_getchar_nonblock(&ch) == 0) {
                     if (map_crnl && ch == '\r') ch = '\n';
-                    dst[done++] = ch;
 
+                    /* Signal-generating characters (ISIG): consume but don't buffer */
+                    if (isig && vintr && ch == vintr) {
+                        tty_signal_foreground(SIGINT);
+                        continue;
+                    }
+                    if (isig && vquit && ch == vquit) {
+                        tty_signal_foreground(SIGQUIT);
+                        continue;
+                    }
+                    if (isig && vsusp && ch == vsusp) {
+                        tty_signal_foreground(SIGTSTP);
+                        continue;
+                    }
+
+                    dst[done++] = ch;
                     if (canonical && ch == '\n') break;
                     continue;
                 }
@@ -249,11 +278,18 @@ static ssize_t devfs_read(vnode_t *v, void *buf, size_t len, uint64_t off) {
             uint32_t iflag = tty_get_iflag();
             uint32_t lflag = tty_get_lflag();
             bool canonical = (lflag & TTY_LFLAG_ICANON) != 0;
+            bool isig      = (lflag & TTY_LFLAG_ISIG)   != 0;
             bool map_crnl  = (iflag & TTY_IFLAG_ICRNL)  != 0;
+            char vintr = isig ? (char)tty_get_cc(TTY_VINTR) : 0;
+            char vquit = isig ? (char)tty_get_cc(TTY_VQUIT) : 0;
+            char vsusp = isig ? (char)tty_get_cc(TTY_VSUSP) : 0;
             while (done < len) {
                 char ch = 0;
                 if (input_tty_getchar_nonblock(&ch) == 0) {
                     if (map_crnl && ch == '\r') ch = '\n';
+                    if (isig && vintr && ch == vintr) { tty_signal_foreground(SIGINT);  continue; }
+                    if (isig && vquit && ch == vquit) { tty_signal_foreground(SIGQUIT); continue; }
+                    if (isig && vsusp && ch == vsusp) { tty_signal_foreground(SIGTSTP); continue; }
                     dst[done++] = ch;
                     if (canonical && ch == '\n') break;
                     continue;
@@ -532,6 +568,20 @@ static int devfs_open(vnode_t *v, int flags) {
     (void)flags;
     if (!v || !v->fs_data) return 0;
     devfs_node_t *node = (devfs_node_t *)v->fs_data;
+
+    if (node->dev_type == DEV_TTY) {
+        /* /dev/tty → the process's controlling terminal.
+         * If the caller has a PTY as its ctty, route the file through
+         * the slave side of that PTY exactly like Linux does. */
+        task_t *cur = sched_current();
+        if (cur && cur->ctty_pty) {
+            v->pending_f_ops = &g_pty_slave_fops;
+            v->pending_priv  = cur->ctty_pty;
+        }
+        /* else: fall through to the physical console (framebuffer/keyboard) */
+        return 0;
+    }
+
     if (node->dev_type == DEV_PTMX) {
         /* Each open of /dev/ptmx allocates a new PTY master (Linux: ptmx_open) */
         int idx = pty_alloc();

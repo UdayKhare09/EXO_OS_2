@@ -65,6 +65,26 @@ void signal_send(task_t *t, int sig) {
     sched_unblock(t);
 }
 
+/* Send signal to every non-kthread task whose pgid matches pgid. */
+void signal_send_pgrp(uint32_t pgid, int sig) {
+    if (pgid == 0 || sig <= 0 || sig >= NSIGS) return;
+    for (uint32_t i = 1; i < TASK_TABLE_SIZE; i++) {
+        task_t *t = task_get_from_table(i);
+        if (!t || t->is_kthread) continue;
+        if (t->pgid == pgid) signal_send(t, sig);
+    }
+}
+
+/* Send signal to every non-kthread task whose sid matches sid. */
+void signal_send_session(uint32_t sid, int sig) {
+    if (sid == 0 || sig <= 0 || sig >= NSIGS) return;
+    for (uint32_t i = 1; i < TASK_TABLE_SIZE; i++) {
+        task_t *t = task_get_from_table(i);
+        if (!t || t->is_kthread) continue;
+        if (t->sid == sid) signal_send(t, sig);
+    }
+}
+
 /* Default signal action: signals that terminate the process */
 static bool sig_default_is_fatal(int sig) {
     switch (sig) {
