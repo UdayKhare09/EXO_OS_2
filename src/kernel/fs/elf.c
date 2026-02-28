@@ -60,7 +60,7 @@ int elf_validate(const Elf64_Ehdr *ehdr) {
 
 /* ── Load ELF64 segments into address space ──────────────────────────────── */
 int elf_load(const void *data, uint64_t data_size,
-             uintptr_t pml4_phys, elf_info_t *out) {
+             uintptr_t pml4_phys, uint64_t load_bias, elf_info_t *out) {
     if (!data || !out) return -EFAULT;
     if (data_size < sizeof(Elf64_Ehdr)) return -ENOEXEC;
 
@@ -77,18 +77,39 @@ int elf_load(const void *data, uint64_t data_size,
 
     const uint8_t *raw = (const uint8_t *)data;
     uint64_t brk_end = 0;   /* track highest loaded address */
+    uint64_t dyn_bias = (ehdr->e_type == ET_DYN)
+                      ? (load_bias ? load_bias : USER_SPACE_START)
+                      : 0;
 
-    out->entry      = ehdr->e_entry;
+    out->entry      = ehdr->e_entry + dyn_bias;
     out->phdr_count = ehdr->e_phnum;
     out->phdr_size  = ehdr->e_phentsize;
     out->phdr_vaddr = 0;
+    out->load_base  = dyn_bias;
+    out->has_interp = 0;
+    out->interp_path[0] = '\0';
 
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
         const Elf64_Phdr *phdr = (const Elf64_Phdr *)(raw + ehdr->e_phoff
                                                        + i * ehdr->e_phentsize);
 
         if (phdr->p_type == PT_PHDR) {
-            out->phdr_vaddr = phdr->p_vaddr;
+            out->phdr_vaddr = phdr->p_vaddr + dyn_bias;
+            continue;
+        }
+
+        if (phdr->p_type == PT_INTERP) {
+            if (phdr->p_filesz == 0 || phdr->p_filesz >= sizeof(out->interp_path)) {
+                KLOG_WARN("elf: PT_INTERP invalid size %llu\n", phdr->p_filesz);
+                return -ENOEXEC;
+            }
+            if (phdr->p_offset + phdr->p_filesz > data_size) {
+                KLOG_WARN("elf: PT_INTERP out of bounds\n");
+                return -ENOEXEC;
+            }
+            memcpy(out->interp_path, raw + phdr->p_offset, phdr->p_filesz);
+            out->interp_path[phdr->p_filesz - 1] = '\0';
+            out->has_interp = 1;
             continue;
         }
 
@@ -101,10 +122,12 @@ int elf_load(const void *data, uint64_t data_size,
             return -ENOEXEC;
         }
 
+        uint64_t seg_vaddr = phdr->p_vaddr + dyn_bias;
+
         /* Segment vaddr must be in user space */
-        if (phdr->p_vaddr < USER_SPACE_START || phdr->p_vaddr >= USER_SPACE_END) {
+        if (seg_vaddr < USER_SPACE_START || seg_vaddr >= USER_SPACE_END) {
             KLOG_WARN("elf: segment %u vaddr %p out of user space\n",
-                      i, (void *)phdr->p_vaddr);
+                      i, (void *)seg_vaddr);
             return -ENOEXEC;
         }
 
@@ -114,8 +137,8 @@ int elf_load(const void *data, uint64_t data_size,
         if (!(phdr->p_flags & PF_X)) pflags |= VMM_NX;
 
         /* Map pages covering [vaddr, vaddr+memsz), page-aligned */
-        uint64_t seg_start = phdr->p_vaddr & ~(uint64_t)(PAGE_SIZE - 1);
-        uint64_t seg_end   = (phdr->p_vaddr + phdr->p_memsz + PAGE_SIZE - 1)
+        uint64_t seg_start = seg_vaddr & ~(uint64_t)(PAGE_SIZE - 1);
+        uint64_t seg_end   = (seg_vaddr + phdr->p_memsz + PAGE_SIZE - 1)
                              & ~(uint64_t)(PAGE_SIZE - 1);
 
         for (uint64_t va = seg_start; va < seg_end; va += PAGE_SIZE) {
@@ -136,7 +159,7 @@ int elf_load(const void *data, uint64_t data_size,
         /* Copy file data into mapped pages */
         uint64_t copied = 0;
         while (copied < phdr->p_filesz) {
-            uint64_t va = phdr->p_vaddr + copied;
+            uint64_t va = seg_vaddr + copied;
             uint64_t page_off = va & (PAGE_SIZE - 1);
             uint64_t chunk = PAGE_SIZE - page_off;
             if (chunk > phdr->p_filesz - copied)
@@ -156,11 +179,11 @@ int elf_load(const void *data, uint64_t data_size,
         }
 
         /* Track highest address for brk */
-        uint64_t seg_top = phdr->p_vaddr + phdr->p_memsz;
+        uint64_t seg_top = seg_vaddr + phdr->p_memsz;
         if (seg_top > brk_end) brk_end = seg_top;
 
         KLOG_DEBUG("elf: loaded seg %u: vaddr=%p filesz=%llu memsz=%llu flags=%x\n",
-                   i, (void *)phdr->p_vaddr, phdr->p_filesz, phdr->p_memsz,
+               i, (void *)seg_vaddr, phdr->p_filesz, phdr->p_memsz,
                    phdr->p_flags);
     }
 
@@ -181,7 +204,7 @@ int elf_load(const void *data, uint64_t data_size,
             uint64_t delta = ehdr->e_phoff - phdr->p_offset;
             if (delta >= phdr->p_filesz)
                 continue;
-            out->phdr_vaddr = phdr->p_vaddr + delta;
+            out->phdr_vaddr = phdr->p_vaddr + dyn_bias + delta;
             break;
         }
     }

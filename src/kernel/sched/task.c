@@ -1,6 +1,7 @@
 #include "task.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
+#include "mm/pagecache.h"
 #include "mm/kmalloc.h"
 #include "ipc/signal.h"
 #include "ipc/ipc.h"
@@ -45,6 +46,27 @@ extern void task_trampoline(void);   /* defined in context_switch.asm */
 extern void user_mode_trampoline(void);  /* defined in context_switch.asm */
 
 static uint32_t next_tid = 1;
+
+static void task_release_shared_mappings(task_t *t) {
+    if (!t || !t->cr3) return;
+
+    for (vma_t *v = t->vma_list; v; v = v->next) {
+        if (!(v->flags & VMA_FILE) || !(v->flags & VMA_SHARED) || !v->file)
+            continue;
+
+        for (uint64_t a = v->start; a < v->end; a += PAGE_SIZE) {
+            uint64_t *pte = vmm_get_pte(t->cr3, a);
+            if (!pte || !(*pte & VMM_PRESENT))
+                continue;
+
+            uint64_t within = a - v->start;
+            if (within >= v->file_size)
+                continue;
+
+            pagecache_release(v->file, v->file_offset + within);
+        }
+    }
+}
 
 /* Shared init for both kernel and user tasks */
 static task_t *task_alloc_common(const char *name, uint32_t cpu_id) {
@@ -181,6 +203,8 @@ void task_destroy(task_t *t) {
     vma_t *v = t->vma_list;
     while (v) {
         vma_t *next = v->next;
+        if (v->file)
+            vfs_vnode_put(v->file);
         kfree(v);
         v = next;
     }
@@ -188,6 +212,7 @@ void task_destroy(task_t *t) {
 
     /* Destroy user address space (if process had its own) */
     if (t->is_user && t->owns_address_space && t->cr3 != vmm_get_kernel_pml4()) {
+        task_release_shared_mappings(t);
         vmm_destroy_address_space(t->cr3);
     }
 

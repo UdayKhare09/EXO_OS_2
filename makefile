@@ -99,33 +99,26 @@ ALL_OBJS := $(C_OBJS) $(AS_OBJS) $(NASM_OBJS) $(TRAMPOLINE_OBJ) $(FONT_DATA_OBJ)
 DEPS     := $(C_OBJS:.o=.d)
 -include $(DEPS)
 
-# ── User-space binaries (freestanding, no libc) ───────────────────────────────
-HELLO_SRC        := tools/hello.c
-HELLO_BIN        := $(BUILD_DIR)/hello
-SYSCALL_TEST_SRC := tools/syscall_test.c
-SYSCALL_TEST_BIN := $(BUILD_DIR)/syscall_test
-
-USER_CC_FLAGS := \
-    --target=x86_64-unknown-linux-elf \
-    -nostdlib -nostdinc -static \
-    -ffreestanding -fno-stack-protector -fno-PIC -O2 \
-    -Wl,-e,_start -Wl,--no-dynamic-linker
-
-# ── musl userspace smoke binaries ────────────────────────────────────────────
+# ── musl userspace dynamic binaries ──────────────────────────────────────────
 MUSL_DIR       ?= /usr/lib/musl
 MUSL_LIB_DIR   ?= $(MUSL_DIR)/lib
 MUSL_INC_DIR   ?= $(MUSL_DIR)/include
 MUSL_SMOKE_CC  ?= clang
+MUSL_LD_SO     ?= $(shell sh -c 'for p in /lib/ld-musl-x86_64.so.1 /usr/lib/ld-musl-x86_64.so.1 /usr/lib/musl/lib/ld-musl-x86_64.so.1; do [ -f "$$p" ] && { echo "$$p"; exit 0; }; done')
 
 LIBC_SMOKE_DIR  := $(BUILD_DIR)/musl-smoke
-LIBC_HELLO_BIN  := $(LIBC_SMOKE_DIR)/hello
-LIBC_PTH_BIN    := $(LIBC_SMOKE_DIR)/pthread_smoke
-LIBC_SUITE_BIN  := $(LIBC_SMOKE_DIR)/posix_suite
-LIBC_SMOKE_BINS := $(LIBC_HELLO_BIN) $(LIBC_PTH_BIN) $(LIBC_SUITE_BIN)
+LIBC_HELLO_DYN_BIN := $(LIBC_SMOKE_DIR)/hello_dynamic
+LIBC_DLOPEN_TEST_BIN := $(LIBC_SMOKE_DIR)/dlopen_test
+LIBC_LIBTEST_SO := $(LIBC_SMOKE_DIR)/libtest.so
+LIBC_DYNAMIC_BINS := $(LIBC_HELLO_DYN_BIN) $(LIBC_DLOPEN_TEST_BIN)
+LIBC_DYNAMIC_LIBS := $(LIBC_LIBTEST_SO)
 
-LIBC_HELLO_SRC  := tools/mlibc_hello.c
-LIBC_PTH_SRC    := tools/mlibc_pthread_smoke.c
-LIBC_SUITE_SRC  := tools/mlibc_posix_suite.c
+LIBC_HELLO_DYN_SRC := tools/hello_dynamic.c
+LIBC_DLOPEN_TEST_SRC := tools/dlopen_test.c
+LIBC_LIBTEST_SO_SRC := tools/libtest.c
+
+MUSL_RUNTIME_DIR := $(LIBC_SMOKE_DIR)/lib
+MUSL_RUNTIME_STAMP := $(MUSL_RUNTIME_DIR)/.stamp
 
 # ── BusyBox (prebuilt upstream static binary) ─────────────────────────────────
 BUSYBOX_URL := https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox
@@ -141,7 +134,6 @@ ROOTFS_PROFILE  := tools/rootfs/profile
 ROOTFS_ENV_FILE := tools/rootfs/environment
 ROOTFS_PASSWD   := tools/rootfs/passwd
 ROOTFS_GROUP    := tools/rootfs/group
-ROOTFS_FISH     := tools/rootfs/fish
 ROOTFS_RESOLV   := tools/rootfs/resolv.conf
 ROOTFS_TERMINFO_LINUX := $(shell sh -c 'for p in /usr/share/terminfo/l/linux /lib/terminfo/l/linux /etc/terminfo/l/linux; do [ -f "$$p" ] && { echo "$$p"; exit 0; }; done')
 ROOTFS_CA_BUNDLE := $(shell sh -c 'for p in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do [ -f "$$p" ] && { echo "$$p"; exit 0; }; done')
@@ -166,7 +158,7 @@ QEMU_FLAGS := \
     -no-reboot
 
 .PHONY: all clean distclean run run-debug
-.PHONY: check-musl libc-smoke busybox-build external-bins-build curl-build
+.PHONY: check-musl check-musl-dynamic libc-smoke busybox-build external-bins-build curl-build
 
 all: $(DISK_IMG)
 
@@ -195,12 +187,7 @@ $(FONT_DATA_OBJ): $(FONT_DATA_C) $(BUILD_DIR)/limine.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# ── User-space binaries ───────────────────────────────────────────────────────
-$(HELLO_BIN): $(HELLO_SRC)
-	clang $(USER_CC_FLAGS) -o $@ $<
 
-$(SYSCALL_TEST_BIN): $(SYSCALL_TEST_SRC)
-	clang $(USER_CC_FLAGS) -o $@ $<
 
 # ── Trampoline: flat binary wrapped in an ELF object ─────────────────────────
 $(TRAMPOLINE_BIN): $(TRAMPOLINE_SRC)
@@ -229,35 +216,59 @@ $(KERNEL_ELF): $(ALL_OBJS)
 	@echo ">>> Linking kernel..."
 	$(LD) $(LDFLAGS) $^ -o $@
 
-# ── musl smoke binaries ──────────────────────────────────────────────────────
+# ── musl dynamic binaries ────────────────────────────────────────────────────
 check-musl:
 	@test -f "$(MUSL_LIB_DIR)/crt1.o" || (echo "Missing musl CRT: $(MUSL_LIB_DIR)/crt1.o"; exit 1)
 	@test -f "$(MUSL_INC_DIR)/stdio.h" || (echo "Missing musl headers: $(MUSL_INC_DIR)/stdio.h"; exit 1)
 
-# Usage: $(call musl-link, OUTPUT, SOURCE, LIBS)
-define musl-link
+check-musl-dynamic:
+	@test -n "$(MUSL_LD_SO)" || (echo "Missing dynamic musl loader (ld-musl-x86_64.so.1)"; exit 1)
+	@test -f "$(MUSL_LD_SO)" || (echo "Missing dynamic musl loader file: $(MUSL_LD_SO)"; exit 1)
+
+# Usage: $(call musl-link-dynamic, OUTPUT, SOURCE, LIBS)
+define musl-link-dynamic
 	$(MUSL_SMOKE_CC) --target=x86_64-linux-musl \
-	    -O2 -static -fno-stack-protector -nostdlib \
+	    -O2 -fno-stack-protector -nostdlib \
 	    -isystem $(MUSL_INC_DIR) \
 	    $(MUSL_LIB_DIR)/crt1.o \
 	    $(MUSL_LIB_DIR)/crti.o \
 	    -o $(1) $(2) \
 	    -L$(MUSL_LIB_DIR) \
+	    -Wl,--dynamic-linker=/lib/ld-musl-x86_64.so.1 \
 	    -Wl,--start-group $(3) -lgcc -Wl,--end-group \
 	    $(MUSL_LIB_DIR)/crtn.o
 endef
 
-$(LIBC_HELLO_BIN): $(LIBC_HELLO_SRC) check-musl
-	@mkdir -p $(dir $@)
-	$(call musl-link,$@,$<,-lc)
+# Usage: $(call musl-link-shared, OUTPUT, SOURCE, LIBS)
+define musl-link-shared
+	$(MUSL_SMOKE_CC) --target=x86_64-linux-musl \
+	    -O2 -fPIC -shared \
+	    -isystem $(MUSL_INC_DIR) \
+	    -o $(1) $(2) \
+	    -L$(MUSL_LIB_DIR) \
+	    $(3)
+endef
 
-$(LIBC_PTH_BIN): $(LIBC_PTH_SRC) check-musl
+$(LIBC_HELLO_DYN_BIN): $(LIBC_HELLO_DYN_SRC) check-musl check-musl-dynamic
 	@mkdir -p $(dir $@)
-	$(call musl-link,$@,$<,-lpthread -lc)
+	$(call musl-link-dynamic,$@,$<,-lc)
 
-$(LIBC_SUITE_BIN): $(LIBC_SUITE_SRC) check-musl
+$(LIBC_DLOPEN_TEST_BIN): $(LIBC_DLOPEN_TEST_SRC) check-musl check-musl-dynamic
 	@mkdir -p $(dir $@)
-	$(call musl-link,$@,$<,-lpthread -lc)
+	$(call musl-link-dynamic,$@,$<,-ldl -lc)
+
+$(LIBC_LIBTEST_SO): $(LIBC_LIBTEST_SO_SRC) check-musl check-musl-dynamic
+	@mkdir -p $(dir $@)
+	$(call musl-link-shared,$@,$<,-lc)
+
+$(MUSL_RUNTIME_STAMP): check-musl-dynamic
+	@mkdir -p $(MUSL_RUNTIME_DIR)
+	cp $(MUSL_LD_SO) $(MUSL_RUNTIME_DIR)/ld-musl-x86_64.so.1
+	cp $(MUSL_RUNTIME_DIR)/ld-musl-x86_64.so.1 $(MUSL_RUNTIME_DIR)/libc.so
+	cp $(MUSL_RUNTIME_DIR)/ld-musl-x86_64.so.1 $(MUSL_RUNTIME_DIR)/libdl.so
+	cp $(MUSL_RUNTIME_DIR)/ld-musl-x86_64.so.1 $(MUSL_RUNTIME_DIR)/libpthread.so
+	cp $(MUSL_RUNTIME_DIR)/ld-musl-x86_64.so.1 $(MUSL_RUNTIME_DIR)/libm.so
+	@touch $@
 
 $(BUSYBOX_BIN):
 	@echo ">>> Fetching BusyBox static binary..."
@@ -278,7 +289,7 @@ $(EXTERNAL_BIN_STAMP): $(EXTERNAL_BIN_LIST_SH)
 	done
 	@touch $@
 
-libc-smoke:      $(LIBC_SMOKE_BINS)
+libc-smoke:      $(LIBC_DYNAMIC_BINS) $(LIBC_DYNAMIC_LIBS) $(MUSL_RUNTIME_STAMP)
 busybox-build:   $(BUSYBOX_BIN)
 external-bins-build: $(EXTERNAL_BIN_STAMP)
 curl-build: external-bins-build
@@ -294,23 +305,25 @@ $(EFI_IMG): $(KERNEL_ELF) $(LIMINE_DIR)/limine.h
 	mcopy -i $@ src/boot/limine.conf       ::/boot/limine/limine.conf
 
 # ── Root partition (ext2, no root needed — debugfs) ───────────────────────────
-$(ROOT_IMG): $(HELLO_BIN) $(SYSCALL_TEST_BIN) \
-			 $(LIBC_SMOKE_BINS) $(BUSYBOX_BIN) $(EXTERNAL_BIN_STAMP) \
-		     $(ROOTFS_PROFILE) $(ROOTFS_ENV_FILE) $(ROOTFS_PASSWD) $(ROOTFS_GROUP) $(ROOTFS_FISH) $(ROOTFS_RESOLV)
+$(ROOT_IMG): $(LIBC_DYNAMIC_BINS) $(LIBC_DYNAMIC_LIBS) $(MUSL_RUNTIME_STAMP) \
+			 $(BUSYBOX_BIN) $(EXTERNAL_BIN_STAMP) \
+		     $(ROOTFS_PROFILE) $(ROOTFS_ENV_FILE) $(ROOTFS_PASSWD) $(ROOTFS_GROUP) $(ROOTFS_RESOLV)
 	@echo ">>> Building root partition (ext2)..."
 	$(eval ROOT_SECTORS := $(shell echo $$(($(DISK_SIZE_MB) * 2048 - $(ROOT_START) - 33))))
 	dd if=/dev/zero of=$@ bs=512 count=$(ROOT_SECTORS) 2>/dev/null
 	mkfs.ext2 -q -L "EXOOS_ROOT" -b 4096 $@
-	$(foreach d, dev tmp boot proc sys sys/bus sys/bus/usb sys/bus/usb/devices sys/bus/pci sys/bus/pci/devices home home/root etc etc/ssl etc/ssl/certs bin usr usr/bin usr/sbin usr/share usr/share/terminfo usr/share/terminfo/l sbin var run, \
+	$(foreach d, dev tmp boot proc sys sys/bus sys/bus/usb sys/bus/usb/devices sys/bus/pci sys/bus/pci/devices home home/root etc etc/ssl etc/ssl/certs bin lib usr usr/bin usr/sbin usr/share usr/share/terminfo usr/share/terminfo/l sbin var run, \
 	    debugfs -w -R "mkdir $(d)" $@ 2>/dev/null || true ;)
-	debugfs -w -R "write $(HELLO_BIN)           home/root/hello"        $@ 2>/dev/null
-	debugfs -w -R "write $(SYSCALL_TEST_BIN)    home/root/syscall_test"  $@ 2>/dev/null
-	debugfs -w -R "write $(LIBC_HELLO_BIN)      home/root/mlibc_hello"   $@ 2>/dev/null
-	debugfs -w -R "write $(LIBC_PTH_BIN)        home/root/pthread_smoke" $@ 2>/dev/null
-	debugfs -w -R "write $(LIBC_SUITE_BIN)      home/root/posix_suite"   $@ 2>/dev/null
+	debugfs -w -R "write $(LIBC_HELLO_DYN_BIN)  home/root/hello_dynamic"   $@ 2>/dev/null
+	debugfs -w -R "write $(LIBC_DLOPEN_TEST_BIN)  home/root/dlopen_test"   $@ 2>/dev/null
+	debugfs -w -R "write $(LIBC_LIBTEST_SO)  lib/libtest.so"   $@ 2>/dev/null
 	debugfs -w -R "write $(BUSYBOX_BIN)         bin/busybox"       $@ 2>/dev/null
 	debugfs -w -R "write $(BUSYBOX_BIN)         bin/sh"            $@ 2>/dev/null
-	debugfs -w -R "write $(ROOTFS_FISH)         bin/fish"          $@ 2>/dev/null
+	debugfs -w -R "write $(MUSL_RUNTIME_DIR)/ld-musl-x86_64.so.1 lib/ld-musl-x86_64.so.1" $@ 2>/dev/null
+	debugfs -w -R "write $(MUSL_RUNTIME_DIR)/libc.so lib/libc.so" $@ 2>/dev/null
+	debugfs -w -R "write $(MUSL_RUNTIME_DIR)/libdl.so lib/libdl.so" $@ 2>/dev/null
+	debugfs -w -R "write $(MUSL_RUNTIME_DIR)/libpthread.so lib/libpthread.so" $@ 2>/dev/null
+	debugfs -w -R "write $(MUSL_RUNTIME_DIR)/libm.so lib/libm.so" $@ 2>/dev/null
 	@if [ -d "$(EXTERNAL_BIN_DIR)" ]; then \
 	    for f in $(EXTERNAL_BIN_DIR)/*; do \
 	        [ -f "$$f" ] || continue; \
@@ -362,9 +375,7 @@ clean:
 	rm -rf $(BUILD_DIR)/obj $(KERNEL_ELF) $(DISK_IMG) \
 	       $(EFI_IMG) $(ROOT_IMG) $(BUILD_DIR)/limine.h \
 	       $(FONT_DATA_C) $(FONT_DATA_OBJ) $(OVMF_VARS) \
-	       $(LIBC_SMOKE_DIR) \
-	       $(BUILD_DIR)/mlibc $(BUILD_DIR)/mlibc-build $(BUILD_DIR)/sysroot \
-	       $(BUILD_DIR)/.stamp-mlibc-*
+	       $(LIBC_SMOKE_DIR)
 
 distclean:
 	rm -rf $(BUILD_DIR)

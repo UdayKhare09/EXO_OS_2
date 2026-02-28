@@ -25,6 +25,7 @@ typedef enum {
 typedef void (*task_entry_t)(void *arg);
 
 struct ipc_mailbox;   /* defined in ipc/ipc.c */
+struct vnode;
 
 /* ── Virtual Memory Area (VMA) — tracks user-space mappings ──────────────── */
 #define VMA_READ    (1 << 0)
@@ -34,11 +35,17 @@ struct ipc_mailbox;   /* defined in ipc/ipc.c */
 #define VMA_ANON    (1 << 4)   /* anonymous (not file-backed) */
 #define VMA_STACK   (1 << 5)   /* stack region                */
 #define VMA_HEAP    (1 << 6)   /* heap (brk) region           */
+#define VMA_SHARED  (1 << 7)   /* MAP_SHARED                  */
+#define VMA_FILE    (1 << 8)   /* file-backed mapping         */
 
 typedef struct vma {
     uint64_t    start;      /* page-aligned start address */
     uint64_t    end;        /* page-aligned end address (exclusive) */
     uint32_t    flags;      /* VMA_READ | VMA_WRITE | ... */
+    struct vnode *file;     /* backing file vnode, NULL for anonymous */
+    uint64_t    file_offset;/* file offset corresponding to vma->start */
+    uint64_t    file_size;  /* bytes backed by file content in this VMA */
+    uint32_t    mmap_flags; /* original mmap flags (MAP_PRIVATE/SHARED/...) */
     struct vma *next;       /* sorted linked list */
 } vma_t;
 

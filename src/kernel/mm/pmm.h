@@ -40,6 +40,11 @@ uintptr_t pmm_alloc_pages(size_t count);
 /* Free N contiguous physical pages */
 void pmm_free_pages(uintptr_t phys, size_t count);
 
+/* Per-page refcounting helpers (4 KiB granularity) */
+uint32_t pmm_page_ref(uintptr_t phys);
+uint32_t pmm_page_unref(uintptr_t phys);
+uint32_t pmm_page_getref(uintptr_t phys);
+
 /* Statistics */
 void     pmm_print_stats(void);
 uint64_t pmm_get_total_pages(void);

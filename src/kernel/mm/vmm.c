@@ -1,5 +1,6 @@
 #include "vmm.h"
 #include "pmm.h"
+#include "pagecache.h"
 #include "lib/string.h"
 #include "lib/klog.h"
 #include "lib/panic.h"
@@ -137,27 +138,21 @@ static void free_pt_level(uintptr_t table_phys, int level) {
             /* Level 1 = PT: entries are leaf 4 KiB pages.
              * Validate physical address before freeing — a corrupt or stale
              * PTE might contain garbage that would trip the PMM bounds check. */
-            if (table[i] & VMM_COW) {
-                /* Shared COW leaf: without per-page refcounts we must not free
-                 * here, otherwise sibling address spaces keep dangling PTEs. */
-                continue;
-            }
             if (!pmm_phys_valid(child_phys, 1)) {
                 KLOG_WARN("VMM: free_pt_level: skipping bad leaf PTE phys=0x%lx\n",
                           (unsigned long)child_phys);
                 continue;
             }
-            pmm_free_pages(child_phys, 1);
+            pmm_page_unref(child_phys);
         } else if (table[i] & VMM_HUGE) {
             /* Huge page leaf — do NOT recurse: child_phys is a data page,
              * not a page table.  Free the underlying pages directly.
              *   level 2 (PD)   → 2 MiB = 512 × 4 KiB pages
              *   level 3 (PDPT) → 1 GiB = 512 × 512 × 4 KiB pages        */
-            if (table[i] & VMM_COW) {
-                continue;
-            }
             size_t npages = (level == 2) ? 512 : (512 * 512);
-            pmm_free_pages(child_phys, npages);
+            for (size_t p = 0; p < npages; p++) {
+                pmm_page_unref(child_phys + p * PAGE_SIZE);
+            }
         } else {
             /* Recurse into PDPT (3) → PD (2) → PT (1) */
             free_pt_level(child_phys, level - 1);
@@ -229,6 +224,9 @@ static uintptr_t clone_pt(uintptr_t src_pt_phys) {
     for (int i = 0; i < 512; i++) {
         if (!(src[i] & VMM_PRESENT)) { dst[i] = 0; continue; }
 
+        uintptr_t leaf_phys = src[i] & VMM_PTE_ADDR_MASK;
+        pmm_page_ref(leaf_phys);
+
         /* Mark source as COW + read-only */
         src[i] = (src[i] & ~VMM_WRITE) | VMM_COW;
         /* Clone with same COW read-only flags */
@@ -250,6 +248,10 @@ static uintptr_t clone_pd(uintptr_t src_pd_phys) {
         if (!(src[i] & VMM_PRESENT)) { dst[i] = 0; continue; }
         if (src[i] & VMM_HUGE) {
             /* 2 MiB huge page leaf — mark COW in both src and clone */
+            uintptr_t huge_phys = src[i] & VMM_PTE_ADDR_MASK;
+            for (size_t p = 0; p < 512; p++) {
+                pmm_page_ref(huge_phys + p * PAGE_SIZE);
+            }
             src[i] = (src[i] & ~VMM_WRITE) | VMM_COW;
             dst[i] = src[i];
             continue;
@@ -275,6 +277,10 @@ static uintptr_t clone_pdpt(uintptr_t src_pdpt_phys) {
         if (!(src[i] & VMM_PRESENT)) { dst[i] = 0; continue; }
         if (src[i] & VMM_HUGE) {
             /* 1 GiB huge page leaf — mark COW in both src and clone */
+            uintptr_t huge_phys = src[i] & VMM_PTE_ADDR_MASK;
+            for (size_t p = 0; p < (512 * 512); p++) {
+                pmm_page_ref(huge_phys + p * PAGE_SIZE);
+            }
             src[i] = (src[i] & ~VMM_WRITE) | VMM_COW;
             dst[i] = src[i];
             continue;
@@ -357,6 +363,7 @@ bool vmm_handle_page_fault(uintptr_t pml4_phys, uintptr_t fault_addr,
 
             uint64_t new_flags = (old_flags & ~VMM_COW) | VMM_WRITE;
             *pte = (new_phys & VMM_PTE_ADDR_MASK) | new_flags;
+            pmm_page_unref(old_phys);
             __asm__ volatile("invlpg (%0)" : : "r"(fault_addr) : "memory");
             return true;
         }
@@ -368,10 +375,41 @@ bool vmm_handle_page_fault(uintptr_t pml4_phys, uintptr_t fault_addr,
         if (!vma) return false;  /* no VMA → real fault */
 
         uintptr_t page_addr = fault_addr & ~(PAGE_SIZE - 1);
-        uintptr_t phys = pmm_alloc_pages(1);
-        if (!phys) return false;
+        uintptr_t phys = 0;
 
-        memset((void *)vmm_phys_to_virt(phys), 0, PAGE_SIZE);
+        if ((vma->flags & VMA_FILE) && vma->file) {
+            uint64_t within = page_addr - vma->start;
+            uint64_t foff = vma->file_offset + within;
+
+            if (within < vma->file_size) {
+                uintptr_t cached = pagecache_get_or_read(vma->file, foff);
+                if (!cached) return false;
+
+                if (vma->flags & VMA_SHARED) {
+                    phys = cached;
+                } else {
+                    phys = pmm_alloc_pages(1);
+                    if (!phys) {
+                        pagecache_release(vma->file, foff);
+                        pmm_page_unref(cached);
+                        return false;
+                    }
+                    memcpy((void *)vmm_phys_to_virt(phys),
+                           (void *)vmm_phys_to_virt(cached),
+                           PAGE_SIZE);
+                    pagecache_release(vma->file, foff);
+                    pmm_page_unref(cached);
+                }
+            } else {
+                phys = pmm_alloc_pages(1);
+                if (!phys) return false;
+                memset((void *)vmm_phys_to_virt(phys), 0, PAGE_SIZE);
+            }
+        } else {
+            phys = pmm_alloc_pages(1);
+            if (!phys) return false;
+            memset((void *)vmm_phys_to_virt(phys), 0, PAGE_SIZE);
+        }
 
         uint64_t flags = VMM_PRESENT | VMM_USER;
         if (vma->flags & VMA_WRITE)  flags |= VMM_WRITE;

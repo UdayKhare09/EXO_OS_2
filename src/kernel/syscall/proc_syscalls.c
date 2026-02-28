@@ -9,6 +9,7 @@
 #include "sched/waitq.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"
+#include "mm/pagecache.h"
 #include "mm/kmalloc.h"
 #include "fs/vfs.h"
 #include "fs/fd.h"
@@ -54,10 +55,169 @@ static void vma_list_clone(task_t *child, task_t *parent) {
         vma_t *v = kmalloc(sizeof(vma_t));
         if (!v) break;
         *v = *src;
+        if (v->file)
+            vfs_vnode_get(v->file);
         v->next = NULL;
         *dst = v;
         dst = &v->next;
         src = src->next;
+    }
+}
+
+static vma_t *vma_find_for_addr(task_t *t, uint64_t addr) {
+    if (!t) return NULL;
+    vma_t *v = t->vma_list;
+    while (v) {
+        if (addr >= v->start && addr < v->end)
+            return v;
+        v = v->next;
+    }
+    return NULL;
+}
+
+static int vma_overlaps_range(task_t *t, uint64_t start, uint64_t end) {
+    if (!t || start >= end) return 0;
+    for (vma_t *v = t->vma_list; v; v = v->next) {
+        if (v->end <= start || v->start >= end)
+            continue;
+        return 1;
+    }
+    return 0;
+}
+
+static inline uint32_t vma_perm_from_prot(int prot) {
+    uint32_t perms = 0;
+    if (prot & PROT_READ)  perms |= VMA_READ;
+    if (prot & PROT_WRITE) perms |= VMA_WRITE;
+    if (prot & PROT_EXEC)  perms |= VMA_EXEC;
+    return perms;
+}
+
+static void vma_set_perm_flags(vma_t *v, uint32_t perms) {
+    if (!v) return;
+    v->flags &= ~(VMA_READ | VMA_WRITE | VMA_EXEC);
+    v->flags |= perms;
+}
+
+static void vma_update_file_window(vma_t *v,
+                                   uint64_t orig_start,
+                                   uint64_t orig_file_offset,
+                                   uint64_t orig_file_size) {
+    if (!v) return;
+    if (!v->file) {
+        v->file_offset = 0;
+        v->file_size = 0;
+        return;
+    }
+
+    uint64_t seg_off = v->start - orig_start;
+    uint64_t seg_len = v->end - v->start;
+    v->file_offset = orig_file_offset + seg_off;
+
+    if (seg_off >= orig_file_size) {
+        v->file_size = 0;
+        return;
+    }
+
+    uint64_t remain = orig_file_size - seg_off;
+    v->file_size = (remain < seg_len) ? remain : seg_len;
+}
+
+static int vma_apply_mprotect(task_t *t, uint64_t start, uint64_t end, uint32_t perms) {
+    if (!t || start >= end) return -EINVAL;
+
+    vma_t **pp = &t->vma_list;
+    while (*pp) {
+        vma_t *v = *pp;
+        if (v->end <= start) {
+            pp = &v->next;
+            continue;
+        }
+        if (v->start >= end)
+            break;
+
+        uint64_t orig_start = v->start;
+        uint64_t orig_end = v->end;
+        uint64_t orig_file_offset = v->file_offset;
+        uint64_t orig_file_size = v->file_size;
+        uint32_t orig_flags = v->flags;
+        vma_t *orig_next = v->next;
+
+        uint64_t prot_start = (orig_start > start) ? orig_start : start;
+        uint64_t prot_end = (orig_end < end) ? orig_end : end;
+
+        bool need_left = orig_start < prot_start;
+        bool need_right = prot_end < orig_end;
+
+        vma_t *left = NULL;
+        vma_t *right = NULL;
+
+        if (need_left) {
+            left = kmalloc(sizeof(vma_t));
+            if (!left) return -ENOMEM;
+            *left = *v;
+            left->start = orig_start;
+            left->end = prot_start;
+            left->flags = orig_flags;
+            left->next = NULL;
+            if (left->file) vfs_vnode_get(left->file);
+            vma_update_file_window(left, orig_start, orig_file_offset, orig_file_size);
+        }
+
+        if (need_right) {
+            right = kmalloc(sizeof(vma_t));
+            if (!right) {
+                if (left) {
+                    if (left->file) vfs_vnode_put(left->file);
+                    kfree(left);
+                }
+                return -ENOMEM;
+            }
+            *right = *v;
+            right->start = prot_end;
+            right->end = orig_end;
+            right->flags = orig_flags;
+            right->next = orig_next;
+            if (right->file) vfs_vnode_get(right->file);
+            vma_update_file_window(right, orig_start, orig_file_offset, orig_file_size);
+        }
+
+        v->start = prot_start;
+        v->end = prot_end;
+        v->next = need_right ? right : orig_next;
+        vma_set_perm_flags(v, perms);
+        vma_update_file_window(v, orig_start, orig_file_offset, orig_file_size);
+
+        if (need_left) {
+            left->next = v;
+            *pp = left;
+        } else {
+            *pp = v;
+        }
+
+        pp = need_right ? &right->next : &v->next;
+    }
+
+    return 0;
+}
+
+static void release_shared_vma_mappings(task_t *t, uintptr_t cr3) {
+    if (!t || !cr3) return;
+    for (vma_t *v = t->vma_list; v; v = v->next) {
+        if (!(v->flags & VMA_FILE) || !(v->flags & VMA_SHARED) || !v->file)
+            continue;
+
+        for (uint64_t a = v->start; a < v->end; a += PAGE_SIZE) {
+            uint64_t *pte = vmm_get_pte(cr3, a);
+            if (!pte || !(*pte & VMM_PRESENT))
+                continue;
+
+            uint64_t within = a - v->start;
+            if (within >= v->file_size)
+                continue;
+
+            pagecache_release(v->file, v->file_offset + within);
+        }
     }
 }
 
@@ -147,8 +307,21 @@ int64_t sys_fork(cpu_regs_t *regs) {
 #define AT_PHENT         4
 #define AT_PHNUM         5
 #define AT_PAGESZ        6
+#define AT_BASE          7
 #define AT_ENTRY         9
+#define AT_UID          11
+#define AT_EUID         12
+#define AT_GID          13
+#define AT_EGID         14
 #define AT_SECURE       23
+#define AT_RANDOM       25
+#define AT_EXECFN       31
+
+static inline uint64_t exec_rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
 
 /* Minimal user-memory copy helpers for execve argument marshaling. */
 static int exec_copy_user_bytes(uintptr_t cr3, const void *user_src, void *dst, size_t len) {
@@ -263,6 +436,7 @@ int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
     if (!buf) { kfree(argv_buf); kfree(envp_buf); return -ENOMEM; }
 
     ssize_t rd = vn->ops->read(vn, buf, size, 0);
+    vfs_vnode_put(vn);
     if (rd < 0 || (uint64_t)rd != size) {
         kfree(buf); kfree(argv_buf); kfree(envp_buf);
         return -EIO;
@@ -280,12 +454,66 @@ int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
 
     /* Parse ELF and load segments into the new address space */
     elf_info_t info;
-    int r = elf_load(buf, size, new_cr3, &info);
+    int r = elf_load(buf, size, new_cr3, 0, &info);
     kfree(buf);
     if (r < 0) {
         vmm_destroy_address_space(new_cr3);
         kfree(argv_buf); kfree(envp_buf);
         return r;
+    }
+
+    uint64_t user_entry = info.entry;
+    uint64_t at_base = 0;
+    uint64_t interp_top = USER_MMAP_BASE;
+
+    if (info.has_interp) {
+        int ivfs_err = 0;
+        vnode_t *ivn = vfs_lookup(info.interp_path, true, &ivfs_err);
+        if (!ivn) {
+            vmm_destroy_address_space(new_cr3);
+            kfree(argv_buf); kfree(envp_buf);
+            return ivfs_err ? ivfs_err : -ENOENT;
+        }
+
+        uint64_t isize = ivn->size;
+        if (isize == 0 || isize > (64ULL * 1024 * 1024)) {
+            vfs_vnode_put(ivn);
+            vmm_destroy_address_space(new_cr3);
+            kfree(argv_buf); kfree(envp_buf);
+            return -ENOEXEC;
+        }
+
+        void *ibuf = kmalloc(isize);
+        if (!ibuf) {
+            vfs_vnode_put(ivn);
+            vmm_destroy_address_space(new_cr3);
+            kfree(argv_buf); kfree(envp_buf);
+            return -ENOMEM;
+        }
+
+        ssize_t ird = ivn->ops->read(ivn, ibuf, isize, 0);
+        vfs_vnode_put(ivn);
+        if (ird < 0 || (uint64_t)ird != isize) {
+            kfree(ibuf);
+            vmm_destroy_address_space(new_cr3);
+            kfree(argv_buf); kfree(envp_buf);
+            return -EIO;
+        }
+
+        elf_info_t iinfo;
+        uint64_t interp_bias = USER_MMAP_BASE;
+        int ir = elf_load(ibuf, isize, new_cr3, interp_bias, &iinfo);
+        kfree(ibuf);
+        if (ir < 0) {
+            vmm_destroy_address_space(new_cr3);
+            kfree(argv_buf); kfree(envp_buf);
+            return ir;
+        }
+
+        user_entry = iinfo.entry;
+        at_base = iinfo.load_base;
+        if (iinfo.brk_start > interp_top)
+            interp_top = iinfo.brk_start;
     }
 
     /* Switch the task to the new address space and activate it in hardware.
@@ -294,12 +522,16 @@ int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
     __asm__ volatile("mov %0, %%cr3" : : "r"(new_cr3) : "memory");
 
     /* Now safe to tear down the old address space (we are no longer using it) */
-    if (old_owns_mm && old_cr3 && old_cr3 != vmm_get_kernel_pml4())
+    if (old_owns_mm && old_cr3 && old_cr3 != vmm_get_kernel_pml4()) {
+        release_shared_vma_mappings(cur, old_cr3);
         vmm_destroy_address_space(old_cr3);
+    }
     cur->owns_address_space = 1;
 
     /* Reset mmap bump pointer */
     cur->mmap_next = USER_MMAP_BASE;
+    if (interp_top > cur->mmap_next)
+        cur->mmap_next = (interp_top + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
 
     /* Close FD_CLOEXEC fds */
     fd_close_cloexec(cur);
@@ -326,7 +558,12 @@ int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
 
     /* Clear old VMAs and rebuild from ELF info */
     vma_t *v = cur->vma_list;
-    while (v) { vma_t *n = v->next; kfree(v); v = n; }
+    while (v) {
+        vma_t *n = v->next;
+        if (v->file) vfs_vnode_put(v->file);
+        kfree(v);
+        v = n;
+    }
     cur->vma_list = NULL;
 
     /* Set up user stack */
@@ -348,6 +585,10 @@ int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
         stack_vma->start = user_stack_top - stack_pages * PAGE_SIZE;
         stack_vma->end   = user_stack_top;
         stack_vma->flags = VMA_READ | VMA_WRITE | VMA_USER | VMA_STACK;
+        stack_vma->file = NULL;
+        stack_vma->file_offset = 0;
+        stack_vma->file_size = 0;
+        stack_vma->mmap_flags = 0;
         stack_vma->next  = NULL;
         vma_insert(cur, stack_vma);
     }
@@ -369,6 +610,35 @@ int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
     /* 1) Copy string data to top of stack */
     uintptr_t argv_user[EXEC_MAX_STRS];
     uintptr_t envp_user[EXEC_MAX_STRS];
+    uintptr_t execfn_user = 0;
+    uintptr_t random_user = 0;
+
+    {
+        size_t len = strlen(exec_path) + 1;
+        sp -= len;
+        uint64_t *pte = vmm_get_pte(cur->cr3, sp);
+        if (pte) {
+            uintptr_t phys = (*pte) & VMM_PTE_ADDR_MASK;
+            uintptr_t off = sp & (PAGE_SIZE - 1);
+            memcpy((void *)(vmm_phys_to_virt(phys) + off), exec_path, len);
+            execfn_user = sp;
+        }
+    }
+
+    {
+        sp -= 16;
+        uint64_t *pte = vmm_get_pte(cur->cr3, sp);
+        if (pte) {
+            uintptr_t phys = (*pte) & VMM_PTE_ADDR_MASK;
+            uintptr_t off = sp & (PAGE_SIZE - 1);
+            uint8_t *dst = (uint8_t *)(vmm_phys_to_virt(phys) + off);
+            uint64_t t0 = exec_rdtsc();
+            uint64_t t1 = exec_rdtsc() ^ (uintptr_t)cur ^ (uintptr_t)sp;
+            memcpy(dst, &t0, 8);
+            memcpy(dst + 8, &t1, 8);
+            random_user = sp;
+        }
+    }
 
     for (int i = envc - 1; i >= 0; i--) {
         size_t len = strlen(envp_ptrs[i]) + 1;
@@ -417,6 +687,20 @@ int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
     PUSH_U64(AT_NULL);               /* AT_NULL type  */
     PUSH_U64(0);                     /* AT_SECURE = 0 */
     PUSH_U64(AT_SECURE);
+    PUSH_U64(cur->gid);              /* AT_EGID       */
+    PUSH_U64(AT_EGID);
+    PUSH_U64(cur->uid);              /* AT_EUID       */
+    PUSH_U64(AT_EUID);
+    PUSH_U64(cur->gid);              /* AT_GID        */
+    PUSH_U64(AT_GID);
+    PUSH_U64(cur->uid);              /* AT_UID        */
+    PUSH_U64(AT_UID);
+    PUSH_U64(execfn_user);           /* AT_EXECFN     */
+    PUSH_U64(AT_EXECFN);
+    PUSH_U64(random_user);           /* AT_RANDOM     */
+    PUSH_U64(AT_RANDOM);
+    PUSH_U64(at_base);               /* AT_BASE       */
+    PUSH_U64(AT_BASE);
     PUSH_U64(info.entry);            /* AT_ENTRY      */
     PUSH_U64(AT_ENTRY);
     PUSH_U64(PAGE_SIZE);             /* AT_PAGESZ     */
@@ -445,8 +729,9 @@ int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
 
     /* Do not realign after pushing argc; [RSP] must point at argc. */
 
-    KLOG_INFO("execve: '%s' entry=%p brk=%p argc=%d envc=%d sp=%p\n",
-              exec_path, (void *)info.entry, (void *)info.brk_start, argc, envc, (void*)sp);
+    KLOG_INFO("execve: '%s' entry=%p at_entry=%p at_base=%p brk=%p argc=%d envc=%d sp=%p\n",
+              exec_path, (void *)user_entry, (void *)info.entry, (void *)at_base,
+              (void *)info.brk_start, argc, envc, (void*)sp);
 
     /* Jump to user-mode at the new entry point via user_mode_trampoline */
     extern void user_mode_trampoline(void);
@@ -461,7 +746,7 @@ int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
     init_frame_t *frame = (init_frame_t *)kstack_top;
     memset(frame, 0, sizeof(*frame));
     frame->rip = (uint64_t)user_mode_trampoline;
-    frame->rbx = info.entry;         /* new user RIP */
+    frame->rbx = user_entry;         /* new user RIP */
     frame->r12 = sp;                 /* new user RSP (with argc/argv/auxv) */
 
     cur->rsp = kstack_top;
@@ -534,6 +819,9 @@ retry:
     goto retry;
 }
 
+/* Forward declaration used by MAP_FIXED replacement path in sys_mmap(). */
+int64_t sys_munmap(uint64_t addr, uint64_t len);
+
 /* ═══════════════════════════════════════════════════════════════════════════ *
  *  sys_mmap — Map memory into the process address space                     *
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -544,14 +832,18 @@ int64_t sys_mmap(uint64_t addr, uint64_t len, int prot, int flags,
 
     if (len == 0) return -EINVAL;
 
+    flags &= ~MAP_DENYWRITE; /* Linux-compat ignored flag */
+    if ((flags & MAP_FIXED_NOREPLACE) && !(flags & MAP_FIXED))
+        return -EINVAL;
+
     bool is_anon = (flags & MAP_ANONYMOUS) != 0;
     file_t *map_file = NULL;
     vnode_t *map_vnode = NULL;
 
     if (!is_anon) {
-        if (flags & MAP_SHARED)
-            return -ENOSYS;
-        if (!(flags & MAP_PRIVATE))
+        if (!((flags & MAP_PRIVATE) || (flags & MAP_SHARED)))
+            return -EINVAL;
+        if ((flags & MAP_PRIVATE) && (flags & MAP_SHARED))
             return -EINVAL;
         if (offset < 0 || (offset & (PAGE_SIZE - 1)))
             return -EINVAL;
@@ -570,6 +862,9 @@ int64_t sys_mmap(uint64_t addr, uint64_t len, int prot, int flags,
     /* Page-align length */
     len = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
+    if ((flags & MAP_FIXED) && addr == 0)
+        return -EINVAL;
+
     /* Choose address */
     uint64_t map_addr;
     uint64_t old_mmap_next = cur->mmap_next;
@@ -580,6 +875,19 @@ int64_t sys_mmap(uint64_t addr, uint64_t len, int prot, int flags,
         cur->mmap_next += len;
     }
 
+    if ((flags & MAP_FIXED_NOREPLACE) &&
+        vma_overlaps_range(cur, map_addr, map_addr + len)) {
+        return -EEXIST;
+    }
+
+    /* MAP_FIXED replaces any previous mappings in the target range.
+     * Without this, stale PTEs/VMAs can survive and cause protection faults. */
+    if (flags & MAP_FIXED) {
+        int64_t ur = sys_munmap(map_addr, len);
+        if (ur < 0)
+            return ur;
+    }
+
     /* Convert prot to page flags */
     uint64_t pflags = VMM_PRESENT | VMM_USER;
     if (prot & PROT_WRITE) pflags |= VMM_WRITE;
@@ -587,39 +895,22 @@ int64_t sys_mmap(uint64_t addr, uint64_t len, int prot, int flags,
 
     uint64_t mapped_len = 0;
 
-    /* Map pages (eager population) */
-    for (uint64_t off = 0; off < len; off += PAGE_SIZE) {
-        uintptr_t pg = pmm_alloc_pages(1);
-        if (!pg) {
-            if (!(flags & MAP_FIXED)) cur->mmap_next = old_mmap_next;
-            for (uint64_t u = 0; u < mapped_len; u += PAGE_SIZE) {
-                uintptr_t phys = vmm_unmap_page_in(cur->cr3, map_addr + u);
-                if (phys) pmm_free_pages(phys, 1);
-            }
-            return -ENOMEM;
-        }
-        /* Zero the page */
-        memset((void *)vmm_phys_to_virt(pg), 0, PAGE_SIZE);
-        vmm_map_page_in(cur->cr3, map_addr + off, pg, pflags);
-
-        if (!is_anon) {
-            uint64_t file_off = (uint64_t)offset + off;
-            if (file_off < map_vnode->size) {
-                size_t to_read = (size_t)(map_vnode->size - file_off);
-                if (to_read > PAGE_SIZE) to_read = PAGE_SIZE;
-                ssize_t rd = map_vnode->ops->read(map_vnode,
-                    (void *)vmm_phys_to_virt(pg), to_read, file_off);
-                if (rd < 0) {
-                    if (!(flags & MAP_FIXED)) cur->mmap_next = old_mmap_next;
-                    for (uint64_t u = 0; u <= off; u += PAGE_SIZE) {
-                        uintptr_t phys = vmm_unmap_page_in(cur->cr3, map_addr + u);
-                        if (phys) pmm_free_pages(phys, 1);
-                    }
-                    return rd;
+    if (is_anon) {
+        /* Map anonymous pages eagerly */
+        for (uint64_t off = 0; off < len; off += PAGE_SIZE) {
+            uintptr_t pg = pmm_alloc_pages(1);
+            if (!pg) {
+                if (!(flags & MAP_FIXED)) cur->mmap_next = old_mmap_next;
+                for (uint64_t u = 0; u < mapped_len; u += PAGE_SIZE) {
+                    uintptr_t phys = vmm_unmap_page_in(cur->cr3, map_addr + u);
+                    if (phys) pmm_page_unref(phys);
                 }
+                return -ENOMEM;
             }
+            memset((void *)vmm_phys_to_virt(pg), 0, PAGE_SIZE);
+            vmm_map_page_in(cur->cr3, map_addr + off, pg, pflags);
+            mapped_len += PAGE_SIZE;
         }
-        mapped_len += PAGE_SIZE;
     }
 
     /* Track VMA */
@@ -629,9 +920,19 @@ int64_t sys_mmap(uint64_t addr, uint64_t len, int prot, int flags,
         v->end   = map_addr + len;
         v->flags = VMA_USER;
         if (is_anon) v->flags |= VMA_ANON;
+        else v->flags |= VMA_FILE;
         if (prot & PROT_READ)  v->flags |= VMA_READ;
         if (prot & PROT_WRITE) v->flags |= VMA_WRITE;
         if (prot & PROT_EXEC)  v->flags |= VMA_EXEC;
+        if (flags & MAP_SHARED) v->flags |= VMA_SHARED;
+        v->file = is_anon ? NULL : map_vnode;
+        v->file_offset = (uint64_t)offset;
+        v->file_size = (v->file && v->file->size > (uint64_t)offset)
+                     ? (v->file->size - (uint64_t)offset)
+                     : 0;
+        if (v->file_size > len) v->file_size = len;
+        v->mmap_flags = (uint32_t)flags;
+        if (v->file) vfs_vnode_get(v->file);
         vma_insert(cur, v);
     }
 
@@ -652,8 +953,17 @@ int64_t sys_munmap(uint64_t addr, uint64_t len) {
 
     /* Unmap pages and free physical memory */
     for (uint64_t off = 0; off < len; off += PAGE_SIZE) {
-        uintptr_t phys = vmm_unmap_page_in(cur->cr3, addr + off);
-        if (phys) pmm_free_pages(phys, 1);
+        uint64_t page_addr = addr + off;
+        vma_t *mv = vma_find_for_addr(cur, page_addr);
+
+        uintptr_t phys = vmm_unmap_page_in(cur->cr3, page_addr);
+        if (phys) pmm_page_unref(phys);
+
+        if (mv && (mv->flags & VMA_FILE) && (mv->flags & VMA_SHARED) && mv->file) {
+            uint64_t within = page_addr - mv->start;
+            if (within < mv->file_size)
+                pagecache_release(mv->file, mv->file_offset + within);
+        }
     }
 
     /* Remove/split VMAs that overlap [addr, addr+len) */
@@ -672,6 +982,7 @@ int64_t sys_munmap(uint64_t addr, uint64_t len) {
         /* Fully contained → remove */
         if (v->start >= unmap_start && v->end <= unmap_end) {
             *pp = v->next;
+            if (v->file) vfs_vnode_put(v->file);
             kfree(v);
             continue;
         }
@@ -685,8 +996,15 @@ int64_t sys_munmap(uint64_t addr, uint64_t len) {
                 right->start = unmap_end;
                 right->end   = v->end;
                 right->flags = v->flags;
+                right->file  = v->file;
+                right->file_offset = v->file_offset + (unmap_end - v->start);
+                right->file_size   = (v->end > unmap_end) ? (v->end - unmap_end) : 0;
+                right->mmap_flags  = v->mmap_flags;
+                if (right->file) vfs_vnode_get(right->file);
                 right->next  = v->next;
                 v->end  = unmap_start;
+                if (v->file_size > (v->end - v->start))
+                    v->file_size = v->end - v->start;
                 v->next = right;
             }
             pp = &v->next;
@@ -697,13 +1015,19 @@ int64_t sys_munmap(uint64_t addr, uint64_t len) {
         /* Overlap on left side: trim end */
         if (v->start < unmap_start) {
             v->end = unmap_start;
+            if (v->file_size > (v->end - v->start))
+                v->file_size = v->end - v->start;
             pp = &v->next;
             continue;
         }
 
         /* Overlap on right side: trim start */
         if (v->end > unmap_end) {
+            if (v->file)
+                v->file_offset += (unmap_end - v->start);
             v->start = unmap_end;
+            if (v->file_size > (v->end - v->start))
+                v->file_size = v->end - v->start;
             pp = &v->next;
             continue;
         }
@@ -727,7 +1051,36 @@ int64_t sys_mprotect(uint64_t addr, uint64_t len, int prot) {
     if ((addr & (PAGE_SIZE - 1)) || len == 0)
         return -EINVAL;
 
+    if (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC))
+        return -EINVAL;
+
     len = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+    uint64_t end = addr + len;
+    if (end < addr)
+        return -EINVAL;
+
+    bool have_vma_overlap = false;
+    for (vma_t *v = cur->vma_list; v; v = v->next) {
+        if (v->end <= addr || v->start >= end)
+            continue;
+        have_vma_overlap = true;
+        break;
+    }
+
+    for (uint64_t a = addr; a < end; a += PAGE_SIZE) {
+        if (vma_find_for_addr(cur, a))
+            continue;
+        uint64_t *pte = vmm_get_pte(cur->cr3, a);
+        if (!pte || !(*pte & VMM_PRESENT))
+            return -ENOMEM;
+    }
+
+    if (have_vma_overlap) {
+        int vrc = vma_apply_mprotect(cur, addr, end, vma_perm_from_prot(prot));
+        if (vrc < 0)
+            return vrc;
+    }
 
     uint64_t pflags = VMM_PRESENT | VMM_USER;
     if (prot & PROT_WRITE) pflags |= VMM_WRITE;

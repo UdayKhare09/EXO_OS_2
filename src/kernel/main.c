@@ -40,6 +40,7 @@
 #include "arch/x86_64/rtc.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
+#include "mm/pagecache.h"
 #include "sched/sched.h"
 #include "sched/task.h"
 #include "arch/x86_64/pci.h"
@@ -328,7 +329,7 @@ static void launcher_exec_path(launcher_t *launcher, const char *args) {
     }
 
     elf_info_t info;
-    int r = elf_load(buf, file_size, pml4, &info);
+    int r = elf_load(buf, file_size, pml4, 0, &info);
     kfree(buf);
     if (r < 0) {
         fbcon_printf_inst(con, "  exec: ELF load failed (%d)\n", r);
@@ -455,6 +456,10 @@ static void launcher_exec_path(launcher_t *launcher, const char *args) {
         stack_vma->start = user_stack_top - stack_pages * PAGE_SIZE;
         stack_vma->end   = user_stack_top;
         stack_vma->flags = VMA_READ | VMA_WRITE | VMA_USER | VMA_STACK;
+        stack_vma->file = NULL;
+        stack_vma->file_offset = 0;
+        stack_vma->file_size = 0;
+        stack_vma->mmap_flags = 0;
         stack_vma->next  = NULL;
         vma_insert(t, stack_vma);
     }
@@ -570,6 +575,7 @@ void kmain(void) {
 
     /* ── 5a. Kernel heap ──────────────────────────────────────────────────── */
     kmalloc_init();
+    pagecache_init();
 
     /* ── 5b. Filesystem stack ─────────────────────────────────────────────── */
     bcache_init();

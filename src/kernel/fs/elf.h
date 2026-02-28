@@ -85,8 +85,11 @@ typedef struct {
     uint64_t entry;       /* entry point virtual address     */
     uint64_t brk_start;   /* first address past loaded data  */
     uint64_t phdr_vaddr;  /* vaddr of loaded PHDR (for auxv) */
+    uint64_t load_base;   /* load base for ET_DYN            */
     uint16_t phdr_count;  /* number of program headers       */
     uint16_t phdr_size;   /* size of each phdr entry         */
+    uint8_t  has_interp;  /* PT_INTERP present               */
+    char     interp_path[256];
 } elf_info_t;
 
 /* ── API ─────────────────────────────────────────────────────────────────── */
@@ -96,11 +99,12 @@ typedef struct {
  * @param data        Pointer to the ELF file in kernel memory.
  * @param data_size   Size of the ELF file.
  * @param pml4_phys   Physical address of the target PML4.
+ * @param load_bias   Load base for ET_DYN images (0 = default)
  * @param out         Filled with entry point and segment info.
  * @return 0 on success, negative errno on error.
  */
 int elf_load(const void *data, uint64_t data_size,
-             uintptr_t pml4_phys, elf_info_t *out);
+             uintptr_t pml4_phys, uint64_t load_bias, elf_info_t *out);
 
 /* Validate an ELF64 header. Returns 0 if valid, negative errno otherwise. */
 int elf_validate(const Elf64_Ehdr *ehdr);

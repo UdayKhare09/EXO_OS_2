@@ -147,6 +147,8 @@
 #define MAP_FIXED       0x10
 #define MAP_ANONYMOUS   0x20
 #define MAP_ANON        MAP_ANONYMOUS
+#define MAP_DENYWRITE   0x0800
+#define MAP_FIXED_NOREPLACE 0x100000
 
 /* mmap prot flags */
 #define PROT_NONE       0x0

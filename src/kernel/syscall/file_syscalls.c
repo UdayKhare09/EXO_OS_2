@@ -894,7 +894,7 @@ int64_t sys_brk(uint64_t addr) {
         uint64_t new_page = (new_brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
         for (uint64_t pg = new_page; pg < old_brk; pg += PAGE_SIZE) {
             uintptr_t phys = vmm_unmap_page_in(cur->cr3, pg);
-            if (phys) pmm_free_pages(phys, 1);
+            if (phys) pmm_page_unref(phys);
         }
     }
 
@@ -912,6 +912,10 @@ int64_t sys_brk(uint64_t addr) {
             v->start = cur->brk_base;
             v->end   = new_brk;
             v->flags = VMA_READ | VMA_WRITE | VMA_USER | VMA_HEAP;
+            v->file = NULL;
+            v->file_offset = 0;
+            v->file_size = 0;
+            v->mmap_flags = 0;
             v->next  = cur->vma_list;
             cur->vma_list = v; /* simple prepend, not sorted */
         }
