@@ -3,6 +3,7 @@
 #include "net/ipv4.h"
 #include "lib/klog.h"
 #include "lib/string.h"
+#include "fs/vfs.h"
 #include "mm/kmalloc.h"
 
 /* ── Constants ───────────────────────────────────────────────────────────── */
@@ -27,7 +28,7 @@ static void tcp_rexmit_timeout(ktimer_t *timer, void *arg) {
 
     (void)ent;
     KLOG_DEBUG("tcp: retransmit timer expired; aborting without retry\n");
-    tcb->so_error = -1;  /* ETIMEDOUT */
+    tcb->so_error = -ETIMEDOUT;
     tcb->state = TCP_CLOSED;
     waitq_wake_all(&tcb->wq_connect);
     waitq_wake_all(&tcb->wq_recv);

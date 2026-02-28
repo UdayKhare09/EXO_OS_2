@@ -131,9 +131,10 @@ LIBC_SUITE_SRC  := tools/mlibc_posix_suite.c
 BUSYBOX_URL := https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox
 BUSYBOX_BIN := $(LIBC_SMOKE_DIR)/busybox
 
-# ── curl (prebuilt static binary) ─────────────────────────────────────────────
-CURL_URL := https://github.com/moparisthebest/static-curl/releases/latest/download/curl-amd64
-CURL_BIN := $(LIBC_SMOKE_DIR)/curl
+# ── External binaries (configured in script) ─────────────────────────────────
+EXTERNAL_BIN_LIST_SH := tools/rootfs/external_bins.sh
+EXTERNAL_BIN_DIR     := $(LIBC_SMOKE_DIR)/external-bin
+EXTERNAL_BIN_STAMP   := $(EXTERNAL_BIN_DIR)/.stamp
 
 # ── rootfs config files ───────────────────────────────────────────────────────
 ROOTFS_PROFILE  := tools/rootfs/profile
@@ -159,7 +160,7 @@ QEMU_FLAGS := \
     -no-reboot
 
 .PHONY: all clean distclean run run-debug
-.PHONY: check-musl libc-smoke busybox-build curl-build
+.PHONY: check-musl libc-smoke busybox-build external-bins-build curl-build
 
 all: $(DISK_IMG)
 
@@ -258,15 +259,23 @@ $(BUSYBOX_BIN):
 	curl -L --fail -o $@ $(BUSYBOX_URL)
 	@chmod +x $@
 
-$(CURL_BIN):
-	@echo ">>> Fetching curl static binary..."
-	@mkdir -p $(dir $@)
-	curl -L --fail -o $@ $(CURL_URL)
-	@chmod +x $@
+$(EXTERNAL_BIN_STAMP): $(EXTERNAL_BIN_LIST_SH)
+	@echo ">>> Fetching external binaries from $(EXTERNAL_BIN_LIST_SH)..."
+	@mkdir -p $(EXTERNAL_BIN_DIR)
+	@set -e; \
+	. ./$(EXTERNAL_BIN_LIST_SH); \
+	external_bins | while read -r name url; do \
+	    if [ -z "$$name" ] || [ -z "$$url" ]; then continue; fi; \
+	    echo "    - $$name <= $$url"; \
+	    curl -L --fail -o "$(EXTERNAL_BIN_DIR)/$$name" "$$url"; \
+	    chmod +x "$(EXTERNAL_BIN_DIR)/$$name"; \
+	done
+	@touch $@
 
 libc-smoke:      $(LIBC_SMOKE_BINS)
 busybox-build:   $(BUSYBOX_BIN)
-curl-build:      $(CURL_BIN)
+external-bins-build: $(EXTERNAL_BIN_STAMP)
+curl-build: external-bins-build
 
 # ── EFI partition (FAT32, no root needed — mtools) ────────────────────────────
 $(EFI_IMG): $(KERNEL_ELF) $(LIMINE_DIR)/limine.h
@@ -280,7 +289,7 @@ $(EFI_IMG): $(KERNEL_ELF) $(LIMINE_DIR)/limine.h
 
 # ── Root partition (ext2, no root needed — debugfs) ───────────────────────────
 $(ROOT_IMG): $(HELLO_BIN) $(SYSCALL_TEST_BIN) \
-			 $(LIBC_SMOKE_BINS) $(BUSYBOX_BIN) $(CURL_BIN) \
+			 $(LIBC_SMOKE_BINS) $(BUSYBOX_BIN) $(EXTERNAL_BIN_STAMP) \
              $(ROOTFS_PROFILE) $(ROOTFS_ENV_FILE)
 	@echo ">>> Building root partition (ext2)..."
 	$(eval ROOT_SECTORS := $(shell echo $$(($(DISK_SIZE_MB) * 2048 - $(ROOT_START) - 33))))
@@ -290,17 +299,19 @@ $(ROOT_IMG): $(HELLO_BIN) $(SYSCALL_TEST_BIN) \
 	    debugfs -w -R "mkdir $(d)" $@ 2>/dev/null || true ;)
 	debugfs -w -R "write $(HELLO_BIN)           bin/hello"         $@ 2>/dev/null
 	debugfs -w -R "write $(HELLO_BIN)           home/hello"        $@ 2>/dev/null
-	debugfs -w -R "write $(SYSCALL_TEST_BIN)    bin/syscall_test"  $@ 2>/dev/null
 	debugfs -w -R "write $(SYSCALL_TEST_BIN)    home/syscall_test"  $@ 2>/dev/null
-	debugfs -w -R "write $(LIBC_HELLO_BIN)      bin/mlibc_hello"   $@ 2>/dev/null
 	debugfs -w -R "write $(LIBC_HELLO_BIN)      home/mlibc_hello"   $@ 2>/dev/null
-	debugfs -w -R "write $(LIBC_PTH_BIN)        bin/pthread_smoke" $@ 2>/dev/null
 	debugfs -w -R "write $(LIBC_PTH_BIN)        home/pthread_smoke" $@ 2>/dev/null
-	debugfs -w -R "write $(LIBC_SUITE_BIN)      bin/posix_suite"   $@ 2>/dev/null
 	debugfs -w -R "write $(LIBC_SUITE_BIN)      home/posix_suite"   $@ 2>/dev/null
 	debugfs -w -R "write $(BUSYBOX_BIN)         bin/busybox"       $@ 2>/dev/null
 	debugfs -w -R "write $(BUSYBOX_BIN)         bin/sh"            $@ 2>/dev/null
-	debugfs -w -R "write $(CURL_BIN)            bin/curl"          $@ 2>/dev/null
+	@if [ -d "$(EXTERNAL_BIN_DIR)" ]; then \
+	    for f in $(EXTERNAL_BIN_DIR)/*; do \
+	        [ -f "$$f" ] || continue; \
+	        n=$$(basename "$$f"); \
+	        debugfs -w -R "write $$f bin/$$n" $@ 2>/dev/null; \
+	    done; \
+	fi
 	debugfs -w -R "write $(ROOTFS_PROFILE)      etc/profile"       $@ 2>/dev/null
 	debugfs -w -R "write $(ROOTFS_ENV_FILE)     etc/environment"   $@ 2>/dev/null
 

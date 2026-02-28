@@ -233,9 +233,15 @@ typedef struct {
 #define EISDIR  21
 #define EINVAL  22
 #define EMFILE  24
+#define EALREADY 37
 #define ENOSPC  28
 #define ESPIPE  29
 #define EPIPE   32
+#define EISCONN 106
+#define ENOTCONN 107
+#define EINPROGRESS 115
+#define ECONNRESET 104
+#define ECONNREFUSED 111
 #define ERANGE  34
 #define EDEADLK 35
 #define ENAMETOOLONG 36

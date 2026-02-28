@@ -48,7 +48,6 @@
 #include "drivers/input/input.h"
 #include "drivers/usb/usb_core.h"
 #include "drivers/usb/hid.h"
-#include "shell/shell.h"
 
 /* ── Filesystem stack ───────────────────────────────────────────────────── */
 #include "fs/bcache.h"
@@ -63,11 +62,19 @@
 #include "drivers/devfs.h"
 #include "fs/procfs.h"
 #include "fs/sysfs.h"
+#include "fs/fd.h"
+#include "fs/elf.h"
 #include "fs/gpt.h"
 #include "syscall/syscall.h"
 
 /* ── Networking ─────────────────────────────────────────────────────────── */
 extern void net_init_task(void *arg);
+extern void tty_set_fg_pgid(int pgid);
+
+typedef struct {
+    fbcon_t *con;
+    char cwd[VFS_MOUNT_PATH_MAX];
+} launcher_t;
 
 /* ── Limine protocol: start marker ────────────────────────────────────── */
 __attribute__((used, section(".limine_requests_start_marker")))
@@ -254,6 +261,234 @@ static void pick_user_shell_path(char *out, size_t out_sz) {
     }
 }
 
+static launcher_t *launcher_create_quiet(fbcon_t *con) {
+    launcher_t *launcher = kmalloc(sizeof(*launcher));
+    if (!launcher) return NULL;
+    launcher->con = con;
+    strncpy(launcher->cwd, "/", VFS_MOUNT_PATH_MAX - 1);
+    launcher->cwd[VFS_MOUNT_PATH_MAX - 1] = '\0';
+    return launcher;
+}
+
+static void launcher_exec_path(launcher_t *launcher, const char *args) {
+    fbcon_t *con = launcher->con;
+    if (!args || !*args) {
+        fbcon_puts_inst(con, "  usage: exec <path>\n");
+        return;
+    }
+
+    while (*args == ' ') args++;
+    if (!*args) {
+        fbcon_puts_inst(con, "  usage: exec <path>\n");
+        return;
+    }
+
+    char fullpath[VFS_MOUNT_PATH_MAX];
+    if (args[0] == '/') {
+        strncpy(fullpath, args, VFS_MOUNT_PATH_MAX - 1);
+        fullpath[VFS_MOUNT_PATH_MAX - 1] = '\0';
+    } else {
+        path_join(launcher->cwd, args, fullpath);
+    }
+
+    int vfs_err = 0;
+    vnode_t *vn = vfs_lookup(fullpath, true, &vfs_err);
+    if (!vn) {
+        fbcon_printf_inst(con, "  exec: '%s': file not found\n", fullpath);
+        return;
+    }
+
+    uint64_t file_size = vn->size;
+    if (file_size == 0 || file_size > (64ULL * 1024 * 1024)) {
+        fbcon_printf_inst(con, "  exec: '%s': invalid file size (%llu)\n", fullpath, file_size);
+        vfs_vnode_put(vn);
+        return;
+    }
+
+    void *buf = kmalloc(file_size);
+    if (!buf) {
+        fbcon_puts_inst(con, "  exec: out of memory\n");
+        vfs_vnode_put(vn);
+        return;
+    }
+
+    ssize_t rd = vn->ops->read(vn, buf, file_size, 0);
+    vfs_vnode_put(vn);
+    if (rd < 0 || (uint64_t)rd != file_size) {
+        fbcon_printf_inst(con, "  exec: read error (%ld)\n", rd);
+        kfree(buf);
+        return;
+    }
+
+    uintptr_t pml4 = vmm_create_address_space();
+    if (!pml4) {
+        fbcon_puts_inst(con, "  exec: failed to create address space\n");
+        kfree(buf);
+        return;
+    }
+
+    elf_info_t info;
+    int r = elf_load(buf, file_size, pml4, &info);
+    kfree(buf);
+    if (r < 0) {
+        fbcon_printf_inst(con, "  exec: ELF load failed (%d)\n", r);
+        vmm_destroy_address_space(pml4);
+        return;
+    }
+
+    uintptr_t user_stack_top = USER_STACK_TOP;
+    uintptr_t stack_pages = 8;
+    for (uintptr_t i = 0; i < stack_pages; i++) {
+        uintptr_t pg = pmm_alloc_pages(1);
+        if (pg) {
+            memset((void *)vmm_phys_to_virt(pg), 0, PAGE_SIZE);
+            vmm_map_page_in(pml4,
+                            user_stack_top - (stack_pages - i) * PAGE_SIZE,
+                            pg, VMM_USER_RW);
+        }
+    }
+
+    uintptr_t sp = user_stack_top;
+
+    #define EXEC_PUSH(val) do {                                          \
+        sp -= 8;                                                          \
+        uint64_t *_pte = vmm_get_pte(pml4, sp);                          \
+        if (_pte) {                                                       \
+            uintptr_t _ph = (*_pte) & 0x000FFFFFFFFFF000ULL;             \
+            uintptr_t _of = sp & (PAGE_SIZE - 1);                        \
+            *(uint64_t *)(vmm_phys_to_virt(_ph) + _of) = (uint64_t)(val);\
+        }                                                                 \
+    } while(0)
+
+    #define EXEC_PUSH_STR(str) ({ \
+        size_t _len = strlen(str) + 1; \
+        sp -= _len; \
+        sp &= ~0x7ULL; \
+        uintptr_t _addr = sp; \
+        uint64_t *_pte2 = vmm_get_pte(pml4, sp); \
+        if (_pte2) { \
+            uintptr_t _ph2 = (*_pte2) & 0x000FFFFFFFFFF000ULL; \
+            uintptr_t _of2 = sp & (PAGE_SIZE - 1); \
+            memcpy((void *)(vmm_phys_to_virt(_ph2) + _of2), (str), _len); \
+        } \
+        _addr; \
+    })
+
+    const char *argv0_str = fullpath;
+    if (strcmp(fullpath, "/bin/sh") == 0)
+        argv0_str = "-sh";
+    uintptr_t argv0_addr = EXEC_PUSH_STR(argv0_str);
+
+    char env_pwd[VFS_MOUNT_PATH_MAX + 5];
+    const char *cwd_env = (launcher && launcher->cwd[0]) ? launcher->cwd : "/";
+    size_t cwd_len = strlen(cwd_env);
+    if (cwd_len > VFS_MOUNT_PATH_MAX - 1)
+        cwd_len = VFS_MOUNT_PATH_MAX - 1;
+    memcpy(env_pwd, "PWD=", 4);
+    memcpy(env_pwd + 4, cwd_env, cwd_len);
+    env_pwd[4 + cwd_len] = '\0';
+
+    const char *env_list[] = {
+        "PATH=/bin:/usr/bin:/sbin:/usr/sbin",
+        "HOME=/",
+        "TERM=linux",
+        "SHELL=/bin/sh",
+        "ENV=/etc/profile",
+        "USER=root",
+        "LOGNAME=root",
+        env_pwd,
+        "TMPDIR=/tmp",
+        "PS1=uday# ",
+    };
+    uintptr_t env_addrs[sizeof(env_list) / sizeof(env_list[0])] = {0};
+    int env_count = 0;
+    for (size_t i = 0; i < sizeof(env_list) / sizeof(env_list[0]); i++)
+        env_addrs[env_count++] = EXEC_PUSH_STR(env_list[i]);
+
+    sp &= ~0xFULL;
+
+    EXEC_PUSH(0);
+    EXEC_PUSH(0);
+    EXEC_PUSH(0);
+    EXEC_PUSH(23);
+    EXEC_PUSH(info.entry);
+    EXEC_PUSH(9);
+    EXEC_PUSH(PAGE_SIZE);
+    EXEC_PUSH(6);
+    EXEC_PUSH(info.phdr_size);
+    EXEC_PUSH(4);
+    EXEC_PUSH(info.phdr_count);
+    EXEC_PUSH(5);
+    EXEC_PUSH(info.phdr_vaddr);
+    EXEC_PUSH(3);
+
+    EXEC_PUSH(0);
+    for (int i = env_count - 1; i >= 0; i--)
+        EXEC_PUSH(env_addrs[i]);
+
+    EXEC_PUSH(0);
+    EXEC_PUSH(argv0_addr);
+    EXEC_PUSH(1);
+
+    #undef EXEC_PUSH_STR
+    #undef EXEC_PUSH
+
+    uint32_t cpu = sched_pick_cpu();
+    task_t *t = task_create_user(fullpath, pml4, info.entry, sp, cpu);
+    if (!t) {
+        fbcon_puts_inst(con, "  exec: failed to create task\n");
+        vmm_destroy_address_space(pml4);
+        return;
+    }
+
+    t->brk_base    = info.brk_start;
+    t->brk_current = info.brk_start;
+    t->mmap_next   = USER_MMAP_BASE;
+    const char *initial_cwd = (launcher && launcher->cwd[0]) ? launcher->cwd : "/";
+    strncpy(t->cwd, initial_cwd, TASK_CWD_MAX - 1);
+    t->cwd[TASK_CWD_MAX - 1] = '\0';
+
+    vma_t *stack_vma = kmalloc(sizeof(vma_t));
+    if (stack_vma) {
+        stack_vma->start = user_stack_top - stack_pages * PAGE_SIZE;
+        stack_vma->end   = user_stack_top;
+        stack_vma->flags = VMA_READ | VMA_WRITE | VMA_USER | VMA_STACK;
+        stack_vma->next  = NULL;
+        vma_insert(t, stack_vma);
+    }
+
+    int vfs_err2 = 0;
+    vnode_t *tty = vfs_lookup("/dev/tty", true, &vfs_err2);
+    if (tty) {
+        fd_setup_stdio(t, tty);
+        vfs_vnode_put(tty);
+    } else {
+        fbcon_puts_inst(con, "  exec: warning: could not open /dev/tty for stdio\n");
+    }
+
+    tty_set_fg_pgid((int)t->pgid);
+
+    t->parent = sched_current();
+    uint32_t child_tid = t->tid;
+
+    sched_add_task(t, cpu);
+
+    {
+        task_t *ct;
+        for (;;) {
+            ct = task_lookup(child_tid);
+            if (!ct || ct->state == TASK_ZOMBIE || ct->state == TASK_DEAD)
+                break;
+            sched_sleep(10);
+        }
+        ct = task_lookup(child_tid);
+        if (ct && ct->state == TASK_ZOMBIE) {
+            ct->parent = NULL;
+            task_destroy(ct);
+        }
+    }
+}
+
 /* ── Init task: launch configured user-space shell ──────────────────────── */
 static void init_task(void *arg) {
     (void)arg;
@@ -271,7 +506,7 @@ static void init_task(void *arg) {
     sched_sleep(200);
 
     fbcon_t *con = fbcon_get();
-    shell_t *launcher = shell_create_quiet(con);
+    launcher_t *launcher = launcher_create_quiet(con);
     if (!launcher) {
         KLOG_ERR("init: failed to create launcher shell context\n");
         return;
@@ -280,7 +515,7 @@ static void init_task(void *arg) {
     for (;;) {
         if (con)
             fbcon_printf_inst(con, "\n  EXO_OS — launching %s\n\n", shell_path);
-        cmd_exec_path(launcher, shell_path);
+        launcher_exec_path(launcher, shell_path);
         KLOG_WARN("init: %s exited; restarting in 1s\n", shell_path);
         sched_sleep(1000);
         pick_user_shell_path(shell_path, sizeof(shell_path));

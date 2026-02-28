@@ -4,6 +4,7 @@
 #include "net/netutil.h"
 #include "lib/klog.h"
 #include "lib/string.h"
+#include "fs/vfs.h"
 #include "mm/kmalloc.h"
 
 /* ── data delivery into RX ring buffer ───────────────────────────────────── */
@@ -178,7 +179,7 @@ void tcp_rx(netdev_t *dev, skbuff_t *skb) {
     if (flags & TCP_RST) {
         KLOG_INFO("tcp: RST received in state %s\n",
              tcp_state_name(tcb->state));
-        tcb->so_error = -1;  /* ECONNRESET */
+        tcb->so_error = -ECONNRESET;
         tcb->state = TCP_CLOSED;
         waitq_wake_all(&tcb->wq_connect);
         waitq_wake_all(&tcb->wq_recv);

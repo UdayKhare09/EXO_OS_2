@@ -259,7 +259,7 @@ static int tcp_sock_connect(socket_t *sk, const struct sockaddr *addr,
     spinlock_release(&tcb->lock);
     tcp_tcb_free(tcb);
     sk->proto_data = NULL;
-    return err ? err : -1;
+    return err ? err : -ETIMEDOUT;
 }
 
 static int tcp_sock_bind(socket_t *sk, const struct sockaddr *addr,
@@ -517,8 +517,40 @@ static int tcp_sock_setsockopt(socket_t *sk, int level, int optname,
 
 static int tcp_sock_getsockopt(socket_t *sk, int level, int optname,
                                void *optval, socklen_t *optlen) {
-    (void)sk; (void)level; (void)optname; (void)optval; (void)optlen;
-    return -1;
+    if (!optval || !optlen || *optlen < sizeof(int)) return -1;
+
+    int value = 0;
+    if (level == SOL_SOCKET) {
+        switch (optname) {
+            case SO_TYPE:
+                value = sk->type;
+                break;
+            case SO_ERROR: {
+                tcp_tcb_t *tcb = (tcp_tcb_t *)sk->proto_data;
+                if (!tcb) {
+                    value = ENOTCONN;
+                } else {
+                    spinlock_acquire(&tcb->lock);
+                    value = (tcb->so_error < 0) ? -tcb->so_error : tcb->so_error;
+                    tcb->so_error = 0;
+                    spinlock_release(&tcb->lock);
+                }
+                break;
+            }
+            case SO_ACCEPTCONN:
+                value = (sk->proto_data &&
+                         ((tcp_tcb_t *)sk->proto_data)->state == TCP_LISTEN) ? 1 : 0;
+                break;
+            default:
+                return -1;
+        }
+    } else {
+        return -1;
+    }
+
+    *(int *)optval = value;
+    *optlen = sizeof(int);
+    return 0;
 }
 
 static socket_proto_ops_t tcp_proto_ops = {

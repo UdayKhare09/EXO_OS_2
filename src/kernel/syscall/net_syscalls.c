@@ -206,7 +206,7 @@ int64_t sys_connect(int fd, const struct sockaddr *addr, socklen_t addrlen) {
     if (!sk) return -EBADF;
     if (!sk->proto_ops || !sk->proto_ops->connect) return -EINVAL;
     int r = sk->proto_ops->connect(sk, addr, addrlen);
-    if (r == -1) return -EINVAL;
+    if (r < 0) return (r == -1) ? -EINVAL : r;
     return (int64_t)r;
 }
 
@@ -229,7 +229,7 @@ int64_t sys_sendto(int fd, const void *buf, size_t len, int flags,
     if (!sk->proto_ops || !sk->proto_ops->sendto) return -EINVAL;
     int r = (int)sk->proto_ops->sendto(sk, buf, len, flags,
                                        dest_addr, addrlen);
-    if (r == -1) return -EINVAL;
+    if (r < 0) return (r == -1) ? -EINVAL : r;
     return (int64_t)r;
 }
 
@@ -243,7 +243,7 @@ int64_t sys_recvfrom(int fd, void *buf, size_t len, int flags,
     int r = (int)sk->proto_ops->recvfrom(sk, buf, len, flags,
                                          src_addr, addrlen);
     if (r == -2) return -EINTR;
-    if (r == -1) return -EAGAIN;
+    if (r < 0) return (r == -1) ? -EAGAIN : r;
     return (int64_t)r;
 }
 
@@ -318,7 +318,7 @@ int64_t sys_getsockopt(int fd, int level, int optname,
     if (!sk) return -EBADF;
     if (!sk->proto_ops || !sk->proto_ops->getsockopt) return -EINVAL;
     int r = sk->proto_ops->getsockopt(sk, level, optname, optval, optlen);
-    if (r == -1) return -EINVAL;
+    if (r < 0) return (r == -1) ? -EINVAL : r;
     return (int64_t)r;
 }
 
