@@ -21,10 +21,12 @@ typedef int64_t ssize_t;
 #endif
 
 /* ── Forward declarations ────────────────────────────────────────────────── */
-typedef struct vnode   vnode_t;
-typedef struct fs_ops  fs_ops_t;
-typedef struct mount   mount_t;
-typedef struct fs_inst fs_inst_t;
+typedef struct vnode    vnode_t;
+typedef struct fs_ops   fs_ops_t;
+typedef struct mount    mount_t;
+typedef struct fs_inst  fs_inst_t;
+typedef struct file     file_t;
+typedef struct file_ops file_ops_t;  /* defined in fs/fd.h */
 
 /* ── File type bits (stored in vnode.mode) ───────────────────────────────── */
 #define VFS_S_IFMT    0xF000
@@ -65,6 +67,7 @@ typedef struct {
     uint64_t size;       /* total size in bytes (for regular files)           */
     uint64_t blocks;     /* number of 512-byte blocks allocated               */
     uint32_t blksize;    /* preferred I/O block size                          */
+    uint64_t rdev;       /* device ID (for char/block device files)           */
     int64_t  atime;      /* last access time (seconds since epoch)            */
     int64_t  mtime;      /* last modification time                            */
     int64_t  ctime;      /* last status-change time                           */
@@ -176,6 +179,13 @@ struct vnode {
     void      *fs_data;   /* filesystem-private data                          */
 
     uint32_t   refcount;  /* number of active references                      */
+
+    /* ── Open-time file_ops injection (set by fs open() callback) ──────────
+     * When a filesystem's open() sets these (e.g. /dev/ptmx allocates a PTY
+     * master), vfs_open() transfers them into the returned file_t, exactly
+     * like Linux's fops->open() filling filp->private_data.               */
+    file_ops_t *pending_f_ops;
+    void       *pending_priv;
 };
 
 /* ── Filesystem instance (one per mounted volume) ───────────────────────── */
@@ -189,7 +199,7 @@ struct fs_inst {
 
 /* ── Mount table entry ───────────────────────────────────────────────────── */
 #define VFS_MOUNT_PATH_MAX 512
-#define VFS_MAX_MOUNTS     16
+#define VFS_MAX_MOUNTS     32
 
 struct mount {
     char       path[VFS_MOUNT_PATH_MAX];  /* absolute mount point            */
@@ -222,42 +232,67 @@ typedef struct {
 #define O_NOFOLLOW  (1 << 17)
 #define O_CLOEXEC   (1 << 19)
 
-/* ── Error codes (subset of POSIX, negative) ─────────────────────────────── */
-#define EPERM    1
-#define ENOENT   2
-#define ESRCH    3
-#define EINTR    4
-#define EIO      5
-#define E2BIG    7
-#define ENOEXEC  8
-#define EBADF    9
-#define ECHILD  10
-#define EAGAIN  11
-#define ENOMEM  12
-#define EACCES  13
-#define EFAULT  14
-#define EEXIST  17
-#define ENOTDIR 20
-#define EISDIR  21
-#define EINVAL  22
-#define EMFILE  24
-#define EALREADY 37
-#define ENOSPC  28
-#define ESPIPE  29
-#define EPIPE   32
-#define EISCONN 106
-#define ENOTCONN 107
-#define EINPROGRESS 115
-#define ECONNRESET 104
-#define ECONNREFUSED 111
-#define ERANGE  34
-#define EDEADLK 35
-#define ENAMETOOLONG 36
-#define ENOSYS  38
-#define ENOTEMPTY 39
-#define ELOOP   40
-#define ETIMEDOUT 110
-#define ENODATA 61
+/* ── Error codes (Linux-compatible, matching kernel UAPI) ────────────────── */
+#define EPERM     1   /* Operation not permitted                              */
+#define ENOENT    2   /* No such file or directory                            */
+#define ESRCH     3   /* No such process                                      */
+#define EINTR     4   /* Interrupted system call                              */
+#define EIO       5   /* I/O error                                            */
+#define ENXIO     6   /* No such device or address                            */
+#define E2BIG     7   /* Argument list too long                               */
+#define ENOEXEC   8   /* Exec format error                                    */
+#define EBADF     9   /* Bad file number                                      */
+#define ECHILD   10   /* No child processes                                   */
+#define EAGAIN   11   /* Try again / EWOULDBLOCK                              */
+#define ENOMEM   12   /* Out of memory                                        */
+#define EACCES   13   /* Permission denied                                    */
+#define EFAULT   14   /* Bad address                                          */
+#define EBUSY    16   /* Device or resource busy                              */
+#define EEXIST   17   /* File exists                                          */
+#define EXDEV    18   /* Cross-device link                                    */
+#define ENODEV   19   /* No such device                                       */
+#define ENOTDIR  20   /* Not a directory                                      */
+#define EISDIR   21   /* Is a directory                                       */
+#define EINVAL   22   /* Invalid argument                                     */
+#define ENFILE   23   /* File table overflow                                  */
+#define EMFILE   24   /* Too many open files                                  */
+#define EFBIG    27   /* File too large                                       */
+#define ENOSPC   28   /* No space left on device                              */
+#define ESPIPE   29   /* Illegal seek                                         */
+#define EROFS    30   /* Read-only file system                                */
+#define EPIPE    32   /* Broken pipe                                          */
+#define ERANGE   34   /* Math result not representable                        */
+#define EDEADLK  35   /* Resource deadlock would occur                        */
+#define ENAMETOOLONG 36 /* File name too long                                 */
+#define ENOSYS   38   /* Function not implemented                             */
+#define ENOTEMPTY 39  /* Directory not empty                                  */
+#define ELOOP    40   /* Too many symbolic links encountered                  */
+#define EWOULDBLOCK EAGAIN /* Operation would block                           */
+#define ENOMSG   42   /* No message of desired type                           */
+#define ENODATA  61   /* No data available                                    */
+#define EOVERFLOW 75  /* Value too large for defined data type                */
+#define ENOTSOCK  88  /* Socket operation on non-socket                       */
+#define EDESTADDRREQ 89 /* Destination address required                       */
+#define EMSGSIZE 90   /* Message too long                                     */
+#define EPROTOTYPE 91 /* Protocol wrong type for socket                       */
+#define ENOPROTOOPT 92 /* Protocol not available                              */
+#define EPROTONOSUPPORT 93 /* Protocol not supported                          */
+#define EOPNOTSUPP 95 /* Operation not supported on transport endpoint        */
+#define EAFNOSUPPORT 97 /* Address family not supported by protocol           */
+#define EADDRINUSE 98 /* Address already in use                               */
+#define EADDRNOTAVAIL 99 /* Cannot assign requested address                   */
+#define ENETDOWN  100 /* Network is down                                      */
+#define ENETUNREACH 101 /* Network is unreachable                             */
+#define ECONNABORTED 103 /* Software caused connection abort                  */
+#define ECONNRESET 104 /* Connection reset by peer                            */
+#define ENOBUFS  105  /* No buffer space available                            */
+#define EISCONN  106  /* Transport endpoint is already connected              */
+#define ENOTCONN 107  /* Transport endpoint is not connected                  */
+#define ETIMEDOUT 110 /* Connection timed out                                 */
+#define ECONNREFUSED 111 /* Connection refused                                */
+#define EINPROGRESS 115 /* Operation now in progress                          */
+#define EEALREADY 37  /* alias for EALREADY */
+#define EALREADY  37  /* Operation already in progress                        */
 
 /* ── VFS global API ──────────────────────────────────────────────────────── */
 
@@ -326,6 +361,12 @@ int vfs_snapshot_mounts(vfs_mount_info_t *buf, int max_count);
 
 /* Allocate a new vnode (zero-initialised). Returns NULL on OOM. */
 vnode_t *vfs_alloc_vnode(void);
+
+/* Open a path and create a file_t wrapper around the resulting vnode.
+ * Returns NULL on failure.
+ * If O_CREAT is set and the path does not exist, creates the file using `mode`.
+ */
+file_t *vfs_open(const char *path, int flags, uint32_t mode);
 
 /* ── Path utilities (path.c) ─────────────────────────────────────────────── */
 

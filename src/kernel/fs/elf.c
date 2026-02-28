@@ -182,9 +182,6 @@ int elf_load(const void *data, uint64_t data_size,
         uint64_t seg_top = seg_vaddr + phdr->p_memsz;
         if (seg_top > brk_end) brk_end = seg_top;
 
-        KLOG_DEBUG("elf: loaded seg %u: vaddr=%p filesz=%llu memsz=%llu flags=%x\n",
-               i, (void *)seg_vaddr, phdr->p_filesz, phdr->p_memsz,
-                   phdr->p_flags);
     }
 
     /* brk starts at page-aligned end of loaded segments */
@@ -208,8 +205,5 @@ int elf_load(const void *data, uint64_t data_size,
             break;
         }
     }
-
-    KLOG_INFO("elf: loaded entry=%p brk_start=%p phnum=%u\n",
-              (void *)out->entry, (void *)out->brk_start, ehdr->e_phnum);
     return 0;
 }

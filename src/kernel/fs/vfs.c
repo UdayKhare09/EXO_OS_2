@@ -1,5 +1,6 @@
 /* fs/vfs.c — VFS core: mount table, path resolution, vnode lifecycle */
 #include "vfs.h"
+#include "fd.h"
 #include "lib/klog.h"
 #include "lib/string.h"
 #include "mm/kmalloc.h"
@@ -383,6 +384,78 @@ static int split_path(const char *path, char *parent_out, size_t parent_sz,
     if (strlen(name) >= name_sz) return -ENAMETOOLONG;
     strcpy(name_out, name);
     return 0;
+}
+
+file_t *vfs_open(const char *path, int flags, uint32_t mode) {
+    if (!path) return NULL;
+
+    int err = 0;
+    vnode_t *v = vfs_lookup(path, !(flags & O_NOFOLLOW), &err);
+
+    if (!v) {
+        if (!(flags & O_CREAT)) return NULL;
+
+        char parent[VFS_MOUNT_PATH_MAX], name[VFS_NAME_MAX + 1];
+        if (split_path(path, parent, sizeof(parent), name, sizeof(name)) < 0)
+            return NULL;
+
+        vnode_t *pdir = vfs_lookup(parent, true, &err);
+        if (!pdir) return NULL;
+
+        if (!pdir->ops || !pdir->ops->create) {
+            vfs_vnode_put(pdir);
+            return NULL;
+        }
+
+        v = pdir->ops->create(pdir, name, mode);
+        vfs_vnode_put(pdir);
+        if (!v) return NULL;
+    } else if ((flags & O_CREAT) && (flags & O_EXCL)) {
+        vfs_vnode_put(v);
+        return NULL;
+    }
+
+    if ((flags & O_DIRECTORY) && !VFS_S_ISDIR(v->mode)) {
+        vfs_vnode_put(v);
+        return NULL;
+    }
+
+    if ((flags & O_TRUNC) && ((flags & O_ACCMODE) != O_RDONLY)) {
+        if (!v->ops || !v->ops->truncate || v->ops->truncate(v, 0) < 0) {
+            vfs_vnode_put(v);
+            return NULL;
+        }
+    }
+
+    if (v->ops && v->ops->open) {
+        int rc = v->ops->open(v, flags);
+        if (rc < 0) {
+            vfs_vnode_put(v);
+            return NULL;
+        }
+    }
+
+    file_t *f = file_alloc(v, flags);
+    if (!f) {
+        if (v->ops && v->ops->close)
+            v->ops->close(v);
+        vfs_vnode_put(v);
+        return NULL;
+    }
+
+    strncpy(f->path, path, sizeof(f->path) - 1);
+    f->path[sizeof(f->path) - 1] = '\0';
+
+    /* Transfer any open()-injected f_ops (e.g. PTY master from /dev/ptmx). */
+    if (v->pending_f_ops) {
+        f->f_ops        = v->pending_f_ops;
+        f->private_data = v->pending_priv;
+        v->pending_f_ops = NULL;
+        v->pending_priv  = NULL;
+    }
+
+    vfs_vnode_put(v);
+    return f;
 }
 
 /* ── VFS operations ──────────────────────────────────────────────────────── */

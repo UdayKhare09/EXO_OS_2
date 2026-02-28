@@ -9,6 +9,7 @@
 #include "net/udp.h"
 #include "net/ipv4.h"
 #include "net/netutil.h"
+#include "net/unix.h"
 #include "fs/fd.h"
 #include "sched/sched.h"
 #include "sched/task.h"
@@ -105,7 +106,30 @@ void socket_init(void) {
 }
 
 int socket_create(int domain, int type, int protocol) {
-    if (domain != AF_INET) return -1;  /* only IPv4 for now */
+    /* AF_UNIX: delegate fully to unix.c */
+    if (domain == AF_UNIX || domain == AF_LOCAL) {
+        int real_type = type & ~(SOCK_NONBLOCK | SOCK_CLOEXEC);
+        socket_t *sk = kzalloc(sizeof(socket_t));
+        if (!sk) return -ENOMEM;
+        sk->domain   = AF_UNIX;
+        sk->type     = real_type;
+        sk->nonblock = (type & SOCK_NONBLOCK) ? 1 : 0;
+        skb_queue_init(&sk->rx_queue);
+        waitq_init(&sk->wq_rx);
+        waitq_init(&sk->wq_tx);
+        if (unix_socket_create(sk, real_type) < 0) { kfree(sk); return -ENOMEM; }
+        extern file_ops_t g_socket_file_ops;
+        file_t *f = file_alloc_generic(&g_socket_file_ops, sk, 2);
+        if (!f) { kfree(sk); return -ENOMEM; }
+        if (type & SOCK_CLOEXEC) { /* set later via fd_alloc */ }
+        task_t *t = sched_current();
+        int fd = fd_alloc(t, f);
+        if (fd < 0) { kfree(sk); return -EMFILE; }
+        if (type & SOCK_CLOEXEC) t->fd_flags[fd] |= FD_CLOEXEC;
+        return fd;
+    }
+
+    if (domain != AF_INET) return -1;  /* only IPv4 besides UNIX */
 
     /* determine protocol */
     int real_type = type & ~(SOCK_NONBLOCK | SOCK_CLOEXEC);

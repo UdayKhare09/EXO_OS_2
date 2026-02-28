@@ -248,6 +248,9 @@ int64_t sys_fork(cpu_regs_t *regs) {
     child->uid     = parent->uid;
     child->gid     = parent->gid;
     child->umask   = parent->umask;
+    /* fork() inherits exe_path: child /proc/<pid>/exe points at same binary
+     * (Linux: mm->exe_file is shared via get_file() across fork). */
+    memcpy(child->exe_path, parent->exe_path, TASK_CWD_MAX);
     child->group_count = parent->group_count;
     for (uint32_t gi = 0; gi < TASK_MAX_GROUPS; gi++)
         child->groups[gi] = parent->groups[gi];
@@ -665,6 +668,26 @@ int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
         argv_user[i] = sp;
     }
 
+    /* Save NUL-separated environ copy in task for /proc/<pid>/environ */
+    {
+        size_t etotal = 0;
+        for (int i = 0; i < envc; i++) etotal += strlen(envp_ptrs[i]) + 1;
+        if (cur->env_block) { kfree(cur->env_block); cur->env_block = NULL; cur->env_block_size = 0; }
+        if (etotal > 0) {
+            char *eb = kmalloc(etotal);
+            if (eb) {
+                size_t pos = 0;
+                for (int i = 0; i < envc; i++) {
+                    size_t l = strlen(envp_ptrs[i]) + 1;
+                    memcpy(eb + pos, envp_ptrs[i], l);
+                    pos += l;
+                }
+                cur->env_block = eb;
+                cur->env_block_size = (uint32_t)etotal;
+            }
+        }
+    }
+
     kfree(argv_buf);
     kfree(envp_buf);
 
@@ -732,6 +755,9 @@ int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
     KLOG_INFO("execve: '%s' entry=%p at_entry=%p at_base=%p brk=%p argc=%d envc=%d sp=%p\n",
               exec_path, (void *)user_entry, (void *)info.entry, (void *)at_base,
               (void *)info.brk_start, argc, envc, (void*)sp);
+
+    strncpy(cur->exe_path, exec_path, TASK_CWD_MAX - 1);
+    cur->exe_path[TASK_CWD_MAX - 1] = '\0';
 
     /* Jump to user-mode at the new entry point via user_mode_trampoline */
     extern void user_mode_trampoline(void);
@@ -1424,6 +1450,19 @@ int64_t sys_tgkill(int tgid, int tid, int sig) {
     task_t *target = task_lookup((uint32_t)tid);
     if (!target || target->state == TASK_DEAD) return -ESRCH;
     if ((int)target->pid != tgid) return -ESRCH;
+
+    if (sig == 0) return 0; /* existence check */
+    signal_send(target, sig);
+    return 0;
+}
+
+/* tkill(tid, sig) — like tgkill but no tgid check */
+int64_t sys_tkill(int tid, int sig) {
+    if (tid <= 0) return -EINVAL;
+    if (sig < 0 || sig >= NSIGS) return -EINVAL;
+
+    task_t *target = task_lookup((uint32_t)tid);
+    if (!target || target->state == TASK_DEAD) return -ESRCH;
 
     if (sig == 0) return 0; /* existence check */
     signal_send(target, sig);

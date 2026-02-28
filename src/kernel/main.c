@@ -61,6 +61,8 @@
 #include "drivers/storage/ahci.h"
 #include "drivers/bus/smbus.h"
 #include "drivers/devfs.h"
+#include "drivers/pty.h"
+#include "drivers/devpts.h"
 #include "fs/procfs.h"
 #include "fs/sysfs.h"
 #include "fs/fd.h"
@@ -592,10 +594,40 @@ void kmain(void) {
     vfs_mkdir("/boot", 0755);
     vfs_mkdir("/proc", 0555);
     vfs_mkdir("/sys",  0555);
+    vfs_mkdir("/run",  0755);
+    vfs_mkdir("/etc",  0755);
+    vfs_mkdir("/home", 0755);
+    vfs_mkdir("/home/root", 0755);
+    vfs_mkdir("/var",  0755);
+    vfs_mkdir("/var/run", 0755);
+    vfs_mkdir("/var/log", 0755);
+    vfs_mkdir("/lib",  0755);
+    vfs_mkdir("/mnt",  0755);
+    if (vfs_mount("/run", NULL, "tmpfs") < 0)
+        KLOG_WARN("vfs: failed to mount tmpfs on /run\n");
+    /* Standard /run subdirectories populated by init/systemd on real Linux */
+    vfs_mkdir("/run/lock",     01777);
+    vfs_mkdir("/run/shm",      01777);
+    vfs_mkdir("/run/user",     0755);
+    vfs_mkdir("/run/udev",     0755);
+    vfs_mkdir("/run/dbus",     0755);
+    vfs_mkdir("/run/network",  0755);
+    vfs_mkdir("/run/sshd",     0750);
+    if (vfs_mount("/tmp", NULL, "tmpfs") < 0)
+        KLOG_WARN("vfs: failed to mount tmpfs on /tmp\n");
     devfs_init();
+    /* PTY subsystem: must come after devfs (needs /dev mounted) */
+    pty_init();
+    vfs_mkdir("/dev/pts", 0755);
+    devpts_init();
+    /* /dev/shm: shared-memory tmpfs (used by mmap MAP_SHARED) */
+    vfs_mkdir("/dev/shm", 01777);
+    vfs_mount("/dev/shm", NULL, "tmpfs");
     procfs_init();
     sysfs_init();
     syscall_init();
+    extern void unix_socket_init(void);
+    unix_socket_init();
 
     /* ── 5c. Input event subsystem ────────────────────────────────────────── */
     input_init();

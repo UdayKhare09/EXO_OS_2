@@ -146,6 +146,7 @@ static void parse_config(usb_device_t *dev, uint8_t *blob, uint16_t total) {
 /* ─── Convert USB EP address to xHCI ep_id ──────────────────────────────── */
 /* xHCI ep_id = 2 * EP_number + (direction: 1=IN, 0=OUT)                    */
 /* For Ctrl EP0: ep_id = 1                                                   */
+static uint8_t ep_addr_to_dci(uint8_t bEndpointAddress) __attribute__((unused));
 static uint8_t ep_addr_to_dci(uint8_t bEndpointAddress) {
     uint8_t num = bEndpointAddress & 0x0F;
     uint8_t dir = (bEndpointAddress >> 7) & 1;

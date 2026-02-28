@@ -22,6 +22,7 @@
 #include "mm/vmm.h"
 #include "mm/pmm.h"
 #include "arch/x86_64/rtc.h"
+#include "syscall/epoll.h"
 
 #include <stdint.h>
 
@@ -91,6 +92,31 @@ int64_t sys_getsockopt(int fd, int level, int optname,
 int64_t sys_poll(struct pollfd *fds, uint64_t nfds, int timeout);
 int64_t sys_ioctl(int fd, unsigned long cmd, unsigned long arg);
 
+/* ── Forward declarations — new Phase 6 net syscalls ────────────────────── */
+int64_t sys_sendmsg(int fd, const msghdr_t *msg, int flags);
+int64_t sys_recvmsg(int fd, msghdr_t *msg, int flags);
+int64_t sys_accept4(int fd, struct sockaddr *addr, socklen_t *addrlen, int flags);
+
+/* ── Forward declarations — new Phase 6 file syscalls ───────────────────── */
+int64_t sys_truncate(const char *path, int64_t length);
+int64_t sys_ftruncate(int fd, int64_t length);
+int64_t sys_link(const char *oldpath, const char *newpath);
+int64_t sys_mknod(const char *path, uint32_t mode, uint64_t dev);
+int64_t sys_statfs(const char *path, linux_statfs_t *buf);
+int64_t sys_fstatfs(int fd, linux_statfs_t *buf);
+int64_t sys_flock(int fd, int operation);
+int64_t sys_fallocate(int fd, int mode, int64_t offset, int64_t len);
+int64_t sys_madvise(void *addr, uint64_t length, int advice);
+int64_t sys_memfd_create(const char *name, unsigned int flags);
+int64_t sys_inotify_init1(int flags);
+
+/* ── Forward declarations — epoll ───────────────────────────────────────── */
+int64_t sys_epoll_create1(int flags);
+int64_t sys_epoll_ctl(int epfd, int op, int fd, epoll_event_t *event);
+int64_t sys_epoll_wait(int epfd, epoll_event_t *events, int maxevents, int timeout);
+int64_t sys_epoll_pwait(int epfd, epoll_event_t *events, int maxevents, int timeout,
+                        const uint64_t *sigmask, uint64_t sigsetsize);
+
 /* ── Forward declarations to proc_syscalls.c ────────────────────────────── */
 int64_t sys_fork(cpu_regs_t *regs);
 int64_t sys_execve(const char *path, char *const argv[], char *const envp[]);
@@ -101,6 +127,7 @@ int64_t sys_munmap(uint64_t addr, uint64_t len);
 int64_t sys_mprotect(uint64_t addr, uint64_t len, int prot);
 int64_t sys_gettid(void);
 int64_t sys_tgkill(int tgid, int tid, int sig);
+int64_t sys_tkill(int tid, int sig);
 int64_t sys_set_robust_list(uint64_t head, uint64_t len);
 int64_t sys_get_robust_list(int pid, uint64_t *head_ptr, uint64_t *len_ptr);
 
@@ -244,6 +271,42 @@ static int64_t sc_setsockopt(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_
     { (void)f; return sys_setsockopt((int)a,(int)b,(int)c,(const void*)d,(socklen_t)e); }
 static int64_t sc_getsockopt(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { (void)f; return sys_getsockopt((int)a,(int)b,(int)c,(void*)d,(socklen_t*)e); }
+static int64_t sc_sendmsg(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)d;(void)e;(void)f; return sys_sendmsg((int)a,(const msghdr_t*)b,(int)c); }
+static int64_t sc_recvmsg(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)d;(void)e;(void)f; return sys_recvmsg((int)a,(msghdr_t*)b,(int)c); }
+static int64_t sc_accept4(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)e;(void)f; return sys_accept4((int)a,(struct sockaddr*)b,(socklen_t*)c,(int)d); }
+static int64_t sc_truncate(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)c;(void)d;(void)e;(void)f; return sys_truncate((const char*)a,(int64_t)b); }
+static int64_t sc_ftruncate(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)c;(void)d;(void)e;(void)f; return sys_ftruncate((int)a,(int64_t)b); }
+static int64_t sc_link(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)c;(void)d;(void)e;(void)f; return sys_link((const char*)a,(const char*)b); }
+static int64_t sc_mknod(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)d;(void)e;(void)f; return sys_mknod((const char*)a,(uint32_t)b,c); }
+static int64_t sc_statfs(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)c;(void)d;(void)e;(void)f; return sys_statfs((const char*)a,(linux_statfs_t*)b); }
+static int64_t sc_fstatfs(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)c;(void)d;(void)e;(void)f; return sys_fstatfs((int)a,(linux_statfs_t*)b); }
+static int64_t sc_flock(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)c;(void)d;(void)e;(void)f; return sys_flock((int)a,(int)b); }
+static int64_t sc_fallocate(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)e;(void)f; return sys_fallocate((int)a,(int)b,(int64_t)c,(int64_t)d); }
+static int64_t sc_madvise(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)d;(void)e;(void)f; return sys_madvise((void*)a,b,(int)c); }
+static int64_t sc_memfd_create(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)c;(void)d;(void)e;(void)f; return sys_memfd_create((const char*)a,(unsigned)b); }
+static int64_t sc_inotify_init1(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)b;(void)c;(void)d;(void)e;(void)f; return sys_inotify_init1((int)a); }
+static int64_t sc_epoll_create1(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)b;(void)c;(void)d;(void)e;(void)f; return sys_epoll_create1((int)a); }
+static int64_t sc_epoll_ctl(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)e;(void)f; return sys_epoll_ctl((int)a,(int)b,(int)c,(epoll_event_t*)d); }
+static int64_t sc_epoll_wait(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)e;(void)f; return sys_epoll_wait((int)a,(epoll_event_t*)b,(int)c,(int)d); }
+static int64_t sc_epoll_pwait(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { return sys_epoll_pwait((int)a,(epoll_event_t*)b,(int)c,(int)d,(const uint64_t*)e,f); }
 
 /* ── Process / memory syscall wrappers ────────────────────────────────────── */
 static int64_t sc_getpid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
@@ -863,6 +926,10 @@ static int64_t sc_tgkill(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,
     (void)d;(void)e;(void)f;
     return sys_tgkill((int)a, (int)b, (int)c);
 }
+static int64_t sc_tkill(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)c;(void)d;(void)e;(void)f;
+    return sys_tkill((int)a, (int)b);
+}
 
 static int64_t sc_set_robust_list(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
     (void)c;(void)d;(void)e;(void)f;
@@ -1086,6 +1153,7 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_WAIT4]     = sc_wait4,
     [SYS_KILL]      = sc_kill,
     [SYS_UNAME]     = sc_uname,
+    [SYS_TKILL]     = sc_tkill,
     [SYS_TGKILL]    = sc_tgkill,
     [SYS_GETCWD]    = sc_getcwd,
     [SYS_CHDIR]     = sc_chdir,
@@ -1165,6 +1233,26 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_FCHMODAT]       = sc_fchmodat,
         [SYS_EVENTFD2]       = sc_eventfd2,
     [SYS_FACCESSAT]      = sc_faccessat,
+    /* Phase 6 additions */
+    [SYS_MADVISE]        = sc_madvise,
+    [SYS_SENDMSG]        = sc_sendmsg,
+    [SYS_RECVMSG]        = sc_recvmsg,
+    [SYS_FLOCK]          = sc_flock,
+    [SYS_TRUNCATE]       = sc_truncate,
+    [SYS_FTRUNCATE]      = sc_ftruncate,
+    [SYS_LINK]           = sc_link,
+    [SYS_MKNOD]          = sc_mknod,
+    [SYS_STATFS]         = sc_statfs,
+    [SYS_FSTATFS]        = sc_fstatfs,
+    [SYS_EPOLL_CREATE]   = sc_epoll_create1, /* epoll_create maps to create1 */
+    [SYS_EPOLL_WAIT]     = sc_epoll_wait,
+    [SYS_EPOLL_CTL]      = sc_epoll_ctl,
+    [SYS_EPOLL_PWAIT]    = sc_epoll_pwait,
+    [SYS_FALLOCATE]      = sc_fallocate,
+    [SYS_ACCEPT4]        = sc_accept4,
+    [SYS_EPOLL_CREATE1]  = sc_epoll_create1,
+    [SYS_INOTIFY_INIT1]  = sc_inotify_init1,
+    [SYS_MEMFD_CREATE]   = sc_memfd_create,
 };
 
 /* ── INT 0x80 handler ─────────────────────────────────────────────────────── */

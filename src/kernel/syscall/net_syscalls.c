@@ -27,9 +27,12 @@ extern int64_t sys_pipe2(int pipefd[2], int flags);
 #define TCSETS      0x5402
 #define TCSETSW     0x5403
 #define TCSETSF     0x5404
+#define TIOCSCTTY   0x540E
 #define TIOCGPGRP   0x540F
 #define TIOCSPGRP   0x5410
 #define TIOCGWINSZ  0x5413
+#define TIOCSWINSZ  0x5414
+#define TIOCNOTTY   0x5422
 #define FIONBIO     0x5421
 
 /* socket interface ioctls used by ifconfig */
@@ -163,6 +166,7 @@ void tty_signal_foreground(int sig) {
 static inline bool is_tty_path(const char *path) {
     if (!path || !path[0]) return false;
     return strcmp(path, "/dev/tty") == 0 ||
+           strcmp(path, "/dev/console") == 0 ||
            strcmp(path, "/dev/stdin") == 0 ||
            strcmp(path, "/dev/stdout") == 0 ||
            strcmp(path, "/dev/stderr") == 0;
@@ -217,6 +221,27 @@ static int tty_ioctl(file_t *f, unsigned long cmd, unsigned long arg) {
         ws->ws_ypixel = (uint16_t)((ypx > 0) ? ypx : 480);
         return 0;
     }
+    if (cmd == TIOCSWINSZ) {
+        /* update window size and deliver SIGWINCH to foreground process group */
+        const kernel_winsize_t *ws = (const kernel_winsize_t *)(uintptr_t)arg;
+        (void)ws; /* fbcon drives real dimensions; just signal SIGWINCH */
+        tty_signal_foreground(28); /* SIGWINCH = 28 */
+        return 0;
+    }
+    if (cmd == TIOCSCTTY) {
+        /* make this terminal the controlling terminal of the calling session
+         * Linux: sets tty->session = current->session, tty->pgrp = current->pgrp */
+        task_t *cur = sched_current();
+        if (cur) {
+            g_tty_fg_pgid = (int)cur->pgid;
+        }
+        return 0;
+    }
+    if (cmd == TIOCNOTTY) {
+        /* detach from controlling terminal — Linux sets current->signal->tty = NULL */
+        /* We have a single global TTY so nothing to detach; just succeed */
+        return 0;
+    }
     return -EINVAL;
 }
 
@@ -230,14 +255,13 @@ int64_t sys_socket(int domain, int type, int protocol) {
 /* ── socketpair(2) ───────────────────────────────────────────────────────── */
 int64_t sys_socketpair(int domain, int type, int protocol, int sv[2]) {
     if (!sv) return -EFAULT;
-
     int base_type = type & ~(SOCK_NONBLOCK | SOCK_CLOEXEC);
-    if ((domain != AF_UNIX && domain != AF_LOCAL) || base_type != SOCK_STREAM)
-        return -EINVAL;
-    if (protocol != 0) return -EINVAL;
-
-    /* Minimal AF_UNIX support for resolver/event channels. */
-    return sys_pipe2(sv, type & (SOCK_NONBLOCK | SOCK_CLOEXEC));
+    if (domain != AF_UNIX && domain != AF_LOCAL) return -EINVAL;
+    if (base_type != SOCK_STREAM && base_type != SOCK_DGRAM &&
+        base_type != SOCK_SEQPACKET) return -EINVAL;
+    (void)protocol;
+    extern int unix_socketpair(int type, int sv[2]);
+    return (int64_t)unix_socketpair(type, sv);
 }
 
 /* ── connect(2) ──────────────────────────────────────────────────────────── */
@@ -515,4 +539,126 @@ int64_t sys_ioctl(int fd, unsigned long cmd, unsigned long arg) {
         return (int64_t)tty_ioctl(f, cmd, arg);
 
     return -EINVAL;
+}
+
+/* ── sendmsg(2) ──────────────────────────────────────────────────────────── */
+int64_t sys_sendmsg(int fd, const msghdr_t *msg, int flags) {
+    if (!msg) return -EFAULT;
+
+    /* SCM_RIGHTS: if control message present, pass fds to peer's unix_sock */
+    if (msg->msg_control && msg->msg_controllen >= 12) {
+        /* struct cmsghdr { uint32_t len; int level; int type; } + payload */
+        const uint8_t *ctrl = (const uint8_t *)msg->msg_control;
+        uint32_t cmsg_len   = *(const uint32_t *)(ctrl + 0);
+        int      cmsg_level = *(const int *)(ctrl + 4);
+        int      cmsg_type  = *(const int *)(ctrl + 8);
+        if (cmsg_level == 1 /* SOL_SOCKET */ && cmsg_type == 1 /* SCM_RIGHTS */) {
+            uint32_t data_len = cmsg_len > 12 ? cmsg_len - 12 : 0;
+            int nfds = (int)(data_len / sizeof(int));
+            const int *fds_in = (const int *)(ctrl + 12);
+            socket_t *sk = socket_from_fd(fd);
+            if (sk && sk->domain == AF_UNIX) {
+                extern void *unix_sock_from_socket(socket_t *sk);
+                extern void *unix_sock_get_peer(void *us);
+                extern void  unix_push_files(void *, file_t **, int);
+                void *us   = unix_sock_from_socket(sk);
+                void *peer = unix_sock_get_peer(us);
+                if (peer) {
+                    task_t *t = sched_current();
+                    file_t *fptrs[16];
+                    int n = nfds > 16 ? 16 : nfds;
+                    for (int i = 0; i < n; i++) fptrs[i] = fd_get(t, fds_in[i]);
+                    unix_push_files(peer, fptrs, n);
+                }
+            }
+        }
+    }
+
+    ssize_t total = 0;
+    for (uint64_t i = 0; i < msg->msg_iovlen; i++) {
+        ssize_t r = sys_sendto(fd, msg->msg_iov[i].iov_base, msg->msg_iov[i].iov_len,
+                               flags, (const struct sockaddr *)msg->msg_name, msg->msg_namelen);
+        if (r < 0) return (total > 0) ? total : r;
+        total += r;
+    }
+    return total;
+}
+
+/* ── recvmsg(2) ──────────────────────────────────────────────────────────── */
+int64_t sys_recvmsg(int fd, msghdr_t *msg, int flags) {
+    if (!msg) return -EFAULT;
+    ssize_t total = 0;
+    for (uint64_t i = 0; i < msg->msg_iovlen; i++) {
+        socklen_t fromlen = msg->msg_namelen;
+        ssize_t r = sys_recvfrom(fd, msg->msg_iov[i].iov_base, msg->msg_iov[i].iov_len,
+                                 flags, (struct sockaddr *)msg->msg_name, &fromlen);
+        if (r < 0) return (total > 0) ? total : r;
+        if (r == 0) break;
+        total += r;
+        msg->msg_namelen = fromlen;
+    }
+    msg->msg_flags = 0;
+
+    /* Fill ancillary data: SCM_CREDENTIALS + SCM_RIGHTS */
+    if (msg->msg_control && msg->msg_controllen >= 24) {
+        uint8_t *ctrl = (uint8_t *)msg->msg_control;
+        uint64_t cap  = msg->msg_controllen;
+        uint64_t pos  = 0;
+
+        /* SCM_CREDENTIALS (24 bytes: 12-byte cmsghdr + 12-byte ucred) */
+        if (cap - pos >= 24) {
+            task_t *cur = sched_current();
+            uint32_t *c = (uint32_t *)(ctrl + pos);
+            c[0] = 24;                     /* cmsg_len */
+            c[1] = 1;                      /* SOL_SOCKET */
+            c[2] = 2;                      /* SCM_CREDENTIALS */
+            c[3] = cur ? cur->pid : 0;     /* pid */
+            c[4] = cur ? cur->uid : 0;     /* uid */
+            c[5] = cur ? cur->gid : 0;     /* gid */
+            pos += 24;
+        }
+
+        /* SCM_RIGHTS: dequeue any pending fds */
+        socket_t *sk = socket_from_fd(fd);
+        if (sk && sk->domain == AF_UNIX && cap - pos >= 12) {
+            extern void *unix_sock_from_socket(socket_t *);
+            extern int   unix_pop_files(void *, task_t *, int *, int);
+            void *us = unix_sock_from_socket(sk);
+            if (us) {
+                int out_fds[16];
+                int maxfds = (int)((cap - pos - 12) / sizeof(int));
+                if (maxfds > 16) maxfds = 16;
+                task_t *cur = sched_current();
+                int n = unix_pop_files(us, cur, out_fds, maxfds);
+                if (n > 0) {
+                    uint32_t rights_len = 12 + (uint32_t)(n * sizeof(int));
+                    uint32_t *r = (uint32_t *)(ctrl + pos);
+                    r[0] = rights_len;  /* cmsg_len */
+                    r[1] = 1;           /* SOL_SOCKET */
+                    r[2] = 1;           /* SCM_RIGHTS */
+                    memcpy(ctrl + pos + 12, out_fds, (size_t)(n * sizeof(int)));
+                    pos += rights_len;
+                }
+            }
+        }
+        msg->msg_controllen = pos;
+    } else {
+        msg->msg_controllen = 0;
+    }
+    return total;
+}
+
+/* ── accept4(2) ──────────────────────────────────────────────────────────── */
+int64_t sys_accept4(int fd, struct sockaddr *addr, socklen_t *addrlen, int flags) {
+    int64_t nfd = sys_accept(fd, addr, addrlen);
+    if (nfd < 0) return nfd;
+    if (flags) {
+        task_t *t = sched_current();
+        file_t *f = fd_get(t, (int)nfd);
+        if (f) {
+            if (flags & SOCK_NONBLOCK) f->flags |= O_NONBLOCK;
+            if (flags & SOCK_CLOEXEC)  t->fd_flags[(int)nfd] |= FD_CLOEXEC;
+        }
+    }
+    return nfd;
 }

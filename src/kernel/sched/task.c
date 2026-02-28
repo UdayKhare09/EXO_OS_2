@@ -134,6 +134,7 @@ static task_t *task_alloc_common(const char *name, uint32_t cpu_id) {
     strncpy(t->name, name ? name : "unnamed", TASK_NAME_MAX - 1);
     t->cwd[0] = '/';
     t->cwd[1] = '\0';
+    t->exe_path[0] = '\0';   /* set by execve; empty for kernel threads (linux: /proc/pid/exe unresolvable) */
     task_register(t);
 
     return t;
@@ -198,6 +199,8 @@ void task_destroy(task_t *t) {
     signal_table_free(t->sig_handlers);  t->sig_handlers = NULL;
     sigaction_table_free(t->sigactions); t->sigactions   = NULL;
     ipc_mailbox_destroy(t->mailbox);     t->mailbox      = NULL;
+
+    if (t->env_block) { kfree(t->env_block); t->env_block = NULL; }
 
     /* Free VMAs */
     vma_t *v = t->vma_list;

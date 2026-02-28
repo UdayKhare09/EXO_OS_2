@@ -81,6 +81,7 @@
 #define SYS_ARCH_PRCTL  158
 #define SYS_SYNC        162
 #define SYS_GETTID      186
+#define SYS_TKILL       200
 #define SYS_FUTEX       202
 #define SYS_GETDENTS64  217
 #define SYS_SET_TID_ADDRESS 218
@@ -97,11 +98,34 @@
 #define SYS_SET_ROBUST_LIST 273
 #define SYS_GET_ROBUST_LIST 274
 #define SYS_UTIMENSAT   280
-#define SYS_EVENTFD2    290
+#define SYS_MADVISE     28
+#define SYS_SENDMSG     46
+#define SYS_RECVMSG     47
+#define SYS_FLOCK       73
+#define SYS_TRUNCATE    76
+#define SYS_FTRUNCATE   77
+#define SYS_LINK        86
+#define SYS_MKNOD       133
+#define SYS_STATFS      137
+#define SYS_FSTATFS     138
+#define SYS_EPOLL_CREATE   213
+#define SYS_EPOLL_WAIT     232
+#define SYS_EPOLL_CTL      233
+#define SYS_EPOLL_PWAIT    281
+#define SYS_FALLOCATE      285
+#define SYS_TIMERFD_CREATE 283
+#define SYS_TIMERFD_SETTIME 286
+#define SYS_TIMERFD_GETTIME 287
+#define SYS_ACCEPT4        288
+#define SYS_SIGNALFD4      289
+#define SYS_EVENTFD2       290
+#define SYS_EPOLL_CREATE1  291
 #define SYS_DUP3        292
 #define SYS_PIPE2       293
+#define SYS_INOTIFY_INIT1  294
 #define SYS_PRLIMIT64   302
 #define SYS_GETRANDOM   318
+#define SYS_MEMFD_CREATE   319
 #define SYS_CLONE3      435
 
 /* *at constants */
@@ -210,6 +234,50 @@ typedef struct {
     int64_t  tv_sec;
     int64_t  tv_nsec;
 } kernel_timespec_t;
+
+/* Linux statfs (x86-64) */
+typedef struct {
+    long     f_type;
+    long     f_bsize;
+    uint64_t f_blocks;
+    uint64_t f_bfree;
+    uint64_t f_bavail;
+    uint64_t f_files;
+    uint64_t f_ffree;
+    int32_t  f_fsid[2];
+    long     f_namelen;
+    long     f_frsize;
+    long     f_flags;
+    long     f_spare[4];
+} linux_statfs_t;
+
+/* epoll_event (packed — Linux x86-64 ABI) */
+#define EPOLLIN    0x00000001u
+#define EPOLLPRI   0x00000002u
+#define EPOLLOUT   0x00000004u
+#define EPOLLERR   0x00000008u
+#define EPOLLHUP   0x00000010u
+#define EPOLLRDHUP 0x00002000u
+#define EPOLLET    0x80000000u
+#define EPOLLONESHOT 0x40000000u
+#define EPOLL_CTL_ADD 1
+#define EPOLL_CTL_DEL 2
+#define EPOLL_CTL_MOD 3
+typedef struct {
+    uint32_t events;
+    uint64_t data;
+} __attribute__((packed)) epoll_event_t;
+
+/* msghdr for sendmsg/recvmsg */
+typedef struct {
+    void       *msg_name;
+    uint32_t    msg_namelen;
+    iovec_t    *msg_iov;
+    uint64_t    msg_iovlen;
+    void       *msg_control;
+    uint64_t    msg_controllen;
+    int         msg_flags;
+} msghdr_t;
 
 void syscall_init(void);
 void syscall_init_fast(void);  /* per-CPU SYSCALL MSR setup (call on each AP) */

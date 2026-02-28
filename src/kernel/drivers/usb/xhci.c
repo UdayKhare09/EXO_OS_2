@@ -40,6 +40,7 @@ static inline uint32_t op_read32(uint32_t off) {
 static inline void op_write32(uint32_t off, uint32_t v) {
     *(volatile uint32_t *)(g_xhci.op_base + off) = v;
 }
+static inline uint64_t op_read64(uint32_t off) __attribute__((unused));
 static inline uint64_t op_read64(uint32_t off) {
     uint64_t lo = op_read32(off);
     uint64_t hi = op_read32(off + 4);

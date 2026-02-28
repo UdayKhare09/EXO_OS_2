@@ -113,6 +113,9 @@ typedef struct task {
     struct file         *fd_table[TASK_FD_TABLE_SIZE];   /* open files        */
     uint8_t              fd_flags[TASK_FD_TABLE_SIZE];   /* per-fd flags (FD_CLOEXEC) */
     char                 cwd[TASK_CWD_MAX];              /* current working dir */
+    char                 exe_path[TASK_CWD_MAX];         /* executable absolute path */
+    char                *env_block;                      /* NUL-separated environ (kernel copy) */
+    uint32_t             env_block_size;                 /* byte length of env_block */
 } task_t;
 
 /* Create a new kernel task; returns NULL on error */

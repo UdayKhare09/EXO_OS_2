@@ -183,12 +183,17 @@ static ssize_t tmpfs_write(vnode_t *v, const void *buf, size_t len, uint64_t off
 
 static int tmpfs_readdir(vnode_t *dir, uint64_t *cookie, vfs_dirent_t *out) {
     tmpfs_inode_t *dti = vnode_ti(dir);
-    /* cookie = pointer (cast) to the current tmpfs_dirent_t, or 0 for start */
+    /* cookie = 0          → start from dir_head
+     * cookie = ~0ULL      → end-of-list sentinel (prevents NULL-pointer restart)
+     * cookie = <ptr>      → resume from this tmpfs_dirent_t *
+     */
+#define TMPFS_COOKIE_EOF (~(uint64_t)0)
     tmpfs_dirent_t *cur;
     if (*cookie == 0) {
         cur = dti->dir_head;
+    } else if (*cookie == TMPFS_COOKIE_EOF) {
+        return 0;
     } else {
-        /* Walk from head until we find the entry at the stored pointer */
         cur = (tmpfs_dirent_t *)(uintptr_t)*cookie;
     }
     if (!cur) return 0;
@@ -197,7 +202,7 @@ static int tmpfs_readdir(vnode_t *dir, uint64_t *cookie, vfs_dirent_t *out) {
     uint32_t ifmt = cur->inode->mode & VFS_S_IFMT;
     out->type = (ifmt == VFS_S_IFDIR) ? VFS_DT_DIR :
                 (ifmt == VFS_S_IFLNK) ? VFS_DT_LNK : VFS_DT_REG;
-    *cookie = (uint64_t)(uintptr_t)cur->next;
+    *cookie = cur->next ? (uint64_t)(uintptr_t)cur->next : TMPFS_COOKIE_EOF;
     return 1;
 }
 

@@ -519,6 +519,7 @@ static void fill_linux_stat(linux_stat_t *lst, const vfs_stat_t *st) {
     lst->st_blocks = (int64_t)((st->size + 511) / 512);
     lst->st_atime  = (uint64_t)st->atime;
     lst->st_mtime  = (uint64_t)st->mtime;
+    lst->st_rdev   = st->rdev;
     lst->st_ctime  = (uint64_t)st->ctime;
 }
 
@@ -1040,4 +1041,112 @@ int64_t sys_brk(uint64_t addr) {
     }
 
     return (int64_t)new_brk;
+}
+
+/* ── truncate(2) / ftruncate(2) ───────────────────────────────────────────── */
+int64_t sys_truncate(const char *path, int64_t length) {
+    if (!path) return -EFAULT;
+    if (length < 0) return -EINVAL;
+    char resolved[VFS_MOUNT_PATH_MAX];
+    if (resolve_path(path, resolved) < 0) return -ENOENT;
+    int r = vfs_truncate(resolved, (uint64_t)length);
+    return r < 0 ? r : 0;
+}
+
+int64_t sys_ftruncate(int fd, int64_t length) {
+    if (length < 0) return -EINVAL;
+    task_t *t = sched_current(); if (!t) return -ESRCH;
+    if (fd < 0 || fd >= FD_TABLE_SIZE || !t->fd_table[fd]) return -EBADF;
+    file_t *f = t->fd_table[fd];
+    if (!f->vnode || !f->vnode->ops || !f->vnode->ops->truncate) return -EINVAL;
+    f->vnode->ops->truncate(f->vnode, (uint64_t)length);
+    return 0;
+}
+
+/* ── link(2) ──────────────────────────────────────────────────────────────── */
+int64_t sys_link(const char *oldpath, const char *newpath) {
+    (void)oldpath; (void)newpath;
+    return -EPERM;  /* hard links not implemented */
+}
+
+/* ── mknod(2) ─────────────────────────────────────────────────────────────── */
+int64_t sys_mknod(const char *path, uint32_t mode, uint64_t dev) {
+    (void)dev;
+    if (!path) return -EFAULT;
+    /* Only support creation of regular files via mknod */
+    if ((mode & 0170000) != 0100000) return -EPERM;
+    int fd = (int)sys_open(path, SYS_O_CREAT | SYS_O_TRUNC | SYS_O_WRONLY, mode & 07777);
+    if (fd < 0) return fd;
+    return sys_close(fd);
+}
+
+/* ── statfs(2) / fstatfs(2) ───────────────────────────────────────────────── */
+static void fill_statfs(linux_statfs_t *st, uint64_t total_kb, uint64_t free_kb,
+                        long fstype) {
+    st->f_type    = fstype;
+    st->f_bsize   = 4096;
+    st->f_blocks  = total_kb / 4;
+    st->f_bfree   = free_kb / 4;
+    st->f_bavail  = free_kb / 4;
+    st->f_files   = 65536;
+    st->f_ffree   = 32768;
+    st->f_fsid[0] = st->f_fsid[1] = 0;
+    st->f_namelen = 255;
+    st->f_frsize  = 4096;
+    st->f_flags   = 4096; /* ST_RELATIME */
+}
+
+int64_t sys_statfs(const char *path, linux_statfs_t *buf) {
+    if (!path || !buf) return -EFAULT;
+    extern uint64_t pmm_get_total_pages(void);
+    extern uint64_t pmm_get_free_pages(void);
+    uint64_t total_kb = (pmm_get_total_pages() * 4096) / 1024;
+    uint64_t free_kb  = (pmm_get_free_pages()  * 4096) / 1024;
+    fill_statfs(buf, total_kb, free_kb, 0xEF53L /* EXT2_SUPER_MAGIC */);
+    return 0;
+}
+
+int64_t sys_fstatfs(int fd, linux_statfs_t *buf) {
+    (void)fd;
+    if (!buf) return -EFAULT;
+    extern uint64_t pmm_get_total_pages(void);
+    extern uint64_t pmm_get_free_pages(void);
+    uint64_t total_kb = (pmm_get_total_pages() * 4096) / 1024;
+    uint64_t free_kb  = (pmm_get_free_pages()  * 4096) / 1024;
+    fill_statfs(buf, total_kb, free_kb, 0xEF53L);
+    return 0;
+}
+
+/* ── flock(2) ─────────────────────────────────────────────────────────────── */
+int64_t sys_flock(int fd, int operation) {
+    (void)fd; (void)operation;
+    return 0;  /* advisory locks: always succeed */
+}
+
+/* ── fallocate(2) ─────────────────────────────────────────────────────────── */
+int64_t sys_fallocate(int fd, int mode, int64_t offset, int64_t len) {
+    (void)mode; (void)offset; (void)len;
+    task_t *t = sched_current(); if (!t) return -ESRCH;
+    if (fd < 0 || fd >= FD_TABLE_SIZE || !t->fd_table[fd]) return -EBADF;
+    return 0;
+}
+
+/* ── madvise(2) ───────────────────────────────────────────────────────────── */
+int64_t sys_madvise(void *addr, uint64_t length, int advice) {
+    (void)addr; (void)length; (void)advice;
+    return 0;
+}
+
+/* ── memfd_create(2) ──────────────────────────────────────────────────────── */
+int64_t sys_memfd_create(const char *name, unsigned int flags) {
+    (void)name; (void)flags;
+    /* Create an anonymous tmpfs file */
+    task_t *t = sched_current(); if (!t) return -ESRCH;
+    return sys_open("/tmp/.memfd", 0100 | 02 | 01000, 0600); /* O_CREAT|O_RDWR|O_TRUNC */
+}
+
+/* ── inotify_init1(2) — stub ─────────────────────────────────────────────── */
+int64_t sys_inotify_init1(int flags) {
+    (void)flags;
+    return -ENOSYS;
 }

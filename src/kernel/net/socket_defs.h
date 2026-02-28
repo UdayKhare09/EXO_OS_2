@@ -22,6 +22,7 @@
 /* ── Socket types ────────────────────────────────────────────────────────── */
 #define SOCK_STREAM    1    /* TCP */
 #define SOCK_DGRAM     2    /* UDP */
+#define SOCK_SEQPACKET 5    /* sequenced, reliable, connection-based */
 #define SOCK_RAW       3    /* raw IP */
 #define SOCK_NONBLOCK  0x800
 #define SOCK_CLOEXEC   0x80000
