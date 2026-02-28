@@ -11,6 +11,7 @@ struct file;
 #define TASK_NAME_MAX     32
 #define TASK_FD_TABLE_SIZE 256
 #define TASK_CWD_MAX      512
+#define TASK_MAX_GROUPS   8
 
 typedef enum {
     TASK_RUNNABLE  = 0,
@@ -59,7 +60,10 @@ typedef struct task {
     uint32_t      ppid;             /* parent process ID                        */
     uint32_t      pgid;             /* process group ID                         */
     uint32_t      sid;              /* session ID                               */
-    uint32_t      uid, gid;         /* user/group (always 0 = root for now)     */
+    uint32_t      uid, gid;         /* effective user/group IDs                  */
+    uint32_t      umask;            /* process file-mode creation mask           */
+    uint32_t      groups[TASK_MAX_GROUPS]; /* supplementary groups              */
+    uint32_t      group_count;      /* number of valid entries in groups[]       */
     struct task  *parent;           /* parent task pointer                      */
     struct task  *children;         /* first child (linked via child_next)      */
     struct task  *child_next;       /* next sibling (in parent's children list) */
@@ -94,12 +98,13 @@ typedef struct task {
 
     /* ── Thread support ──────────────────────────────────────────────────── */
     uint64_t      fs_base;          /* FS base (TLS pointer for user-space)      */
-    uint64_t     *clear_child_tid;  /* set_tid_address: write 0 + futex on exit  */
+    uint32_t     *clear_child_tid;  /* set_tid_address: write 0 + futex on exit  */
     uint64_t      robust_list_head; /* set_robust_list head pointer (user VA)    */
     uint64_t      robust_list_len;  /* ABI size for robust list head             */
 
     /* ── Filesystem ──────────────────────────────────────────────────────── */
     struct file         *fd_table[TASK_FD_TABLE_SIZE];   /* open files        */
+    uint8_t              fd_flags[TASK_FD_TABLE_SIZE];   /* per-fd flags (FD_CLOEXEC) */
     char                 cwd[TASK_CWD_MAX];              /* current working dir */
 } task_t;
 

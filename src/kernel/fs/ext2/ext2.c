@@ -588,6 +588,28 @@ static uint32_t ext2_inode_clear_block(ext2_sb_t *sb, ext2_inode_t *inode,
 static inline ext2_sb_t *get_sb(vnode_t *v) { return (ext2_sb_t *)v->fsi->priv; }
 static inline uint32_t   get_ino(vnode_t *v) { return ((ext2_node_t*)v->fs_data)->ino; }
 
+static int ext2_chmod(vnode_t *v, uint32_t mode) {
+    ext2_sb_t *sb = get_sb(v);
+    ext2_inode_t inode;
+    if (ext2_read_inode(sb, get_ino(v), &inode) < 0) return -EIO;
+    inode.i_mode = (uint16_t)((inode.i_mode & EXT2_IFMT) | (mode & 0x0FFF));
+    if (ext2_write_inode(sb, get_ino(v), &inode) < 0) return -EIO;
+    v->mode = (v->mode & VFS_S_IFMT) | (mode & 0777);
+    return 0;
+}
+
+static int ext2_chown(vnode_t *v, int owner, int group) {
+    ext2_sb_t *sb = get_sb(v);
+    ext2_inode_t inode;
+    if (ext2_read_inode(sb, get_ino(v), &inode) < 0) return -EIO;
+    if (owner >= 0) inode.i_uid = (uint16_t)owner;
+    if (group >= 0) inode.i_gid = (uint16_t)group;
+    if (ext2_write_inode(sb, get_ino(v), &inode) < 0) return -EIO;
+    if (owner >= 0) v->uid = (uint32_t)owner;
+    if (group >= 0) v->gid = (uint32_t)group;
+    return 0;
+}
+
 /* ── Build vnode from inode number ────────────────────────────────────────── */
 static vnode_t *make_vnode(ext2_sb_t *sb, fs_inst_t *fsi, uint32_t ino,
                             ext2_inode_t *inode) {
@@ -1167,6 +1189,8 @@ fs_ops_t g_ext2_ops = {
     .symlink  = ext2_symlink,
     .readlink = ext2_readlink,
     .truncate = ext2_truncate,
+    .chmod    = ext2_chmod,
+    .chown    = ext2_chown,
     .sync     = ext2_sync_v,
     .evict    = ext2_evict,
     .mount    = ext2_mount,

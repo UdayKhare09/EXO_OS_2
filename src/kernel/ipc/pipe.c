@@ -227,9 +227,14 @@ int64_t sys_pipe2(int pipefd[2], int flags) {
         return -EMFILE;
     }
 
-    if (flags & 0x80000) {  /* O_CLOEXEC */
-        rf->fd_flags |= FD_CLOEXEC;
-        wf->fd_flags |= FD_CLOEXEC;
+    if (flags & O_NONBLOCK) {
+        rf->flags |= O_NONBLOCK;
+        wf->flags |= O_NONBLOCK;
+    }
+
+    if (flags & O_CLOEXEC) {
+        cur->fd_flags[rfd] |= FD_CLOEXEC;
+        cur->fd_flags[wfd] |= FD_CLOEXEC;
     }
 
     pipefd[0] = rfd;

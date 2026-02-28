@@ -317,6 +317,26 @@ static int tmpfs_truncate(vnode_t *v, uint64_t size) {
     return 0;
 }
 
+static int tmpfs_chmod(vnode_t *v, uint32_t mode) {
+    tmpfs_inode_t *ti = vnode_ti(v);
+    ti->mode = (ti->mode & VFS_S_IFMT) | (mode & 0777);
+    v->mode  = ti->mode;
+    return 0;
+}
+
+static int tmpfs_chown(vnode_t *v, int owner, int group) {
+    tmpfs_inode_t *ti = vnode_ti(v);
+    if (owner >= 0) {
+        ti->uid = (uint32_t)owner;
+        v->uid = (uint32_t)owner;
+    }
+    if (group >= 0) {
+        ti->gid = (uint32_t)group;
+        v->gid = (uint32_t)group;
+    }
+    return 0;
+}
+
 static int tmpfs_sync_v(vnode_t *v) { (void)v; return 0; }
 
 static void tmpfs_evict(vnode_t *v) {
@@ -378,6 +398,8 @@ fs_ops_t g_tmpfs_ops = {
     .symlink  = tmpfs_symlink,
     .readlink = tmpfs_readlink,
     .truncate = tmpfs_truncate,
+    .chmod    = tmpfs_chmod,
+    .chown    = tmpfs_chown,
     .sync     = tmpfs_sync_v,
     .evict    = tmpfs_evict,
     .mount    = tmpfs_mount,

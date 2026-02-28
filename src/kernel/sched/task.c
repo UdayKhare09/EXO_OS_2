@@ -80,6 +80,9 @@ static task_t *task_alloc_common(const char *name, uint32_t cpu_id) {
     t->sid    = t->pid;
     t->uid    = 0;
     t->gid    = 0;
+    t->umask  = 022;
+    t->group_count = 1;
+    t->groups[0] = t->gid;
     t->parent = NULL;
     t->children   = NULL;
     t->child_next = NULL;

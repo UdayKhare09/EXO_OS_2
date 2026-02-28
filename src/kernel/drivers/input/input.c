@@ -10,7 +10,7 @@ extern void tty_signal_foreground(int sig);
 input_ring_t g_kbd_ring;
 input_ring_t g_mouse_ring;
 
-#define TTY_CHAR_RING_SIZE 256u
+#define TTY_CHAR_RING_SIZE 1024u
 static char g_tty_chars[TTY_CHAR_RING_SIZE];
 static volatile uint32_t g_tty_head;
 static volatile uint32_t g_tty_tail;
@@ -86,8 +86,11 @@ void input_push_key(uint8_t modifiers, uint8_t keycode, uint8_t state) {
         .keycode   = keycode,
         .modifiers = modifiers,
     };
-    if (!ring_push(&g_kbd_ring, &ev))
-        KLOG_WARN("input: keyboard ring full, event dropped\n");
+    if (!ring_push(&g_kbd_ring, &ev)) {
+        input_event_t dropped;
+        (void)ring_pop(&g_kbd_ring, &dropped);
+        (void)ring_push(&g_kbd_ring, &ev);
+    }
 
     if (state == INPUT_KEY_PRESS) {
         if (modifiers & MOD_CTRL) {
@@ -148,7 +151,7 @@ static const char keycode_normal[0x40] = {
     [0x1D]='z',
     [0x1E]='1',[0x1F]='2',[0x20]='3',[0x21]='4',[0x22]='5',
     [0x23]='6',[0x24]='7',[0x25]='8',[0x26]='9',[0x27]='0',
-    [0x28]='\n',[0x29]=0x1B,[0x2A]='\b',[0x2B]='\t',[0x2C]=' ',
+    [0x28]='\r',[0x29]=0x1B,[0x2A]='\b',[0x2B]='\t',[0x2C]=' ',
     [0x2D]='-',[0x2E]='=',[0x2F]='[',[0x30]=']',[0x31]='\\',
     [0x33]=';',[0x34]='\'',[0x35]='`',[0x36]=',',[0x37]='.',
     [0x38]='/',
@@ -163,7 +166,7 @@ static const char keycode_shifted[0x40] = {
     [0x1D]='Z',
     [0x1E]='!',[0x1F]='@',[0x20]='#',[0x21]='$',[0x22]='%',
     [0x23]='^',[0x24]='&',[0x25]='*',[0x26]='(',[0x27]=')',
-    [0x28]='\n',[0x29]=0x1B,[0x2A]='\b',[0x2B]='\t',[0x2C]=' ',
+    [0x28]='\r',[0x29]=0x1B,[0x2A]='\b',[0x2B]='\t',[0x2C]=' ',
     [0x2D]='_',[0x2E]='+',[0x2F]='{',[0x30]='}',[0x31]='|',
     [0x33]=':',[0x34]='"',[0x35]='~',[0x36]='<',[0x37]='>',
     [0x38]='?',

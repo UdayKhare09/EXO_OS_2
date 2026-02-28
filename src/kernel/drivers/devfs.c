@@ -20,6 +20,16 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#define TTY_IFLAG_ICRNL 0x00000100U
+#define TTY_OFLAG_OPOST 0x00000001U
+#define TTY_OFLAG_ONLCR 0x00000004U
+#define TTY_LFLAG_ICANON 0x00000002U
+
+/* Exposed by syscall/net_syscalls.c */
+extern uint32_t tty_get_iflag(void);
+extern uint32_t tty_get_oflag(void);
+extern uint32_t tty_get_lflag(void);
+
 static inline uint64_t devfs_rdtsc(void) {
     uint32_t lo, hi;
     __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
@@ -112,15 +122,21 @@ static ssize_t devfs_read(vnode_t *v, void *buf, size_t len, uint64_t off) {
             if (len == 0) return 0;
             char *dst = (char *)buf;
             size_t done = 0;
+            uint32_t iflag = tty_get_iflag();
+            uint32_t lflag = tty_get_lflag();
+            bool canonical = (lflag & TTY_LFLAG_ICANON) != 0;
+            bool map_crnl = (iflag & TTY_IFLAG_ICRNL) != 0;
+
             while (done < len) {
                 char ch = 0;
                 if (input_tty_getchar_nonblock(&ch) == 0) {
-                    if (ch == '\r') ch = '\n';
+                    if (map_crnl && ch == '\r') ch = '\n';
                     dst[done++] = ch;
 
-                    if (ch == '\n') break;
+                    if (canonical && ch == '\n') break;
                     continue;
                 }
+
                 if (done > 0) break;
                 sched_sleep(1);
             }
@@ -199,8 +215,15 @@ static ssize_t devfs_write(vnode_t *v, const void *buf, size_t len, uint64_t off
             fbcon_t *con = fbcon_get();
             if (con) {
                 const char *s = (const char *)buf;
-                for (size_t i = 0; i < len; i++)
-                    fbcon_putchar_inst(con, s[i]);
+                uint32_t oflag = tty_get_oflag();
+                bool post = (oflag & TTY_OFLAG_OPOST) != 0;
+                bool onlcr = (oflag & TTY_OFLAG_ONLCR) != 0;
+                for (size_t i = 0; i < len; i++) {
+                    char ch = s[i];
+                    if (post && onlcr && ch == '\n')
+                        fbcon_putchar_inst(con, '\r');
+                    fbcon_putchar_inst(con, ch);
+                }
             }
             return (ssize_t)len;
         }

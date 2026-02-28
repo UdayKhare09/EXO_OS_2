@@ -13,11 +13,14 @@
 #include "net/socket_defs.h"
 #include "drivers/net/netdev.h"
 #include "drivers/input/input.h"
+#include "gfx/fbcon.h"
 #include "sched/sched.h"
 #include "sched/task.h"
 #include "ipc/signal.h"
 #include "lib/klog.h"
 #include "lib/string.h"
+
+extern int64_t sys_pipe2(int pipefd[2], int flags);
 
 /* ioctl requests (Linux ABI subset) */
 #define TCGETS      0x5401
@@ -130,6 +133,18 @@ static kernel_termios_t g_tty_termios = {
 
 static int g_tty_fg_pgid = 1;
 
+uint32_t tty_get_iflag(void) {
+    return g_tty_termios.c_iflag;
+}
+
+uint32_t tty_get_lflag(void) {
+    return g_tty_termios.c_lflag;
+}
+
+uint32_t tty_get_oflag(void) {
+    return g_tty_termios.c_oflag;
+}
+
 void tty_set_fg_pgid(int pgid) {
     g_tty_fg_pgid = pgid;
 }
@@ -145,8 +160,16 @@ void tty_signal_foreground(int sig) {
     }
 }
 
+static inline bool is_tty_path(const char *path) {
+    if (!path || !path[0]) return false;
+    return strcmp(path, "/dev/tty") == 0 ||
+           strcmp(path, "/dev/stdin") == 0 ||
+           strcmp(path, "/dev/stdout") == 0 ||
+           strcmp(path, "/dev/stderr") == 0;
+}
+
 static inline bool is_tty_file(const file_t *f) {
-    return f && f->path[0] && strcmp(f->path, "/dev/tty") == 0;
+    return f && is_tty_path(f->path);
 }
 
 static void sync_socket_nonblock(file_t *f) {
@@ -184,10 +207,14 @@ static int tty_ioctl(file_t *f, unsigned long cmd, unsigned long arg) {
     }
     if (cmd == TIOCGWINSZ) {
         kernel_winsize_t *ws = (kernel_winsize_t *)(uintptr_t)arg;
-        ws->ws_row = 25;
-        ws->ws_col = 80;
-        ws->ws_xpixel = 0;
-        ws->ws_ypixel = 0;
+        int rows = fbcon_text_rows();
+        int cols = fbcon_text_cols();
+        int xpx = fbcon_pixel_width();
+        int ypx = fbcon_pixel_height();
+        ws->ws_row = (uint16_t)((rows > 0) ? rows : 25);
+        ws->ws_col = (uint16_t)((cols > 0) ? cols : 80);
+        ws->ws_xpixel = (uint16_t)((xpx > 0) ? xpx : 640);
+        ws->ws_ypixel = (uint16_t)((ypx > 0) ? ypx : 480);
         return 0;
     }
     return -EINVAL;
@@ -198,6 +225,19 @@ int64_t sys_socket(int domain, int type, int protocol) {
     int r = socket_create(domain, type, protocol);
     if (r == -1) return -EINVAL;
     return (int64_t)r;
+}
+
+/* ── socketpair(2) ───────────────────────────────────────────────────────── */
+int64_t sys_socketpair(int domain, int type, int protocol, int sv[2]) {
+    if (!sv) return -EFAULT;
+
+    int base_type = type & ~(SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if ((domain != AF_UNIX && domain != AF_LOCAL) || base_type != SOCK_STREAM)
+        return -EINVAL;
+    if (protocol != 0) return -EINVAL;
+
+    /* Minimal AF_UNIX support for resolver/event channels. */
+    return sys_pipe2(sv, type & (SOCK_NONBLOCK | SOCK_CLOEXEC));
 }
 
 /* ── connect(2) ──────────────────────────────────────────────────────────── */

@@ -140,6 +140,12 @@ struct fs_ops {
     /* Truncate file to `size` bytes. */
     int (*truncate)(vnode_t *v, uint64_t size);
 
+    /* Change permission bits (0777 mask) while preserving file type bits. */
+    int (*chmod)(vnode_t *v, uint32_t mode);
+
+    /* Change ownership; owner/group < 0 means unchanged. */
+    int (*chown)(vnode_t *v, int owner, int group);
+
     /* Flush dirty state of `v` to underlying storage. */
     int (*sync)(vnode_t *v);
 
@@ -213,6 +219,7 @@ typedef struct {
 #define O_NONBLOCK (1 << 11)
 #define O_DIRECTORY (1 << 16)
 #define O_NOFOLLOW  (1 << 17)
+#define O_CLOEXEC   (1 << 19)
 
 /* ── Error codes (subset of POSIX, negative) ─────────────────────────────── */
 #define EPERM    1

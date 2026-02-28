@@ -265,7 +265,7 @@ static launcher_t *launcher_create_quiet(fbcon_t *con) {
     launcher_t *launcher = kmalloc(sizeof(*launcher));
     if (!launcher) return NULL;
     launcher->con = con;
-    strncpy(launcher->cwd, "/", VFS_MOUNT_PATH_MAX - 1);
+    strncpy(launcher->cwd, "/home/root", VFS_MOUNT_PATH_MAX - 1);
     launcher->cwd[VFS_MOUNT_PATH_MAX - 1] = '\0';
     return launcher;
 }
@@ -390,15 +390,17 @@ static void launcher_exec_path(launcher_t *launcher, const char *args) {
 
     const char *env_list[] = {
         "PATH=/bin:/usr/bin:/sbin:/usr/sbin",
-        "HOME=/",
+        "HOME=/home/root",
         "TERM=linux",
         "SHELL=/bin/sh",
-        "ENV=/etc/profile",
         "USER=root",
         "LOGNAME=root",
-        env_pwd,
+        "HOSTNAME=exo",
         "TMPDIR=/tmp",
-        "PS1=uday# ",
+        "PS1=root@exo:\\w# ",
+        "SSL_CERT_FILE=/etc/ssl/cert.pem",
+        "SSL_CERT_DIR=/etc/ssl/certs",
+        env_pwd,
     };
     uintptr_t env_addrs[sizeof(env_list) / sizeof(env_list[0])] = {0};
     int env_count = 0;
@@ -513,8 +515,6 @@ static void init_task(void *arg) {
     }
 
     for (;;) {
-        if (con)
-            fbcon_printf_inst(con, "\n  EXO_OS — launching %s\n\n", shell_path);
         launcher_exec_path(launcher, shell_path);
         KLOG_WARN("init: %s exited; restarting in 1s\n", shell_path);
         sched_sleep(1000);

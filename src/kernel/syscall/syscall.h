@@ -34,6 +34,7 @@
 #define SYS_ALARM       37
 #define SYS_SETITIMER   38
 #define SYS_GETPID      39
+#define SYS_SENDFILE    40
 #define SYS_CLONE       56
 #define SYS_FORK        57
 #define SYS_EXECVE      59
@@ -43,6 +44,7 @@
 #define SYS_UNAME       63
 #define SYS_OPENAT      257
 #define SYS_MKDIRAT     258
+#define SYS_FCHOWNAT    260
 #define SYS_RENAMEAT    264
 #define SYS_FCNTL       72
 #define SYS_GETCWD      79
@@ -53,16 +55,25 @@
 #define SYS_UNLINK      87
 #define SYS_SYMLINK     88
 #define SYS_READLINK    89
+#define SYS_CHMOD       90
+#define SYS_FCHMOD      91
+#define SYS_CHOWN       92
+#define SYS_FCHOWN      93
+#define SYS_LCHOWN      94
 #define SYS_UMASK       95
 #define SYS_GETRLIMIT   97
 #define SYS_TIMES       100
 #define SYS_FUTIMESAT   261
 #define SYS_GETUID      102
 #define SYS_GETGID      104
+#define SYS_SETUID      105
+#define SYS_SETGID      106
 #define SYS_GETEUID     107
 #define SYS_GETEGID     108
 #define SYS_SETPGID     109
 #define SYS_GETPPID     110
+#define SYS_GETGROUPS   115
+#define SYS_SETGROUPS   116
 #define SYS_SETSID      112
 #define SYS_GETPGID     121
 #define SYS_GETSID      124
@@ -80,6 +91,7 @@
 #define SYS_UNLINKAT    263
 #define SYS_SYMLINKAT   266
 #define SYS_READLINKAT  267
+#define SYS_FCHMODAT    268
 #define SYS_FACCESSAT   269
 #define SYS_SET_ROBUST_LIST 273
 #define SYS_GET_ROBUST_LIST 274
@@ -89,6 +101,7 @@
 #define SYS_PIPE2       293
 #define SYS_PRLIMIT64   302
 #define SYS_GETRANDOM   318
+#define SYS_CLONE3      435
 
 /* *at constants */
 #define AT_FDCWD        (-100)
@@ -109,6 +122,7 @@
 #define SYS_LISTEN      50
 #define SYS_GETSOCKNAME 51
 #define SYS_GETPEERNAME 52
+#define SYS_SOCKETPAIR  53
 #define SYS_SETSOCKOPT  54
 #define SYS_GETSOCKOPT  55
 

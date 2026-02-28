@@ -66,6 +66,7 @@ int fd_alloc(struct task *t, file_t *f) {
     for (int i = 0; i < FD_TABLE_SIZE; i++) {
         if (t->fd_table[i] == NULL) {
             t->fd_table[i] = f;
+            t->fd_flags[i] = 0;
             file_get(f); /* bump: table now holds a reference */
             return i;
         }
@@ -79,6 +80,7 @@ int fd_install(struct task *t, int fd, file_t *f) {
         file_put(t->fd_table[fd]);
     }
     t->fd_table[fd] = f;
+    t->fd_flags[fd] = 0; /* dup()/dup2() clear FD_CLOEXEC on the new fd */
     file_get(f);
     return fd;
 }
@@ -93,6 +95,7 @@ int fd_close(struct task *t, int fd) {
     if (!t->fd_table[fd]) return -1; /* EBADF */
     file_put(t->fd_table[fd]);  /* one put for the table's reference */
     t->fd_table[fd] = NULL;
+    t->fd_flags[fd] = 0;
     return 0;
 }
 
@@ -104,6 +107,9 @@ int fd_dup(struct task *t, int old_fd) {
 
 int fd_dup2(struct task *t, int old_fd, int new_fd) {
     if (!t || new_fd < 0 || new_fd >= FD_TABLE_SIZE) return -1;
+    if (old_fd == new_fd) {
+        return fd_get(t, old_fd) ? new_fd : -1;
+    }
     file_t *f = fd_get(t, old_fd);
     if (!f) return -1;
     return fd_install(t, new_fd, f);
@@ -112,7 +118,7 @@ int fd_dup2(struct task *t, int old_fd, int new_fd) {
 void fd_close_cloexec(struct task *t) {
     if (!t) return;
     for (int i = 0; i < FD_TABLE_SIZE; i++) {
-        if (t->fd_table[i] && (t->fd_table[i]->fd_flags & FD_CLOEXEC))
+        if (t->fd_table[i] && (t->fd_flags[i] & FD_CLOEXEC))
             fd_close(t, i);
     }
 }

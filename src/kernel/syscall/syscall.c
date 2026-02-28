@@ -21,6 +21,7 @@
 #include "mm/kmalloc.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"
+#include "arch/x86_64/rtc.h"
 
 #include <stdint.h>
 
@@ -45,8 +46,16 @@ int64_t sys_renameat(int olddirfd, const char *old_path, int newdirfd, const cha
 int64_t sys_faccessat(int dirfd, const char *path, int mode, int flags);
 int64_t sys_symlinkat(const char *target, int newdirfd, const char *linkpath);
 int64_t sys_utimensat(int dirfd, const char *upath, const kernel_timespec_t times[2], int flags);
+int64_t sys_chmod(const char *upath, uint32_t mode);
+int64_t sys_fchmod(int fd, uint32_t mode);
+int64_t sys_fchmodat(int dirfd, const char *upath, uint32_t mode, int flags);
+int64_t sys_chown(const char *upath, int owner, int group);
+int64_t sys_lchown(const char *upath, int owner, int group);
+int64_t sys_fchown(int fd, int owner, int group);
+int64_t sys_fchownat(int dirfd, const char *upath, int owner, int group, int flags);
 int64_t sys_dup(int old_fd);
 int64_t sys_dup2(int old_fd, int new_fd);
+int64_t sys_sendfile(int out_fd, int in_fd, uint64_t *offset, uint64_t count);
 int64_t sys_getcwd(char *buf, uint64_t size);
 int64_t sys_chdir(const char *path);
 int64_t sys_mkdir(const char *path, uint32_t mode);
@@ -67,6 +76,7 @@ int64_t sys_sendto(int fd, const void *buf, uint64_t len, int flags,
                    const struct sockaddr *dest_addr, socklen_t addrlen);
 int64_t sys_recvfrom(int fd, void *buf, uint64_t len, int flags,
                      struct sockaddr *src_addr, socklen_t *addrlen);
+int64_t sys_socketpair(int domain, int type, int protocol, int sv[2]);
 int64_t sys_shutdown(int fd, int how);
 int64_t sys_bind(int fd, const struct sockaddr *addr, socklen_t addrlen);
 int64_t sys_listen(int fd, int backlog);
@@ -124,6 +134,8 @@ static int64_t sc_dup(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uin
     { (void)b;(void)c;(void)d;(void)e;(void)f; return sys_dup((int)a); }
 static int64_t sc_dup2(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { (void)c;(void)d;(void)e;(void)f; return sys_dup2((int)a,(int)b); }
+static int64_t sc_sendfile(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)e;(void)f; return sys_sendfile((int)a,(int)b,(uint64_t*)c,d); }
 static int64_t sc_sync(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; vfs_sync_all(); return 0; }
     static int64_t sc_eventfd2(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
@@ -149,7 +161,7 @@ static int64_t sc_exit(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,ui
             *cur->clear_child_tid = 0;
             extern int64_t sys_futex(uint32_t *uaddr, int op, uint32_t val,
                                      const kernel_timespec_t *timeout, uint32_t *uaddr2, uint32_t val3);
-            sys_futex((uint32_t *)cur->clear_child_tid, 1/*FUTEX_WAKE*/, 1, NULL, NULL, 0);
+            sys_futex(cur->clear_child_tid, 1/*FUTEX_WAKE*/, 1, NULL, NULL, 0);
         }
     }
     sched_task_exit();
@@ -180,6 +192,20 @@ static int64_t sc_symlinkat(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t
     { (void)d;(void)e;(void)f; return sys_symlinkat((const char*)a,(int)b,(const char*)c); }
 static int64_t sc_symlink(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { (void)c;(void)d;(void)e;(void)f; return sys_symlinkat((const char*)a, AT_FDCWD, (const char*)b); }
+static int64_t sc_chmod(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)c;(void)d;(void)e;(void)f; return sys_chmod((const char*)a, (uint32_t)b); }
+static int64_t sc_fchmod(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)c;(void)d;(void)e;(void)f; return sys_fchmod((int)a, (uint32_t)b); }
+static int64_t sc_fchmodat(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)e;(void)f; return sys_fchmodat((int)a, (const char*)b, (uint32_t)c, (int)d); }
+static int64_t sc_chown(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)d;(void)e;(void)f; return sys_chown((const char*)a, (int)b, (int)c); }
+static int64_t sc_lchown(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)d;(void)e;(void)f; return sys_lchown((const char*)a, (int)b, (int)c); }
+static int64_t sc_fchown(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)d;(void)e;(void)f; return sys_fchown((int)a, (int)b, (int)c); }
+static int64_t sc_fchownat(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)f; return sys_fchownat((int)a, (const char*)b, (int)c, (int)d, (int)e); }
 static int64_t sc_getdents64(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { (void)d;(void)e;(void)f; return sys_getdents64((int)a,(void*)b,c); }
 
@@ -198,6 +224,8 @@ static int64_t sc_sendto(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,
     { return sys_sendto((int)a,(const void*)b,c,(int)d,(const struct sockaddr*)e,(socklen_t)f); }
 static int64_t sc_recvfrom(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { return sys_recvfrom((int)a,(void*)b,c,(int)d,(struct sockaddr*)e,(socklen_t*)f); }
+static int64_t sc_socketpair(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)e;(void)f; return sys_socketpair((int)a,(int)b,(int)c,(int*)d); }
 static int64_t sc_shutdown(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { (void)c;(void)d;(void)e;(void)f; return sys_shutdown((int)a,(int)b); }
 static int64_t sc_bind(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
@@ -223,9 +251,73 @@ static int64_t sc_getppid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e
     { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;
       task_t *t = sched_current(); return t ? (int64_t)t->ppid : 0; }
 static int64_t sc_getuid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
-    { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; return 0; }
+    { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; task_t *t = sched_current(); return t ? (int64_t)t->uid : 0; }
 static int64_t sc_getgid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
-    { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; return 0; }
+    { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; task_t *t = sched_current(); return t ? (int64_t)t->gid : 0; }
+
+static int64_t sc_setuid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+{
+    (void)b;(void)c;(void)d;(void)e;(void)f;
+    task_t *t = sched_current();
+    if (!t) return -ESRCH;
+    uint32_t uid = (uint32_t)a;
+    if (t->uid != 0 && uid != t->uid) return -EPERM;
+    t->uid = uid;
+    return 0;
+}
+
+static int64_t sc_setgid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+{
+    (void)b;(void)c;(void)d;(void)e;(void)f;
+    task_t *t = sched_current();
+    if (!t) return -ESRCH;
+    uint32_t gid = (uint32_t)a;
+    if (t->uid != 0 && gid != t->gid) return -EPERM;
+    t->gid = gid;
+    if (t->group_count == 0) {
+        t->groups[0] = gid;
+        t->group_count = 1;
+    }
+    return 0;
+}
+
+static int64_t sc_getgroups(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+{
+    (void)c;(void)d;(void)e;(void)f;
+    task_t *t = sched_current();
+    if (!t) return -ESRCH;
+    int size = (int)a;
+    uint32_t *list = (uint32_t *)b;
+    int count = (int)t->group_count;
+    if (size == 0) return count;
+    if (size < count) return -EINVAL;
+    if (!list) return -EFAULT;
+    for (int i = 0; i < count; i++)
+        list[i] = t->groups[i];
+    return count;
+}
+
+static int64_t sc_setgroups(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+{
+    (void)c;(void)d;(void)e;(void)f;
+    task_t *t = sched_current();
+    if (!t) return -ESRCH;
+    if (t->uid != 0) return -EPERM;
+    int size = (int)a;
+    uint32_t *list = (uint32_t *)b;
+    if (size < 0 || size > TASK_MAX_GROUPS) return -EINVAL;
+    if (size > 0 && !list) return -EFAULT;
+    for (int i = 0; i < size; i++)
+        t->groups[i] = list[i];
+    for (int i = size; i < TASK_MAX_GROUPS; i++)
+        t->groups[i] = 0;
+    t->group_count = (uint32_t)size;
+    if (t->group_count == 0) {
+        t->groups[0] = t->gid;
+        t->group_count = 1;
+    }
+    return 0;
+}
 
 static int64_t sc_getpgid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
 {
@@ -308,7 +400,7 @@ static int64_t sc_arch_prctl(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_
 static int64_t sc_set_tid_address(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
     (void)b;(void)c;(void)d;(void)e;(void)f;
     task_t *cur = sched_current();
-    if (cur) cur->clear_child_tid = (uint64_t *)a;
+    if (cur) cur->clear_child_tid = (uint32_t *)a;
     return cur ? (int64_t)cur->tid : 0;
 }
 
@@ -355,6 +447,17 @@ static uint64_t timeval_to_ms(const kernel_timeval_t *tv) {
     if (tv->tv_sec < 0 || tv->tv_usec < 0 || tv->tv_usec >= 1000000LL) return 0;
     uint64_t ms = (uint64_t)tv->tv_sec * 1000ULL + (uint64_t)(tv->tv_usec / 1000ULL);
     if (ms == 0 && (tv->tv_sec > 0 || tv->tv_usec > 0)) ms = 1;
+    return ms;
+}
+
+static uint64_t monotonic_ms_now(void) {
+    return sched_get_ticks();
+}
+
+static uint64_t realtime_ms_now(void) {
+    rtc_epoch_t sec = rtc_get_epoch();
+    uint64_t ms = (sec > 0) ? ((uint64_t)sec * 1000ULL) : 0ULL;
+    ms += monotonic_ms_now() % 1000ULL;
     return ms;
 }
 
@@ -493,7 +596,7 @@ static int64_t sc_clock_nanosleep(uint64_t a,uint64_t b,uint64_t c,uint64_t d,ui
 
     uint64_t sleep_ms = 0;
     if (flags & TIMER_ABSTIME) {
-        uint64_t now_ms = sched_get_ticks();
+        uint64_t now_ms = (clock_id == CLOCK_REALTIME) ? realtime_ms_now() : monotonic_ms_now();
         uint64_t abs_ms = (uint64_t)req->tv_sec * 1000ULL + (uint64_t)(req->tv_nsec / 1000000ULL);
         if (abs_ms > now_ms)
             sleep_ms = abs_ms - now_ms;
@@ -533,9 +636,9 @@ static int64_t sc_gettimeofday(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint6
     kernel_timeval_t *tv = (kernel_timeval_t *)a;
     if (!tv) return -EFAULT;
 
-    uint64_t ticks = sched_get_ticks();
-    tv->tv_sec = (int64_t)(ticks / 1000ULL);
-    tv->tv_usec = (int64_t)((ticks % 1000ULL) * 1000ULL);
+    uint64_t now_ms = realtime_ms_now();
+    tv->tv_sec = (int64_t)(now_ms / 1000ULL);
+    tv->tv_usec = (int64_t)((now_ms % 1000ULL) * 1000ULL);
 
     (void)b;
     return 0;
@@ -576,8 +679,9 @@ static int rlimit_default_for(int resource, kernel_rlimit_t *out) {
             out->rlim_max = TASK_FD_TABLE_SIZE;
             return 0;
         case RLIMIT_STACK:
-            out->rlim_cur = TASK_STACK_SIZE;
-            out->rlim_max = TASK_STACK_SIZE;
+            /* User-space expects a much larger default than kernel task stack. */
+            out->rlim_cur = 8ULL * 1024ULL * 1024ULL;
+            out->rlim_max = 8ULL * 1024ULL * 1024ULL;
             return 0;
         case RLIMIT_AS:
         case RLIMIT_DATA:
@@ -648,27 +752,34 @@ static int64_t sc_clock_gettime(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint
     (void)c;(void)d;(void)e;(void)f;
     kernel_timespec_t *ts = (kernel_timespec_t *)b;
     if (!ts) return -EFAULT;
-    uint64_t ticks = sched_get_ticks();
-    ts->tv_sec  = (int64_t)(ticks / 1000);
-    ts->tv_nsec = (int64_t)((ticks % 1000) * 1000000);
-    (void)a; /* clock_id ignored for now; both REALTIME and MONOTONIC use ticks */
+    int clock_id = (int)a;
+    if (clock_id != CLOCK_REALTIME && clock_id != CLOCK_MONOTONIC)
+        return -EINVAL;
+
+    uint64_t now_ms = (clock_id == CLOCK_REALTIME) ? realtime_ms_now() : monotonic_ms_now();
+    ts->tv_sec  = (int64_t)(now_ms / 1000ULL);
+    ts->tv_nsec = (int64_t)((now_ms % 1000ULL) * 1000000ULL);
     return 0;
 }
 
 static int64_t sc_umask(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
     (void)b;(void)c;(void)d;(void)e;(void)f;
-    (void)a;
-    return 022; /* always return default umask */
+    task_t *t = sched_current();
+    if (!t) return -ESRCH;
+    uint32_t old = t->umask;
+    t->umask = (uint32_t)a & 0777;
+    return (int64_t)old;
 }
 
 static int64_t sc_dup3(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
     (void)d;(void)e;(void)f;
     task_t *cur = sched_current();
     if (!cur) return -ENOSYS;
+    if (c & ~O_CLOEXEC) return -EINVAL;
+    if ((int)a == (int)b) return -EINVAL;
     int r = fd_dup2(cur, (int)a, (int)b);
-    if (r >= 0 && (c & 0x80000)) { /* O_CLOEXEC = 0x80000 */
-        file_t *fp = fd_get(cur, r);
-        if (fp) fp->fd_flags |= FD_CLOEXEC;
+    if (r >= 0 && (c & O_CLOEXEC)) {
+        cur->fd_flags[r] |= FD_CLOEXEC;
     }
     return r;
 }
@@ -810,6 +921,43 @@ static int64_t sc_clone(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,u
     return sys_clone(a, b, c, d, e, g_fork_regs);
 }
 
+typedef struct {
+    uint64_t flags;
+    uint64_t pidfd;
+    uint64_t child_tid;
+    uint64_t parent_tid;
+    uint64_t exit_signal;
+    uint64_t stack;
+    uint64_t stack_size;
+    uint64_t tls;
+    uint64_t set_tid;
+    uint64_t set_tid_size;
+    uint64_t cgroup;
+} kernel_clone_args_t;
+
+static int64_t sc_clone3(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)c;(void)d;(void)e;(void)f;
+    if (!a) return -EFAULT;
+    if (b < 64) return -EINVAL; /* minimum clone_args size through tls field */
+
+    kernel_clone_args_t ca;
+    memset(&ca, 0, sizeof(ca));
+
+    uint64_t copy_len = b;
+    if (copy_len > sizeof(ca)) copy_len = sizeof(ca);
+    memcpy(&ca, (const void *)a, copy_len);
+
+    uint64_t child_sp = ca.stack;
+    if (ca.stack && ca.stack_size) {
+        uint64_t top = ca.stack + ca.stack_size;
+        if (top < ca.stack) return -EINVAL;
+        child_sp = top; /* clone3 stack is base; clone() expects child RSP */
+    }
+
+    uint64_t flags = ca.flags | (ca.exit_signal & 0xFFULL);
+    return sys_clone(flags, child_sp, ca.parent_tid, ca.child_tid, ca.tls, g_fork_regs);
+}
+
 /* Futex syscall — forward declaration */
 extern int64_t sys_futex(uint32_t *uaddr, int op, uint32_t val,
                          const kernel_timespec_t *timeout, uint32_t *uaddr2, uint32_t val3);
@@ -850,9 +998,9 @@ static int64_t sc_fcntl(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,u
             return -EMFILE;
         }
         case 1: /* F_GETFD */
-            return fp->fd_flags;
+            return cur->fd_flags[fd_num];
         case 2: /* F_SETFD */
-            fp->fd_flags = (int)c;
+            cur->fd_flags[fd_num] = (uint8_t)((int)c & FD_CLOEXEC);
             return 0;
         case 3: /* F_GETFL */
             return fp->flags;
@@ -869,7 +1017,7 @@ static int64_t sc_fcntl(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,u
                 if (!cur->fd_table[i]) {
                     int r = fd_install(cur, i, fp);
                     if (r < 0) return -EMFILE;
-                    cur->fd_table[i]->fd_flags |= FD_CLOEXEC;
+                    cur->fd_flags[i] |= FD_CLOEXEC;
                     return r;
                 }
             }
@@ -921,6 +1069,7 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_SCHED_YIELD] = sc_sched_yield,
     [SYS_DUP]       = sc_dup,
     [SYS_DUP2]      = sc_dup2,
+    [SYS_SENDFILE]  = sc_sendfile,
     [SYS_GETITIMER] = sc_getitimer,
     [SYS_ALARM]     = sc_alarm,
     [SYS_SETITIMER] = sc_setitimer,
@@ -943,6 +1092,11 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_RMDIR]     = sc_rmdir,
     [SYS_UNLINK]    = sc_unlink,
     [SYS_SYMLINK]   = sc_symlink,
+    [SYS_CHMOD]     = sc_chmod,
+    [SYS_FCHMOD]    = sc_fchmod,
+    [SYS_CHOWN]     = sc_chown,
+    [SYS_FCHOWN]    = sc_fchown,
+    [SYS_LCHOWN]    = sc_lchown,
     [SYS_UNLINKAT]  = sc_unlinkat,
     [SYS_SYMLINKAT] = sc_symlinkat,
     [SYS_UMASK]     = sc_umask,
@@ -950,8 +1104,12 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_TIMES]     = sc_times,
     [SYS_GETUID]    = sc_getuid,
     [SYS_GETGID]    = sc_getgid,
+    [SYS_SETUID]    = sc_setuid,
+    [SYS_SETGID]    = sc_setgid,
     [SYS_GETEUID]   = sc_getuid,
     [SYS_GETEGID]   = sc_getgid,
+    [SYS_GETGROUPS] = sc_getgroups,
+    [SYS_SETGROUPS] = sc_setgroups,
     [SYS_GETPPID]   = sc_getppid,
     [SYS_SETPGID]   = sc_setpgid,
     [SYS_SETSID]    = sc_setsid,
@@ -976,6 +1134,7 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_ACCEPT]    = sc_accept,
     [SYS_SENDTO]    = sc_sendto,
     [SYS_RECVFROM]  = sc_recvfrom,
+    [SYS_SOCKETPAIR]= sc_socketpair,
     [SYS_SHUTDOWN]  = sc_shutdown,
     [SYS_BIND]      = sc_bind,
     [SYS_LISTEN]    = sc_listen,
@@ -989,13 +1148,16 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_PIPE]           = sc_pipe,
     [SYS_PIPE2]          = sc_pipe2,
     [SYS_CLONE]          = sc_clone,
+    [SYS_CLONE3]         = sc_clone3,
     [SYS_FUTEX]          = sc_futex,
     [SYS_READLINK]       = sc_readlink,
     [SYS_READLINKAT]     = sc_readlinkat,
     [SYS_FCNTL]          = sc_fcntl,
     [SYS_FSTATAT]        = sc_fstatat,
+    [SYS_FCHOWNAT]       = sc_fchownat,
     [SYS_FUTIMESAT]      = sc_futimesat,
     [SYS_UTIMENSAT]      = sc_utimensat,
+    [SYS_FCHMODAT]       = sc_fchmodat,
         [SYS_EVENTFD2]       = sc_eventfd2,
     [SYS_FACCESSAT]      = sc_faccessat,
 };
@@ -1005,7 +1167,7 @@ static void syscall_dispatch(cpu_regs_t *regs) {
     uint64_t nr = regs->rax;
 
     /* sys_fork/clone/sigreturn need access to the full register frame */
-    if (nr == SYS_FORK || nr == SYS_CLONE) g_fork_regs = regs;
+    if (nr == SYS_FORK || nr == SYS_CLONE || nr == SYS_CLONE3) g_fork_regs = regs;
     if (nr == SYS_RT_SIGRETURN) g_sigreturn_regs = regs;
 
     if (nr < SYSCALL_TABLE_SIZE && g_syscall_table[nr]) {
@@ -1029,7 +1191,7 @@ void syscall_dispatch_fast(cpu_regs_t *regs) {
     uint64_t nr = regs->rax;
 
 
-    if (nr == SYS_FORK || nr == SYS_CLONE) g_fork_regs = regs;
+    if (nr == SYS_FORK || nr == SYS_CLONE || nr == SYS_CLONE3) g_fork_regs = regs;
     if (nr == SYS_RT_SIGRETURN) g_sigreturn_regs = regs;
 
     if (nr < SYSCALL_TABLE_SIZE && g_syscall_table[nr]) {

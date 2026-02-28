@@ -139,6 +139,12 @@ EXTERNAL_BIN_STAMP   := $(EXTERNAL_BIN_DIR)/.stamp
 # ── rootfs config files ───────────────────────────────────────────────────────
 ROOTFS_PROFILE  := tools/rootfs/profile
 ROOTFS_ENV_FILE := tools/rootfs/environment
+ROOTFS_PASSWD   := tools/rootfs/passwd
+ROOTFS_GROUP    := tools/rootfs/group
+ROOTFS_FISH     := tools/rootfs/fish
+ROOTFS_RESOLV   := tools/rootfs/resolv.conf
+ROOTFS_TERMINFO_LINUX := $(shell sh -c 'for p in /usr/share/terminfo/l/linux /lib/terminfo/l/linux /etc/terminfo/l/linux; do [ -f "$$p" ] && { echo "$$p"; exit 0; }; done')
+ROOTFS_CA_BUNDLE := $(shell sh -c 'for p in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do [ -f "$$p" ] && { echo "$$p"; exit 0; }; done')
 
 # ── QEMU flags (shared between run and run-debug) ─────────────────────────────
 QEMU_FLAGS := \
@@ -183,7 +189,7 @@ $(FONT_TOOL): tools/gen_font.c
 
 $(FONT_DATA_C): $(FONT_TOOL) $(FONT_TTF)
 	@mkdir -p $(dir $@)
-	$< $(FONT_TTF) 26 $@
+	$< $(FONT_TTF) 20 $@
 
 $(FONT_DATA_OBJ): $(FONT_DATA_C) $(BUILD_DIR)/limine.h
 	@mkdir -p $(dir $@)
@@ -290,21 +296,21 @@ $(EFI_IMG): $(KERNEL_ELF) $(LIMINE_DIR)/limine.h
 # ── Root partition (ext2, no root needed — debugfs) ───────────────────────────
 $(ROOT_IMG): $(HELLO_BIN) $(SYSCALL_TEST_BIN) \
 			 $(LIBC_SMOKE_BINS) $(BUSYBOX_BIN) $(EXTERNAL_BIN_STAMP) \
-             $(ROOTFS_PROFILE) $(ROOTFS_ENV_FILE)
+		     $(ROOTFS_PROFILE) $(ROOTFS_ENV_FILE) $(ROOTFS_PASSWD) $(ROOTFS_GROUP) $(ROOTFS_FISH) $(ROOTFS_RESOLV)
 	@echo ">>> Building root partition (ext2)..."
 	$(eval ROOT_SECTORS := $(shell echo $$(($(DISK_SIZE_MB) * 2048 - $(ROOT_START) - 33))))
 	dd if=/dev/zero of=$@ bs=512 count=$(ROOT_SECTORS) 2>/dev/null
 	mkfs.ext2 -q -L "EXOOS_ROOT" -b 4096 $@
-	$(foreach d, dev tmp boot proc sys sys/bus sys/bus/usb sys/bus/usb/devices sys/bus/pci sys/bus/pci/devices home etc bin usr usr/bin usr/sbin sbin var run, \
+	$(foreach d, dev tmp boot proc sys sys/bus sys/bus/usb sys/bus/usb/devices sys/bus/pci sys/bus/pci/devices home home/root etc etc/ssl etc/ssl/certs bin usr usr/bin usr/sbin usr/share usr/share/terminfo usr/share/terminfo/l sbin var run, \
 	    debugfs -w -R "mkdir $(d)" $@ 2>/dev/null || true ;)
-	debugfs -w -R "write $(HELLO_BIN)           bin/hello"         $@ 2>/dev/null
-	debugfs -w -R "write $(HELLO_BIN)           home/hello"        $@ 2>/dev/null
-	debugfs -w -R "write $(SYSCALL_TEST_BIN)    home/syscall_test"  $@ 2>/dev/null
-	debugfs -w -R "write $(LIBC_HELLO_BIN)      home/mlibc_hello"   $@ 2>/dev/null
-	debugfs -w -R "write $(LIBC_PTH_BIN)        home/pthread_smoke" $@ 2>/dev/null
-	debugfs -w -R "write $(LIBC_SUITE_BIN)      home/posix_suite"   $@ 2>/dev/null
+	debugfs -w -R "write $(HELLO_BIN)           home/root/hello"        $@ 2>/dev/null
+	debugfs -w -R "write $(SYSCALL_TEST_BIN)    home/root/syscall_test"  $@ 2>/dev/null
+	debugfs -w -R "write $(LIBC_HELLO_BIN)      home/root/mlibc_hello"   $@ 2>/dev/null
+	debugfs -w -R "write $(LIBC_PTH_BIN)        home/root/pthread_smoke" $@ 2>/dev/null
+	debugfs -w -R "write $(LIBC_SUITE_BIN)      home/root/posix_suite"   $@ 2>/dev/null
 	debugfs -w -R "write $(BUSYBOX_BIN)         bin/busybox"       $@ 2>/dev/null
 	debugfs -w -R "write $(BUSYBOX_BIN)         bin/sh"            $@ 2>/dev/null
+	debugfs -w -R "write $(ROOTFS_FISH)         bin/fish"          $@ 2>/dev/null
 	@if [ -d "$(EXTERNAL_BIN_DIR)" ]; then \
 	    for f in $(EXTERNAL_BIN_DIR)/*; do \
 	        [ -f "$$f" ] || continue; \
@@ -314,6 +320,20 @@ $(ROOT_IMG): $(HELLO_BIN) $(SYSCALL_TEST_BIN) \
 	fi
 	debugfs -w -R "write $(ROOTFS_PROFILE)      etc/profile"       $@ 2>/dev/null
 	debugfs -w -R "write $(ROOTFS_ENV_FILE)     etc/environment"   $@ 2>/dev/null
+	debugfs -w -R "write $(ROOTFS_PASSWD)       etc/passwd"        $@ 2>/dev/null
+	debugfs -w -R "write $(ROOTFS_GROUP)        etc/group"         $@ 2>/dev/null
+	debugfs -w -R "write $(ROOTFS_RESOLV)       etc/resolv.conf"   $@ 2>/dev/null
+	@if [ -n "$(ROOTFS_CA_BUNDLE)" ] && [ -f "$(ROOTFS_CA_BUNDLE)" ]; then \
+	    debugfs -w -R "write $(ROOTFS_CA_BUNDLE) etc/ssl/cert.pem" $@ 2>/dev/null; \
+	    debugfs -w -R "write $(ROOTFS_CA_BUNDLE) etc/ssl/certs/ca-certificates.crt" $@ 2>/dev/null; \
+	else \
+	    echo "!!! warning: host CA bundle not found; HTTPS cert validation may fail in guest"; \
+	fi
+	@if [ -n "$(ROOTFS_TERMINFO_LINUX)" ] && [ -f "$(ROOTFS_TERMINFO_LINUX)" ]; then \
+	    debugfs -w -R "write $(ROOTFS_TERMINFO_LINUX) usr/share/terminfo/l/linux" $@ 2>/dev/null; \
+	else \
+	    echo "!!! warning: linux terminfo entry not found on host; nano may fail with TERM=linux"; \
+	fi
 
 # ── GPT disk image ────────────────────────────────────────────────────────────
 $(DISK_IMG): $(EFI_IMG) $(ROOT_IMG)

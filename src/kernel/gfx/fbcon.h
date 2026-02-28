@@ -47,3 +47,11 @@ void fbcon_hide_cursor_inst(fbcon_t *c);
 
 /* Blink tick — call from a periodic timer / scheduler task at ~2 Hz */
 void fbcon_tick(fbcon_t *c);
+
+/* Report current text grid size (columns/rows). Returns 0 if unavailable. */
+int fbcon_text_cols(void);
+int fbcon_text_rows(void);
+
+/* Report current framebuffer pixel size. Returns 0 if unavailable. */
+int fbcon_pixel_width(void);
+int fbcon_pixel_height(void);

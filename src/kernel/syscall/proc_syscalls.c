@@ -39,6 +39,7 @@ static void fd_table_clone(task_t *child, task_t *parent) {
             file_get(f);           /* bump refcount */
             child->fd_table[i] = f;
         }
+        child->fd_flags[i] = parent->fd_flags[i];
     }
     /* Copy cwd */
     strncpy(child->cwd, parent->cwd, TASK_CWD_MAX - 1);
@@ -86,6 +87,10 @@ int64_t sys_fork(cpu_regs_t *regs) {
     child->sid     = parent->sid;
     child->uid     = parent->uid;
     child->gid     = parent->gid;
+    child->umask   = parent->umask;
+    child->group_count = parent->group_count;
+    for (uint32_t gi = 0; gi < TASK_MAX_GROUPS; gi++)
+        child->groups[gi] = parent->groups[gi];
     child->parent  = parent;
 
     /* Add to parent's children list */
@@ -630,8 +635,6 @@ int64_t sys_mmap(uint64_t addr, uint64_t len, int prot, int flags,
         vma_insert(cur, v);
     }
 
-    KLOG_DEBUG("mmap: addr=%p len=%llu prot=%d flags=%d → %p\n",
-               (void *)addr, len, prot, flags, (void *)map_addr);
     return (int64_t)map_addr;
 }
 
@@ -757,9 +760,11 @@ int64_t sys_clone(uint64_t flags, uint64_t stack, uint64_t parent_tid_ptr,
     bool share_files  = (flags & CLONE_FILES) != 0;
     bool is_thread    = (flags & CLONE_THREAD) != 0;
 
-    /* Linux-required flag coupling for thread groups */
+    /* Thread groups must share an address space. Keep this strict check,
+     * but tolerate runtimes that omit CLONE_SIGHAND while still expecting
+     * Linux-like thread creation semantics. */
     if ((flags & CLONE_SIGHAND) && !share_vm) return -EINVAL;
-    if (is_thread && (!share_vm || !(flags & CLONE_SIGHAND))) return -EINVAL;
+    if (is_thread && !share_vm) return -EINVAL;
 
     uintptr_t child_pml4;
     task_t *child;
@@ -788,8 +793,13 @@ int64_t sys_clone(uint64_t flags, uint64_t stack, uint64_t parent_tid_ptr,
 
     child->ppid   = parent->pid;
     child->pgid   = parent->pgid;
+    child->sid    = parent->sid;
     child->uid    = parent->uid;
     child->gid    = parent->gid;
+    child->umask  = parent->umask;
+    child->group_count = parent->group_count;
+    for (uint32_t gi = 0; gi < TASK_MAX_GROUPS; gi++)
+        child->groups[gi] = parent->groups[gi];
     child->parent = parent;
 
     if (is_thread) {
@@ -803,6 +813,7 @@ int64_t sys_clone(uint64_t flags, uint64_t stack, uint64_t parent_tid_ptr,
         for (int i = 0; i < TASK_FD_TABLE_SIZE; i++) {
             file_t *f = parent->fd_table[i];
             if (f) { file_get(f); child->fd_table[i] = f; }
+            child->fd_flags[i] = parent->fd_flags[i];
         }
         strncpy(child->cwd, parent->cwd, TASK_CWD_MAX - 1);
     } else {
@@ -822,7 +833,7 @@ int64_t sys_clone(uint64_t flags, uint64_t stack, uint64_t parent_tid_ptr,
     }
 
     if (flags & 0x00200000) /* CLONE_CHILD_CLEARTID */
-        child->clear_child_tid = (uint64_t *)child_tid_ptr;
+        child->clear_child_tid = (uint32_t *)child_tid_ptr;
 
     if ((flags & 0x00100000) && parent_tid_ptr) /* CLONE_PARENT_SETTID */
         *(uint32_t *)parent_tid_ptr = child->tid;

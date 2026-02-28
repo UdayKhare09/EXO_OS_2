@@ -153,15 +153,14 @@ int socket_create(int domain, int type, int protocol) {
     file_t *f = file_alloc_generic(&g_socket_file_ops, sk, flags);
     if (!f) { kfree(sk); return -1; }
 
-    if (type & SOCK_CLOEXEC)
-        f->fd_flags |= FD_CLOEXEC;
-
     task_t *cur = sched_current();
     int fd = fd_alloc(cur, f);
     if (fd < 0) {
         file_put(f);
         return -1;
     }
+    if (type & SOCK_CLOEXEC)
+        cur->fd_flags[fd] |= FD_CLOEXEC;
 
     KLOG_DEBUG("socket: created %s socket fd=%d\n",
          protocol == IPPROTO_TCP ? "TCP" :
