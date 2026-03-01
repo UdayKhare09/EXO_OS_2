@@ -17,6 +17,7 @@
 #include "font.h"          /* g_font_atlas, font_get_glyph()  */
 #include "lib/string.h"    /* memset, strlen                  */
 #include "mm/kmalloc.h"    /* kzalloc                         */
+#include "mm/vmm.h"        /* vmm_virt_to_phys — for fb0 mmap */
 
 #include <stdarg.h>
 #include <stdint.h>
@@ -744,4 +745,25 @@ void fbcon_printf_inst(fbcon_t *c, const char *fmt, ...) {
     if (c->cursor_drawn) cursor_erase(c);
     for (const char *p = buf; *p; p++) emit_char(c, *p);
     if (c->cursor_visible) cursor_draw(c);
+}
+
+/* ── fbcon_get_fb_info ─────────────────────────────────────────────────────
+ * Return framebuffer geometry and the *physical* base address of the pixel
+ * buffer.  Used by /dev/fb0 to fill FBIOGET_FSCREENINFO and to mmap the
+ * real hardware framebuffer into user-space address space.                 */
+void fbcon_get_fb_info(uint64_t *phys_base, uint32_t *width,
+                       uint32_t *height, uint32_t *pitch_bytes) {
+    if (!g_fbcon) {
+        if (phys_base)   *phys_base   = 0;
+        if (width)       *width       = 0;
+        if (height)      *height      = 0;
+        if (pitch_bytes) *pitch_bytes = 0;
+        return;
+    }
+    /* g_fbcon->fb is a HHDM virtual pointer; convert to physical. */
+    if (phys_base)   *phys_base   = vmm_virt_to_phys((uintptr_t)g_fbcon->fb);
+    if (width)       *width       = g_fbcon->fb_w;
+    if (height)      *height      = g_fbcon->fb_h;
+    /* fb_pitch_u32 is pitch in uint32_t units; multiply by 4 for bytes. */
+    if (pitch_bytes) *pitch_bytes = g_fbcon->fb_pitch_u32 * 4u;
 }

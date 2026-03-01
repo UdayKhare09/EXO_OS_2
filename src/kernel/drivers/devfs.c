@@ -16,7 +16,10 @@
 #include "drivers/storage/blkdev.h"
 #include "gfx/fbcon.h"
 #include "drivers/input/input.h"
+#include "drivers/input/evdev.h"    /* g_evdev_kbd_fops, g_evdev_mouse_fops */
+#include "drivers/fb.h"             /* g_fb_fops */
 #include "arch/x86_64/cpu.h"
+#include "net/socket_defs.h"         /* POLLIN, POLLOUT, POLLRDNORM */
 #include "sched/sched.h"
 #include "drivers/pty.h"
 #include "ipc/signal.h"
@@ -26,13 +29,22 @@
 #define TTY_IFLAG_ICRNL  0x00000100U
 #define TTY_OFLAG_OPOST  0x00000001U
 #define TTY_OFLAG_ONLCR  0x00000004U
-#define TTY_LFLAG_ICANON 0x00000002U
+/* lflag bits */
 #define TTY_LFLAG_ISIG   0x00000001U   /* generate signals on VINTR/VQUIT/VSUSP */
+#define TTY_LFLAG_ICANON 0x00000002U
+#define TTY_LFLAG_ECHO   0x00000008U   /* echo input characters                 */
+#define TTY_LFLAG_ECHOE  0x00000010U   /* echo ERASE as BS-SP-BS                */
+#define TTY_LFLAG_ECHOK  0x00000020U   /* echo newline after KILL               */
+#define TTY_LFLAG_ECHONL 0x00000040U   /* echo NL even if ECHO is off           */
 
-/* c_cc indices (POSIX) */
-#define TTY_VINTR  0   /* ^C  → SIGINT  */
-#define TTY_VQUIT  1   /* ^\  → SIGQUIT */
-#define TTY_VSUSP 10   /* ^Z  → SIGTSTP */
+/* c_cc indices (Linux/POSIX) */
+#define TTY_VINTR   0   /* ^C  → SIGINT  */
+#define TTY_VQUIT   1   /* ^\  → SIGQUIT */
+#define TTY_VERASE  2   /* DEL/^H → erase previous char */
+#define TTY_VKILL   3   /* ^U → erase line              */
+#define TTY_VEOF    4   /* ^D → end of file             */
+#define TTY_VSUSP  10   /* ^Z  → SIGTSTP */
+#define TTY_VWERASE 14  /* ^W → erase previous word     */
 
 /* Exposed by syscall/net_syscalls.c */
 extern uint32_t tty_get_iflag(void);
@@ -40,6 +52,246 @@ extern uint32_t tty_get_oflag(void);
 extern uint32_t tty_get_lflag(void);
 extern uint8_t  tty_get_cc(int idx);
 extern void     tty_signal_foreground(int sig);
+/* tty_console_ioctl: the session-aware TTY ioctl handler in net_syscalls.c
+ * (renamed from the old static tty_ioctl; handles TCGETS/TCSETS/TIOCGWINSZ…) */
+extern int tty_console_ioctl(struct file *f, unsigned long cmd, unsigned long arg);
+
+/* ── Physical console file_ops (for /dev/ttyN and /dev/tty without PTY) ─────
+ * These wrap the keyboard input ring + fbcon output.                       */
+static ssize_t tty_console_read(file_t *f, void *buf, size_t len) {
+    (void)f;
+    if (len == 0) return 0;
+    char       *dst     = (char *)buf;
+    uint32_t    iflag   = tty_get_iflag();
+    uint32_t    lflag   = tty_get_lflag();
+    bool canonical= (lflag & TTY_LFLAG_ICANON)  != 0;
+    bool isig     = (lflag & TTY_LFLAG_ISIG)    != 0;
+    bool do_echo  = (lflag & TTY_LFLAG_ECHO)    != 0;
+    bool echoe    = (lflag & TTY_LFLAG_ECHOE)   != 0;
+    bool echok    = (lflag & TTY_LFLAG_ECHOK)   != 0;
+    bool echonl   = (lflag & TTY_LFLAG_ECHONL)  != 0;
+    bool map_crnl = (iflag & TTY_IFLAG_ICRNL)   != 0;
+
+    char vintr  = isig     ? (char)tty_get_cc(TTY_VINTR)  : 0;
+    char vquit  = isig     ? (char)tty_get_cc(TTY_VQUIT)  : 0;
+    char vsusp  = isig     ? (char)tty_get_cc(TTY_VSUSP)  : 0;
+    char verase = canonical? (char)tty_get_cc(TTY_VERASE) : 0;
+    char vkill  = canonical? (char)tty_get_cc(TTY_VKILL)  : 0;
+    char veof   = canonical? (char)tty_get_cc(TTY_VEOF)   : 0;
+    char vwerase= canonical? (char)tty_get_cc(TTY_VWERASE): 0;
+
+    fbcon_t *con = fbcon_get();
+
+    /* ── Non-canonical / raw mode: VMIN/VTIME ─────────────────────────── */
+    if (!canonical) {
+        uint8_t vmin = tty_get_cc(6); /* VMIN */
+        if (vmin == 0) vmin = 1;
+        size_t done = 0;
+        while (done < len) {
+            char ch = 0;
+            if (input_tty_getchar_nonblock(&ch) == 0) {
+                if (map_crnl && ch == '\r') ch = '\n';
+                if (isig && vintr && ch == vintr) { tty_signal_foreground(SIGINT);  continue; }
+                if (isig && vquit && ch == vquit) { tty_signal_foreground(SIGQUIT); continue; }
+                if (isig && vsusp && ch == vsusp) { tty_signal_foreground(SIGTSTP); continue; }
+                if (do_echo && con) fbcon_putchar_inst(con, ch);
+                dst[done++] = ch;
+                if (done >= (size_t)vmin) break;
+            } else {
+                if (done > 0) break;
+                if (f->flags & O_NONBLOCK) return -EAGAIN;
+                sched_sleep(1);
+            }
+        }
+        return (ssize_t)done;
+    }
+
+    /* ── Canonical mode: full Linux n_tty line discipline ──────────────
+     * Buffer characters locally, process erase/kill/signal/EOF,
+     * echo to screen, and deliver a complete line to the caller.
+     * A static buffer is fine here because the physical console is a
+     * single-session device; PTYs have their own per-pair buffers.      */
+#define LBUF_MAX 4096
+    static char   lbuf[LBUF_MAX];
+    static size_t llen   = 0;
+    static bool   lready = false;
+
+    /* Deliver leftover data from a previous partial read */
+    if (lready && llen > 0) {
+        size_t take = (llen < len) ? llen : len;
+        memcpy(dst, lbuf, take);
+        llen -= take;
+        if (llen > 0) memmove(lbuf, lbuf + take, llen);
+        else          lready = false;
+        return (ssize_t)take;
+    }
+    lready = false;
+
+    for (;;) {
+        char ch = 0;
+        if (input_tty_getchar_nonblock(&ch) != 0) {
+            if (f->flags & O_NONBLOCK) {
+                if (llen > 0) goto deliver;
+                return -EAGAIN;
+            }
+            sched_sleep(1);
+            continue;
+        }
+
+        /* ICRNL */
+        if (map_crnl && ch == '\r') ch = '\n';
+
+        /* ISIG: signal-generating characters */
+        if (isig) {
+            if (vintr && ch == vintr) {
+                if (do_echo && con) {
+                    fbcon_putchar_inst(con, '^');
+                    fbcon_putchar_inst(con, 'C');
+                    fbcon_putchar_inst(con, '\n');
+                }
+                llen = 0;
+                tty_signal_foreground(SIGINT);
+                continue;
+            }
+            if (vquit && ch == vquit) {
+                llen = 0;
+                tty_signal_foreground(SIGQUIT);
+                continue;
+            }
+            if (vsusp && ch == vsusp) {
+                if (do_echo && con) {
+                    fbcon_putchar_inst(con, '^');
+                    fbcon_putchar_inst(con, 'Z');
+                    fbcon_putchar_inst(con, '\n');
+                }
+                llen = 0;
+                tty_signal_foreground(SIGTSTP);
+                continue;
+            }
+        }
+
+        /* VERASE: erase previous character (^H / DEL) */
+        if (verase && ch == verase) {
+            if (llen > 0) {
+                llen--;
+                if (echoe && con) {
+                    fbcon_putchar_inst(con, '\b');
+                    fbcon_putchar_inst(con, ' ');
+                    fbcon_putchar_inst(con, '\b');
+                }
+            }
+            continue;
+        }
+
+        /* VWERASE: erase previous word (^W) */
+        if (vwerase && ch == vwerase) {
+            while (llen > 0 && lbuf[llen-1] == ' ') {
+                llen--;
+                if (echoe && con) {
+                    fbcon_putchar_inst(con, '\b');
+                    fbcon_putchar_inst(con, ' ');
+                    fbcon_putchar_inst(con, '\b');
+                }
+            }
+            while (llen > 0 && lbuf[llen-1] != ' ') {
+                llen--;
+                if (echoe && con) {
+                    fbcon_putchar_inst(con, '\b');
+                    fbcon_putchar_inst(con, ' ');
+                    fbcon_putchar_inst(con, '\b');
+                }
+            }
+            continue;
+        }
+
+        /* VKILL: erase entire line (^U) */
+        if (vkill && ch == vkill) {
+            if (echoe && con) {
+                for (size_t i = 0; i < llen; i++) {
+                    fbcon_putchar_inst(con, '\b');
+                    fbcon_putchar_inst(con, ' ');
+                    fbcon_putchar_inst(con, '\b');
+                }
+            } else if (echok && con) {
+                fbcon_putchar_inst(con, '\n');
+            }
+            llen = 0;
+            continue;
+        }
+
+        /* VEOF: ^D — deliver line without newline; empty buffer means EOF */
+        if (veof && ch == veof) {
+            if (llen == 0) return 0;  /* EOF */
+            goto deliver;
+        }
+
+        /* Append to line buffer */
+        if (llen < LBUF_MAX - 1)
+            lbuf[llen++] = ch;
+
+        /* Echo */
+        if (con) {
+            if (ch == '\n') {
+                if (do_echo || echonl) fbcon_putchar_inst(con, '\n');
+            } else if ((unsigned char)ch < 0x20 && ch != '\t') {
+                /* control character: show as ^X */
+                if (do_echo) {
+                    fbcon_putchar_inst(con, '^');
+                    fbcon_putchar_inst(con, (char)(ch + 0x40));
+                }
+            } else {
+                if (do_echo) fbcon_putchar_inst(con, ch);
+            }
+        }
+
+        /* Newline completes the line */
+        if (ch == '\n') goto deliver;
+    }
+
+deliver:;
+    size_t take = (llen < len) ? llen : len;
+    memcpy(dst, lbuf, take);
+    llen -= take;
+    if (llen > 0) { memmove(lbuf, lbuf + take, llen); lready = true; }
+    return (ssize_t)take;
+}
+
+static ssize_t tty_console_write(file_t *f, const void *buf, size_t len) {
+    (void)f;
+    fbcon_t *con = fbcon_get();
+    if (!con) return (ssize_t)len;   /* discard if no console */
+    const char *s = (const char *)buf;
+    uint32_t oflag = tty_get_oflag();
+    bool post  = (oflag & TTY_OFLAG_OPOST)  != 0;
+    bool onlcr = (oflag & TTY_OFLAG_ONLCR) != 0;
+    for (size_t i = 0; i < len; i++) {
+        char ch = s[i];
+        if (post && onlcr && ch == '\n')
+            fbcon_putchar_inst(con, '\r');
+        fbcon_putchar_inst(con, ch);
+    }
+    return (ssize_t)len;
+}
+
+static int tty_console_poll(file_t *f, int events) {
+    (void)f;
+    int ready = 0;
+    if ((events & (POLLIN | POLLRDNORM)) && input_tty_char_available())
+        ready |= POLLIN | POLLRDNORM;
+    if (events & (POLLOUT | POLLWRNORM))
+        ready |= POLLOUT | POLLWRNORM;
+    return ready;
+}
+
+static int tty_console_close(file_t *f) { (void)f; return 0; }
+
+static file_ops_t g_tty_console_fops = {
+    .read  = tty_console_read,
+    .write = tty_console_write,
+    .close = tty_console_close,
+    .poll  = tty_console_poll,
+    .ioctl = tty_console_ioctl,
+};
 
 static inline uint64_t devfs_rdtsc(void) {
     uint32_t lo, hi;
@@ -68,6 +320,9 @@ static inline uint64_t devfs_rdtsc(void) {
 #define DEV_VTTY    10   /* /dev/ttyN  — virtual console N (node->index)     */
 #define DEV_LOOP    11   /* /dev/loopN — loop block device N (node->index)   */
 #define DEV_SYM     12   /* symlink node: target in node->symlink_target     */
+#define DEV_INPUT_DIR   13   /* /dev/input (sub-directory)                   */
+#define DEV_INPUT_EVENT 14   /* /dev/input/eventN — Linux evdev char device   */
+#define DEV_FB          15   /* /dev/fb0  — Linux fbdev framebuffer           */
 
 typedef struct {
     const char *name;
@@ -115,7 +370,9 @@ static const struct { const char *name; const char *target; } g_sym_entries[] = 
 #define RDDIR_SYM_BASE  (DEV_MAX)
 #define RDDIR_VTTY_BASE (DEV_MAX + SYM_MAX)
 #define RDDIR_LOOP_BASE (DEV_MAX + SYM_MAX + VTTY_COUNT)
-#define RDDIR_BLK_BASE  (DEV_MAX + SYM_MAX + VTTY_COUNT + LOOP_COUNT)
+/* Extra synthetic entries (fb0 and input/) appear before block devices     */
+#define RDDIR_EXTRA_BASE (DEV_MAX + SYM_MAX + VTTY_COUNT + LOOP_COUNT)
+#define RDDIR_BLK_BASE   (RDDIR_EXTRA_BASE + 2)  /* +2: fb0 + input dir    */
 
 /* ── Per-vnode device info ───────────────────────────────────────────────── */
 typedef struct {
@@ -506,6 +763,22 @@ static vnode_t *devfs_make_dynamic(vnode_t *dir, int type, int idx_,
 static vnode_t *devfs_lookup(vnode_t *dir, const char *name) {
     if (!dir || !name) return NULL;
 
+    /* If the parent is the /dev/input sub-directory, look up eventN nodes */
+    if (dir->fs_data) {
+        devfs_node_t *pn = (devfs_node_t *)dir->fs_data;
+        if (pn->dev_type == DEV_INPUT_DIR) {
+            if (strcmp(name, "event0") == 0)
+                return devfs_make_dynamic(dir, DEV_INPUT_EVENT, 0,
+                                          MKDEV(13, 64), 900,
+                                          VFS_S_IFCHR | 0660);
+            if (strcmp(name, "event1") == 0)
+                return devfs_make_dynamic(dir, DEV_INPUT_EVENT, 1,
+                                          MKDEV(13, 65), 901,
+                                          VFS_S_IFCHR | 0660);
+            return NULL;
+        }
+    }
+
     /* Static char device nodes (cached in dev_vnodes[]) */
     for (int i = 0; i < DEV_MAX; i++) {
         if (strcmp(name, g_dev_entries[i].name) == 0) {
@@ -540,6 +813,16 @@ static vnode_t *devfs_lookup(vnode_t *dir, const char *name) {
                                       (uint64_t)(700+n), VFS_S_IFBLK | 0660);
     }
 
+    /* /dev/input  — sub-directory containing evdev nodes */
+    if (strcmp(name, "input") == 0)
+        return devfs_make_dynamic(dir, DEV_INPUT_DIR, 0, 0,
+                                   800, VFS_S_IFDIR | 0755);
+
+    /* /dev/fb0  — Linux framebuffer character device (major 29, minor 0) */
+    if (strcmp(name, "fb0") == 0)
+        return devfs_make_dynamic(dir, DEV_FB, 0, MKDEV(29, 0),
+                                   850, VFS_S_IFCHR | 0660);
+
     /* Block devices registered with blkdev */
     blkdev_t *blk = blkdev_find_by_name(name);
     if (blk) {
@@ -573,27 +856,51 @@ static int devfs_open(vnode_t *v, int flags) {
 
     if (node->dev_type == DEV_TTY) {
         /* /dev/tty → the process's controlling terminal.
-         * If the caller has a PTY as its ctty, route the file through
-         * the slave side of that PTY exactly like Linux does. */
+         * If the caller has a PTY as its ctty, route through the PTY slave.
+         * Otherwise fall through to the physical console.                   */
         task_t *cur = sched_current();
         if (cur && cur->ctty_pty) {
             v->pending_f_ops = &g_pty_slave_fops;
             v->pending_priv  = cur->ctty_pty;
+        } else {
+            v->pending_f_ops = &g_tty_console_fops;
+            v->pending_priv  = NULL;
         }
-        /* else: fall through to the physical console (framebuffer/keyboard) */
+        return 0;
+    }
+
+    if (node->dev_type == DEV_VTTY) {
+        /* /dev/ttyN always routes to the physical console.                  */
+        v->pending_f_ops = &g_tty_console_fops;
+        v->pending_priv  = NULL;
         return 0;
     }
 
     if (node->dev_type == DEV_PTMX) {
-        /* Each open of /dev/ptmx allocates a new PTY master (Linux: ptmx_open) */
+        /* Each open of /dev/ptmx allocates a new PTY master */
         int idx = pty_alloc();
         if (idx < 0) return -ENOMEM;
         pty_pair_t *pair = pty_get(idx);
         if (!pair) return -EIO;
-        /* Inject into the vnode so vfs_open() transfers it to the file_t */
         v->pending_f_ops = &g_pty_master_fops;
         v->pending_priv  = pair;
+        return 0;
     }
+
+    if (node->dev_type == DEV_INPUT_EVENT) {
+        /* event0 = keyboard, event1 = mouse */
+        v->pending_f_ops = (node->index == 0) ? &g_evdev_kbd_fops
+                                              : &g_evdev_mouse_fops;
+        v->pending_priv  = (void *)(uintptr_t)(unsigned int)node->index;
+        return 0;
+    }
+
+    if (node->dev_type == DEV_FB) {
+        v->pending_f_ops = &g_fb_fops;
+        v->pending_priv  = NULL;
+        return 0;
+    }
+
     return 0;
 }
 
@@ -639,12 +946,29 @@ static int devfs_readdir(vnode_t *dir, uint64_t *cookie, vfs_dirent_t *out) {
     }
 
     /* Loop devices loop0..loop(LOOP_COUNT-1) */
-    if (idx < (uint64_t)RDDIR_BLK_BASE) {
+    if (idx < (uint64_t)RDDIR_EXTRA_BASE) {
         uint64_t li = idx - RDDIR_LOOP_BASE;
         out->ino  = 700 + li;
         out->type = VFS_DT_BLK;
         out->name[0]='l'; out->name[1]='o'; out->name[2]='o';
         out->name[3]='p'; out->name[4]=(char)('0'+li); out->name[5]='\0';
+        *cookie = idx + 1;
+        return 1;
+    }
+
+    /* Synthetic: /dev/fb0 (extra index 0) and /dev/input (extra index 1) */
+    if (idx < (uint64_t)RDDIR_BLK_BASE) {
+        uint64_t ei = idx - RDDIR_EXTRA_BASE;
+        if (ei == 0) {
+            out->ino  = 850;
+            out->type = VFS_DT_CHR;
+            out->name[0]='f'; out->name[1]='b'; out->name[2]='0'; out->name[3]='\0';
+        } else {
+            out->ino  = 800;
+            out->type = VFS_DT_DIR;
+            out->name[0]='i'; out->name[1]='n'; out->name[2]='p';
+            out->name[3]='u'; out->name[4]='t'; out->name[5]='\0';
+        }
         *cookie = idx + 1;
         return 1;
     }
@@ -700,7 +1024,9 @@ static void devfs_evict(vnode_t *v) {
     devfs_node_t *node = (devfs_node_t *)v->fs_data;
     /* Free nodes that were dynamically allocated during lookup */
     if (node->blk || node->dev_type == DEV_SYM ||
-        node->dev_type == DEV_VTTY || node->dev_type == DEV_LOOP) {
+        node->dev_type == DEV_VTTY  || node->dev_type == DEV_LOOP ||
+        node->dev_type == DEV_INPUT_DIR || node->dev_type == DEV_INPUT_EVENT ||
+        node->dev_type == DEV_FB) {
         kfree(node);
         v->fs_data = NULL;
     }

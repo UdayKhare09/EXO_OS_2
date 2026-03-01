@@ -1,5 +1,6 @@
 /* drivers/input/input.c — SPSC event ring implementation */
 #include "input.h"
+#include "evdev.h"           /* evdev_feed_key, evdev_feed_mouse */
 #include "lib/klog.h"
 #include "arch/x86_64/cpu.h"   /* cpu_mfence */
 #include "ipc/signal.h"
@@ -9,6 +10,10 @@ extern void tty_signal_foreground(int sig);
 
 input_ring_t g_kbd_ring;
 input_ring_t g_mouse_ring;
+
+/* ── Toggle-key state ────────────────────────────────────────────────────── */
+static bool g_capslock = false;  /* toggled on HID 0x39 press               */
+static bool g_numlock  = false;  /* toggled on HID 0x53 press               */
 
 #define TTY_CHAR_RING_SIZE 1024u
 static char g_tty_chars[TTY_CHAR_RING_SIZE];
@@ -37,15 +42,45 @@ static inline void tty_seq_push(const char *s) {
 static bool input_keycode_to_esc_seq(uint8_t keycode, const char **seq) {
     if (!seq) return false;
     switch (keycode) {
+        /* ── Arrow keys ───────────────────────────────────────────────── */
         case 0x4F: *seq = "\x1b[C"; return true; /* Right arrow */
         case 0x50: *seq = "\x1b[D"; return true; /* Left arrow  */
         case 0x51: *seq = "\x1b[B"; return true; /* Down arrow  */
         case 0x52: *seq = "\x1b[A"; return true; /* Up arrow    */
-        case 0x4A: *seq = "\x1b[H"; return true; /* Home */
-        case 0x4D: *seq = "\x1b[F"; return true; /* End  */
-        case 0x4C: *seq = "\x1b[3~"; return true; /* Delete */
-        default: return false;
+        /* ── Navigation cluster ───────────────────────────────────────── */
+        case 0x4A: *seq = "\x1b[H"; return true;  /* Home        */
+        case 0x4D: *seq = "\x1b[F"; return true;  /* End         */
+        case 0x4C: *seq = "\x1b[3~"; return true; /* Delete      */
+        case 0x49: *seq = "\x1b[2~"; return true; /* Insert      */
+        case 0x4B: *seq = "\x1b[5~"; return true; /* Page Up     */
+        case 0x4E: *seq = "\x1b[6~"; return true; /* Page Down   */
+        /* ── Function keys (xterm SS3 / CSI ~ sequences) ──────────────── */
+        case 0x3A: *seq = "\x1bOP";    return true; /* F1  */
+        case 0x3B: *seq = "\x1bOQ";    return true; /* F2  */
+        case 0x3C: *seq = "\x1bOR";    return true; /* F3  */
+        case 0x3D: *seq = "\x1bOS";    return true; /* F4  */
+        case 0x3E: *seq = "\x1b[15~"; return true; /* F5  */
+        case 0x3F: *seq = "\x1b[17~"; return true; /* F6  */
+        case 0x40: *seq = "\x1b[18~"; return true; /* F7  */
+        case 0x41: *seq = "\x1b[19~"; return true; /* F8  */
+        case 0x42: *seq = "\x1b[20~"; return true; /* F9  */
+        case 0x43: *seq = "\x1b[21~"; return true; /* F10 */
+        case 0x44: *seq = "\x1b[23~"; return true; /* F11 */
+        case 0x45: *seq = "\x1b[24~"; return true; /* F12 */
+        /* ── Numpad when numlock is OFF → navigation sequences ─────────── */
+        case 0x59: if (!g_numlock) { *seq = "\x1b[F"; return true; } break; /* KP1=End   */
+        case 0x5A: if (!g_numlock) { *seq = "\x1b[B"; return true; } break; /* KP2=Down  */
+        case 0x5B: if (!g_numlock) { *seq = "\x1b[6~"; return true; } break; /* KP3=PgDn */
+        case 0x5C: if (!g_numlock) { *seq = "\x1b[D"; return true; } break; /* KP4=Left  */
+        case 0x5E: if (!g_numlock) { *seq = "\x1b[C"; return true; } break; /* KP6=Right */
+        case 0x5F: if (!g_numlock) { *seq = "\x1b[H"; return true; } break; /* KP7=Home  */
+        case 0x60: if (!g_numlock) { *seq = "\x1b[A"; return true; } break; /* KP8=Up    */
+        case 0x61: if (!g_numlock) { *seq = "\x1b[5~"; return true; } break; /* KP9=PgUp */
+        case 0x62: if (!g_numlock) { *seq = "\x1b[2~"; return true; } break; /* KP0=Ins  */
+        case 0x63: if (!g_numlock) { *seq = "\x1b[3~"; return true; } break; /* KP.=Del  */
+        default: break;
     }
+    return false;
 }
 
 void input_init(void) {
@@ -80,6 +115,9 @@ static inline bool ring_pop(input_ring_t *r, input_event_t *out) {
 }
 
 void input_push_key(uint8_t modifiers, uint8_t keycode, uint8_t state) {
+    /* ── Feed Linux evdev ring before any further processing ─────────────── */
+    evdev_feed_key(keycode, state, modifiers);
+
     input_event_t ev = {
         .type      = INPUT_EV_KEY,
         .state     = state,
@@ -93,6 +131,9 @@ void input_push_key(uint8_t modifiers, uint8_t keycode, uint8_t state) {
     }
 
     if (state == INPUT_KEY_PRESS) {
+        /* ── Toggle-key state updates ──────────────────────────────────── */
+        if (keycode == 0x39) { g_capslock = !g_capslock; return; }
+        if (keycode == 0x53) { g_numlock  = !g_numlock;  return; }
         if (modifiers & MOD_CTRL) {
             /* Ctrl+A..Ctrl+Z => 0x01..0x1A */
             if (keycode >= 0x04 && keycode <= 0x1D) {
@@ -121,7 +162,14 @@ void input_push_key(uint8_t modifiers, uint8_t keycode, uint8_t state) {
     }
 }
 
+/* Saved previous mouse button mask (for delta computation in evdev). */
+static uint8_t g_prev_mouse_buttons = 0;
+
 void input_push_mouse(uint8_t buttons, int8_t dx, int8_t dy, int8_t scroll) {
+    /* ── Feed Linux evdev ring first ─────────────────────────────────────── */
+    evdev_feed_mouse(dx, dy, buttons, g_prev_mouse_buttons, scroll);
+    g_prev_mouse_buttons = buttons;
+
     input_event_t ev = {
         .type         = INPUT_EV_MOUSE,
         .mouse_buttons= buttons,
@@ -172,14 +220,48 @@ static const char keycode_shifted[0x40] = {
     [0x38]='?',
 };
 
+/* Numpad digit table (numlock ON): index = HID code - 0x59 */
+static const char numpad_digits[12] = {
+    /* 0x59=KP1 … 0x61=KP9 */ '1','2','3','4','5','6','7','8','9',
+    /* 0x62=KP0 */             '0',
+    /* 0x63=KP. */             '.',
+    /* 0x5D=KP5, gaps: handle KP5 specially below */
+};
+
 char input_keycode_to_ascii(uint8_t keycode, uint8_t modifiers) {
+    /* ── Numpad digits (numlock ON) ──────────────────────────────────────── */
+    if (g_numlock) {
+        if (keycode >= 0x59 && keycode <= 0x63) {
+            /* KP5 (0x5D) is index 4 in the 0x59-based table → '5' */
+            return numpad_digits[keycode - 0x59];
+        }
+        if (keycode == 0x58) return '\r'; /* KP Enter */
+        if (keycode == 0x54) return '/';  /* KP / */
+        if (keycode == 0x55) return '*';  /* KP * */
+        if (keycode == 0x56) return '-';  /* KP - */
+        if (keycode == 0x57) return '+';  /* KP + */
+    }
+    /* ── Regular keys (table only covers 0x04-0x3F) ──────────────────────── */
     if (keycode >= 0x40) return 0;
-    if (modifiers & MOD_SHIFT) return keycode_shifted[keycode];
+    bool shifted = (modifiers & MOD_SHIFT) != 0;
+    /* Capslock inverts case only for letter keys (0x04-0x1D). */
+    if (g_capslock && keycode >= 0x04 && keycode <= 0x1D)
+        shifted = !shifted;
+    if (shifted) return keycode_shifted[keycode];
     return keycode_normal[keycode];
 }
 
 bool input_tty_char_available(void) {
     return g_tty_tail != g_tty_head;
+}
+
+/* Return the number of characters waiting in the TTY char ring.
+ * Used by FIONREAD / TIOCINQ ioctl. */
+int input_tty_char_count(void) {
+    uint32_t h = g_tty_head;
+    uint32_t t = g_tty_tail;
+    if (h >= t) return (int)(h - t);
+    return (int)(TTY_CHAR_RING_SIZE - t + h);
 }
 
 int input_tty_getchar_nonblock(char *out_ch) {
@@ -190,4 +272,10 @@ int input_tty_getchar_nonblock(char *out_ch) {
     cpu_mfence();
     g_tty_tail = (t + 1) & (TTY_CHAR_RING_SIZE - 1);
     return 0;
+}
+
+/* input_tty_flush: discard all bytes in the TTY character ring (TCFLSH). */
+void input_tty_flush(void) {
+    cpu_mfence();
+    g_tty_tail = g_tty_head;
 }

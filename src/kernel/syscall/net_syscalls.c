@@ -136,7 +136,52 @@ static kernel_termios_t g_tty_termios = {
     .c_ospeed = 38400,
 };
 
+/* ── Per-session termios table ───────────────────────────────────────────────────
+ * Like Linux, each setsid() session has its own line-discipline settings.
+ * When a session first calls TCGETS/TCSETS, an entry is allocated.        */
+#define SESSION_TABLE_SIZE  64
+typedef struct {
+    uint32_t         sid;      /* 0 = free slot                             */
+    kernel_termios_t termios;  /* session-specific termios copy             */
+    int              fg_pgid;  /* foreground process group for this session */
+} session_tty_t;
+static session_tty_t g_session_table[SESSION_TABLE_SIZE];
+
 static int g_tty_fg_pgid = 1;
+
+static session_tty_t *session_find(uint32_t sid) {
+    if (!sid) return NULL;
+    for (int i = 0; i < SESSION_TABLE_SIZE; i++)
+        if (g_session_table[i].sid == sid) return &g_session_table[i];
+    return NULL;
+}
+
+static session_tty_t *session_find_or_create(uint32_t sid) {
+    if (!sid) return NULL;
+    for (int i = 0; i < SESSION_TABLE_SIZE; i++) {
+        if (g_session_table[i].sid == sid) return &g_session_table[i];
+    }
+    /* Allocate a new slot, copying current defaults */
+    for (int i = 0; i < SESSION_TABLE_SIZE; i++) {
+        if (g_session_table[i].sid == 0) {
+            g_session_table[i].sid     = sid;
+            g_session_table[i].termios = g_tty_termios;
+            g_session_table[i].fg_pgid = (int)sid;
+            return &g_session_table[i];
+        }
+    }
+    return NULL; /* table full — fall back to global */
+}
+
+static inline kernel_termios_t *session_termios(uint32_t sid) {
+    session_tty_t *s = session_find(sid);
+    return s ? &s->termios : &g_tty_termios;
+}
+
+static inline int session_fg_pgid(uint32_t sid) {
+    session_tty_t *s = session_find(sid);
+    return s ? s->fg_pgid : g_tty_fg_pgid;
+}
 
 static inline int current_has_cap(uint64_t cap) {
     task_t *cur = sched_current();
@@ -144,44 +189,65 @@ static inline int current_has_cap(uint64_t cap) {
 }
 
 uint32_t tty_get_iflag(void) {
-    return g_tty_termios.c_iflag;
+    task_t *cur = sched_current();
+    return session_termios(cur ? cur->sid : 0)->c_iflag;
 }
 
 uint32_t tty_get_lflag(void) {
-    return g_tty_termios.c_lflag;
+    task_t *cur = sched_current();
+    return session_termios(cur ? cur->sid : 0)->c_lflag;
 }
 
 uint32_t tty_get_oflag(void) {
-    return g_tty_termios.c_oflag;
+    task_t *cur = sched_current();
+    return session_termios(cur ? cur->sid : 0)->c_oflag;
 }
 
 void tty_set_fg_pgid(int pgid) {
+    task_t *cur = sched_current();
+    if (cur) {
+        session_tty_t *s = session_find_or_create(cur->sid);
+        if (s) { s->fg_pgid = pgid; return; }
+    }
     g_tty_fg_pgid = pgid;
 }
 
 uint8_t tty_get_cc(int idx) {
     if (idx < 0 || idx >= 19) return 0;
-    return g_tty_termios.c_cc[idx];
+    task_t *cur = sched_current();
+    return session_termios(cur ? cur->sid : 0)->c_cc[idx];
 }
 
 void tty_signal_foreground(int sig) {
     if (sig <= 0 || sig >= NSIGS) return;
+    int pgid = g_tty_fg_pgid;
+    /* Use session-specific fg_pgid if current task has a session entry */
+    task_t *cur = sched_current();
+    if (cur) {
+        session_tty_t *s = session_find(cur->sid);
+        if (s) pgid = s->fg_pgid;
+    }
     for (uint32_t i = 1; i < TASK_TABLE_SIZE; i++) {
         task_t *t = task_get_from_table(i);
         if (!t) continue;
         if (t->state == TASK_DEAD || t->state == TASK_ZOMBIE) continue;
-        if ((int)t->pgid == g_tty_fg_pgid)
+        if ((int)t->pgid == pgid)
             signal_send(t, sig);
     }
 }
 
 static inline bool is_tty_path(const char *path) {
     if (!path || !path[0]) return false;
-    return strcmp(path, "/dev/tty") == 0 ||
-           strcmp(path, "/dev/console") == 0 ||
-           strcmp(path, "/dev/stdin") == 0 ||
-           strcmp(path, "/dev/stdout") == 0 ||
-           strcmp(path, "/dev/stderr") == 0;
+    if (strcmp(path, "/dev/tty") == 0 ||
+        strcmp(path, "/dev/console") == 0 ||
+        strcmp(path, "/dev/stdin") == 0 ||
+        strcmp(path, "/dev/stdout") == 0 ||
+        strcmp(path, "/dev/stderr") == 0) return true;
+    /* /dev/ttyN  (N = 0-9) */
+    if (path[0]=='/' && path[1]=='d' && path[2]=='e' && path[3]=='v' &&
+        path[4]=='/' && path[5]=='t' && path[6]=='t' && path[7]=='y' &&
+        path[8]>='0' && path[8]<='9' && path[9]=='\0') return true;
+    return false;
 }
 
 static inline bool is_tty_file(const file_t *f) {
@@ -195,32 +261,39 @@ static void sync_socket_nonblock(file_t *f) {
     sk->nonblock = (f->flags & O_NONBLOCK) ? 1 : 0;
 }
 
-static int tty_ioctl(file_t *f, unsigned long cmd, unsigned long arg) {
+/* tty_console_ioctl: non-static TTY ioctl handler.
+ * Called from f_ops->ioctl for /dev/ttyN, /dev/tty (console path),
+ * and as fallback for files matched by is_tty_file().                      */
+int tty_console_ioctl(file_t *f, unsigned long cmd, unsigned long arg) {
     (void)f;
+    task_t *cur = sched_current();
+    uint32_t sid = cur ? cur->sid : 0;
+    session_tty_t *sess = session_find_or_create(sid);
+    kernel_termios_t *termios = sess ? &sess->termios : &g_tty_termios;
+    int *fg_pgid_ptr = sess ? &sess->fg_pgid : &g_tty_fg_pgid;
+
     if (cmd == TCGETS) {
         if (!arg) return -EINVAL;
         kernel_termios_t *user_t = (kernel_termios_t *)(uintptr_t)arg;
-        *user_t = g_tty_termios;
+        *user_t = *termios;
         return 0;
     }
     if (cmd == TCSETS || cmd == TCSETSW || cmd == TCSETSF) {
         if (!arg) return -EINVAL;
         const kernel_termios_t *user_t = (const kernel_termios_t *)(uintptr_t)arg;
-        g_tty_termios = *user_t;
+        *termios = *user_t;
         return 0;
     }
     if (cmd == TIOCGPGRP) {
         if (!arg) return -EINVAL;
-        int *pgid = (int *)(uintptr_t)arg;
-        *pgid = g_tty_fg_pgid;
+        *(int *)(uintptr_t)arg = *fg_pgid_ptr;
         return 0;
     }
     if (cmd == TIOCSPGRP) {
         if (!arg) return -EINVAL;
         int new_pgid = *(int *)(uintptr_t)arg;
-        if (new_pgid <= 0)
-            return -EINVAL;
-        g_tty_fg_pgid = new_pgid;
+        if (new_pgid <= 0) return -EINVAL;
+        *fg_pgid_ptr = new_pgid;
         return 0;
     }
     if (cmd == TIOCGWINSZ) {
@@ -230,32 +303,38 @@ static int tty_ioctl(file_t *f, unsigned long cmd, unsigned long arg) {
         int cols = fbcon_text_cols();
         int xpx = fbcon_pixel_width();
         int ypx = fbcon_pixel_height();
-        ws->ws_row = (uint16_t)((rows > 0) ? rows : 25);
-        ws->ws_col = (uint16_t)((cols > 0) ? cols : 80);
-        ws->ws_xpixel = (uint16_t)((xpx > 0) ? xpx : 640);
-        ws->ws_ypixel = (uint16_t)((ypx > 0) ? ypx : 480);
+        ws->ws_row    = (uint16_t)((rows > 0) ? rows : 25);
+        ws->ws_col    = (uint16_t)((cols > 0) ? cols : 80);
+        ws->ws_xpixel = (uint16_t)((xpx  > 0) ? xpx  : 640);
+        ws->ws_ypixel = (uint16_t)((ypx  > 0) ? ypx  : 480);
         return 0;
     }
     if (cmd == TIOCSWINSZ) {
         if (!arg) return -EINVAL;
-        /* update window size and deliver SIGWINCH to foreground process group */
         const kernel_winsize_t *ws = (const kernel_winsize_t *)(uintptr_t)arg;
-        (void)ws; /* fbcon drives real dimensions; just signal SIGWINCH */
-        tty_signal_foreground(28); /* SIGWINCH = 28 */
+        (void)ws;
+        tty_signal_foreground(28); /* SIGWINCH */
         return 0;
     }
     if (cmd == TIOCSCTTY) {
-        /* make this terminal the controlling terminal of the calling session
-         * Linux: sets tty->session = current->session, tty->pgrp = current->pgrp */
-        task_t *cur = sched_current();
-        if (cur) {
-            g_tty_fg_pgid = (int)cur->pgid;
-        }
+        if (cur) *fg_pgid_ptr = (int)cur->pgid;
         return 0;
     }
     if (cmd == TIOCNOTTY) {
-        /* detach from controlling terminal — Linux sets current->signal->tty = NULL */
-        /* We have a single global TTY so nothing to detach; just succeed */
+        return 0; /* accept and ignore */
+    }
+    /* TCFLSH (0x540B): flush input or output queue */
+    if (cmd == 0x540BU) {
+        /* TCIOFLUSH (2) or TCIFLUSH (0): flush input ring */
+        extern void input_tty_flush(void);
+        input_tty_flush();
+        return 0;
+    }
+    /* TIOCINQ / FIONREAD (0x541B): bytes waiting in input queue */
+    if (cmd == 0x541BU) {
+        if (!arg) return -EINVAL;
+        extern int input_tty_char_count(void);
+        *(int *)(uintptr_t)arg = input_tty_char_count();
         return 0;
     }
     return -EINVAL;
@@ -453,6 +532,13 @@ int64_t sys_poll(struct pollfd *fds, uint64_t nfds, int timeout) {
                     mask |= (POLLOUT | POLLWRNORM);
                 fds[i].revents = (int16_t)mask;
                 if (mask) ready++;
+            } else if (f->vnode) {
+                /* Regular VFS file: always report as ready for I/O */
+                int mask = 0;
+                if (fds[i].events & (POLLIN  | POLLRDNORM)) mask |= POLLIN  | POLLRDNORM;
+                if (fds[i].events & (POLLOUT | POLLWRNORM)) mask |= POLLOUT | POLLWRNORM;
+                fds[i].revents = (int16_t)mask;
+                if (mask) ready++;
             }
         }
         if (ready > 0) break;
@@ -572,8 +658,24 @@ int64_t sys_ioctl(int fd, unsigned long cmd, unsigned long arg) {
     if (f->f_ops && f->f_ops->ioctl)
         return (int64_t)f->f_ops->ioctl(f, cmd, arg);
 
+    /* FIONREAD / TIOCINQ: number of bytes available to read */
+    if (cmd == 0x541BU) {
+        if (!arg) return -EINVAL;
+        int *cnt = (int *)(uintptr_t)arg;
+        if (is_tty_file(f)) {
+            extern int input_tty_char_count(void);
+            *cnt = input_tty_char_count();
+        } else if (f->vnode) {
+            int64_t avail = (int64_t)f->vnode->size - (int64_t)f->offset;
+            *cnt = (avail > 0) ? (int)avail : 0;
+        } else {
+            *cnt = 0;
+        }
+        return 0;
+    }
+
     if (is_tty_file(f))
-        return (int64_t)tty_ioctl(f, cmd, arg);
+        return (int64_t)tty_console_ioctl(f, cmd, arg);
 
     return -EINVAL;
 }

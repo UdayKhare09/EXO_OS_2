@@ -109,6 +109,13 @@ int64_t sys_fallocate(int fd, int mode, int64_t offset, int64_t len);
 int64_t sys_madvise(void *addr, uint64_t length, int advice);
 int64_t sys_memfd_create(const char *name, unsigned int flags);
 int64_t sys_inotify_init1(int flags);
+/* ── Additional Phase-7 syscalls ─────────────────────────────────────────── */
+int64_t sys_select(int nfds, void *readfds, void *writefds, void *exceptfds, void *timeout);
+int64_t sys_pselect6(int nfds, void *readfds, void *writefds, void *exceptfds, void *timeout, void *sigmask);
+int64_t sys_sysinfo(void *info);
+int64_t sys_sigaltstack(const void *ss, void *old_ss);
+int64_t sys_rt_sigsuspend(const uint64_t *mask, uint64_t sigsetsize);
+int64_t sys_clock_getres(int clock_id, kernel_timespec_t *res);
 
 /* ── Forward declarations — epoll ───────────────────────────────────────── */
 int64_t sys_epoll_create1(int flags);
@@ -299,6 +306,19 @@ static int64_t sc_memfd_create(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint6
     { (void)c;(void)d;(void)e;(void)f; return sys_memfd_create((const char*)a,(unsigned)b); }
 static int64_t sc_inotify_init1(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { (void)b;(void)c;(void)d;(void)e;(void)f; return sys_inotify_init1((int)a); }
+/* ── Phase-7 sc_ wrappers ─────────────────────────────────────────────────── */
+static int64_t sc_select(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)f; return sys_select((int)a,(void*)b,(void*)c,(void*)d,(void*)e); }
+static int64_t sc_pselect6(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { return sys_pselect6((int)a,(void*)b,(void*)c,(void*)d,(void*)e,(void*)f); }
+static int64_t sc_sysinfo(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)b;(void)c;(void)d;(void)e;(void)f; return sys_sysinfo((void*)a); }
+static int64_t sc_sigaltstack(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)c;(void)d;(void)e;(void)f; return sys_sigaltstack((const void*)a,(void*)b); }
+static int64_t sc_rt_sigsuspend(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)c;(void)d;(void)e;(void)f; return sys_rt_sigsuspend((const uint64_t*)a,b); }
+static int64_t sc_clock_getres(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)c;(void)d;(void)e;(void)f; return sys_clock_getres((int)a,(kernel_timespec_t*)b); }
 static int64_t sc_epoll_create1(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { (void)b;(void)c;(void)d;(void)e;(void)f; return sys_epoll_create1((int)a); }
 static int64_t sc_epoll_ctl(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
@@ -1716,6 +1736,13 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_EPOLL_CREATE1]  = sc_epoll_create1,
     [SYS_INOTIFY_INIT1]  = sc_inotify_init1,
     [SYS_MEMFD_CREATE]   = sc_memfd_create,
+    /* Phase 7: select/pselect6, sysinfo, sigaltstack, rt_sigsuspend, clock_getres */
+    [SYS_SELECT]         = sc_select,
+    [SYS_PSELECT6]       = sc_pselect6,
+    [SYS_SYSINFO]        = sc_sysinfo,
+    [SYS_SIGALTSTACK]    = sc_sigaltstack,
+    [SYS_RT_SIGSUSPEND]  = sc_rt_sigsuspend,
+    [SYS_CLOCK_GETRES]   = sc_clock_getres,
 };
 
 /* ── INT 0x80 handler ─────────────────────────────────────────────────────── */

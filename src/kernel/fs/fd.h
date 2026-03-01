@@ -27,6 +27,10 @@ typedef struct file_ops {
     int     (*close)(struct file *f);
     int     (*poll)(struct file *f, int events);  /* returns ready-event mask */
     int     (*ioctl)(struct file *f, unsigned long cmd, unsigned long arg);
+    /* Device mmap: map `len` bytes at `offset` into `addr` of current task.
+     * Returns 0 on success, negative errno on failure.                     */
+    int64_t (*mmap)(struct file *f, uint64_t addr, uint64_t len, int prot,
+                    int flags, int64_t offset);
 } file_ops_t;
 
 /* ── Open file object ────────────────────────────────────────────────────── */

@@ -120,6 +120,11 @@ typedef struct task {
     char                 exe_path[TASK_CWD_MAX];         /* executable absolute path */
     char                *env_block;                      /* NUL-separated environ (kernel copy) */
     uint32_t             env_block_size;                 /* byte length of env_block */
+
+    /* ── Signal alternate stack (sigaltstack / SA_ONSTACK) ───────────────── */
+    uint64_t             altstack_sp;    /* SS.ss_sp (user pointer)           */
+    uint64_t             altstack_size;  /* SS.ss_size                        */
+    uint32_t             altstack_flags; /* SS_DISABLE(4)=disabled            */
 } task_t;
 
 /* Create a new kernel task; returns NULL on error */

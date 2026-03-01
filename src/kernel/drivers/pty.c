@@ -284,6 +284,25 @@ static int pty_master_ioctl(file_t *f, unsigned long cmd, unsigned long arg) {
         }
         return 0;
     }
+    /* FIONREAD / TIOCINQ (0x541B): bytes available to read from master (from s2m) */
+    if (cmd == 0x541BU) {
+        if (!arg) return -EINVAL;
+        *(int *)(uintptr_t)arg = (int)((p->s2m.tail - p->s2m.head + PTY_BUF_SIZE) % PTY_BUF_SIZE);
+        return 0;
+    }
+    /* TIOCOUTQ (0x5411): bytes in output buffer (m2s in-flight) */
+    if (cmd == 0x5411U) {
+        if (!arg) return -EINVAL;
+        *(int *)(uintptr_t)arg = (int)((p->m2s.tail - p->m2s.head + PTY_BUF_SIZE) % PTY_BUF_SIZE);
+        return 0;
+    }
+    /* TCFLSH (0x540B): flush input or output queue */
+    if (cmd == 0x540BU) {
+        unsigned long queue = arg; /* TCIFLUSH=0, TCOFLUSH=1, TCIOFLUSH=2 */
+        if (queue == 0 || queue == 2) p->s2m.head = p->s2m.tail; /* flush s2m = master reads */
+        if (queue == 1 || queue == 2) p->m2s.head = p->m2s.tail; /* flush m2s = slave reads  */
+        return 0;
+    }
     return -EINVAL;
 }
 
@@ -355,7 +374,21 @@ static ssize_t pty_slave_write(file_t *f, const void *buf, size_t count) {
 }
 
 static int pty_slave_ioctl(file_t *f, unsigned long cmd, unsigned long arg) {
-    /* slave ioctl mirrors master — same termios/winsize state */
+    pty_pair_t *p = (pty_pair_t *)f->private_data;
+    if (!p) return -EIO;
+    /* From slave's perspective: FIONREAD = bytes waiting in m2s (master→slave = slave input) */
+    if (cmd == 0x541BU) {
+        if (!arg) return -EINVAL;
+        *(int *)(uintptr_t)arg = (int)((p->m2s.tail - p->m2s.head + PTY_BUF_SIZE) % PTY_BUF_SIZE);
+        return 0;
+    }
+    /* TIOCOUTQ from slave = bytes in s2m (slave's pending output) */
+    if (cmd == 0x5411U) {
+        if (!arg) return -EINVAL;
+        *(int *)(uintptr_t)arg = (int)((p->s2m.tail - p->s2m.head + PTY_BUF_SIZE) % PTY_BUF_SIZE);
+        return 0;
+    }
+    /* Delegate everything else to the master handler (shared termios/winsize/pgrp state) */
     return pty_master_ioctl(f, cmd, arg);
 }
 

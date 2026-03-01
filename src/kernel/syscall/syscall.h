@@ -26,6 +26,7 @@
 #define SYS_WRITEV      20
 #define SYS_ACCESS       21
 #define SYS_PIPE         22
+#define SYS_SELECT       23
 #define SYS_SCHED_YIELD  24
 #define SYS_DUP         32
 #define SYS_DUP2        33
@@ -62,6 +63,7 @@
 #define SYS_LCHOWN      94
 #define SYS_UMASK       95
 #define SYS_GETRLIMIT   97
+#define SYS_SYSINFO     99
 #define SYS_TIMES       100
 #define SYS_MOUNT      165
 #define SYS_FUTIMESAT   261
@@ -88,6 +90,8 @@
 #define SYS_GETSID      124
 #define SYS_CAPGET      125
 #define SYS_CAPSET      126
+#define SYS_RT_SIGSUSPEND  130
+#define SYS_SIGALTSTACK    131
 #define SYS_PRCTL       157
 #define SYS_ARCH_PRCTL  158
 #define SYS_SYNC        162
@@ -98,6 +102,7 @@
 #define SYS_SET_TID_ADDRESS 218
 #define SYS_TGKILL      234
 #define SYS_CLOCK_GETTIME   228
+#define SYS_CLOCK_GETRES    229
 #define SYS_CLOCK_NANOSLEEP 230
 #define SYS_EXIT_GROUP  231
 #define SYS_FSTATAT     262
@@ -106,6 +111,7 @@
 #define SYS_READLINKAT  267
 #define SYS_FCHMODAT    268
 #define SYS_FACCESSAT   269
+#define SYS_PSELECT6    270
 #define SYS_SET_ROBUST_LIST 273
 #define SYS_GET_ROBUST_LIST 274
 #define SYS_UTIMENSAT   280

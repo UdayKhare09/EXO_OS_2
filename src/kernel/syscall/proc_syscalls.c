@@ -923,6 +923,31 @@ int64_t sys_mmap(uint64_t addr, uint64_t len, int prot, int flags,
         if ((map_file->flags & O_ACCMODE) == O_WRONLY) return -EACCES;
 
         map_vnode = map_file->vnode;
+
+        /* ── Device/driver mmap (e.g. /dev/fb0) ─────────────────────────────
+         * If the opened file has its own mmap handler, call it directly
+         * instead of going through the regular file-backed page fault path.  */
+        if (map_file->f_ops && map_file->f_ops->mmap) {
+            uint64_t dlen  = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+            uint64_t daddr = addr ? (addr & ~(PAGE_SIZE - 1)) : cur->mmap_next;
+            if (!addr) cur->mmap_next += dlen;
+            int64_t r = map_file->f_ops->mmap(map_file, daddr, dlen,
+                                               prot, flags, offset);
+            if (r < 0) return r;
+            /* Track VMA so that munmap can later release the mapping */
+            vma_t *vd = kmalloc(sizeof(vma_t));
+            if (vd) {
+                vd->start = daddr; vd->end = daddr + dlen;
+                vd->flags = VMA_USER | VMA_FILE | VMA_READ | VMA_SHARED;
+                if (prot & PROT_WRITE) vd->flags |= VMA_WRITE;
+                vd->file = map_vnode; vd->file_offset = (uint64_t)offset;
+                vd->file_size = dlen; vd->mmap_flags = (uint32_t)flags;
+                if (vd->file) vfs_vnode_get(vd->file);
+                vma_insert(cur, vd);
+            }
+            return r;
+        }
+
         if (!map_vnode || !map_vnode->ops || !map_vnode->ops->read)
             return -EINVAL;
         if (!VFS_S_ISREG(map_vnode->mode))
@@ -1536,5 +1561,116 @@ int64_t sys_get_robust_list(int pid, uint64_t *head_ptr, uint64_t *len_ptr) {
 
     *head_ptr = target->robust_list_head;
     *len_ptr = target->robust_list_len;
+    return 0;
+}
+
+/* ── sysinfo(2) ─────────────────────────────────────────────────────────────
+ * Fills struct sysinfo with basic system statistics.                        */
+typedef struct {
+    int64_t  uptime;      /* seconds since boot        */
+    uint64_t loads[3];    /* 1/5/15 min load avg       */
+    uint64_t totalram;    /* total usable RAM (bytes)  */
+    uint64_t freeram;     /* free RAM                  */
+    uint64_t sharedram;   /* shared RAM                */
+    uint64_t bufferram;   /* buffer RAM                */
+    uint64_t totalswap;
+    uint64_t freeswap;
+    uint16_t procs;       /* process count             */
+    uint16_t pad[3];
+    uint64_t totalhigh;
+    uint64_t freehigh;
+    uint32_t mem_unit;    /* page size                 */
+    char     _f[20];      /* pad to 64 bytes           */
+} kernel_sysinfo_t;
+
+int64_t sys_sysinfo(kernel_sysinfo_t *info) {
+    if (!info) return -EINVAL;
+    uint64_t now_ms = sched_get_ticks();
+    info->uptime    = (int64_t)(now_ms / 1000ULL);
+    info->loads[0]  = info->loads[1] = info->loads[2] = 0;
+    info->totalram  = pmm_get_total_pages() * PAGE_SIZE;
+    info->freeram   = pmm_get_free_pages()  * PAGE_SIZE;
+    info->sharedram = 0;
+    info->bufferram = 0;
+    info->totalswap = 0;
+    info->freeswap  = 0;
+    info->procs     = 0;        /* TODO: count active tasks */
+    info->totalhigh = 0;
+    info->freehigh  = 0;
+    info->mem_unit  = (uint32_t)PAGE_SIZE;
+    return 0;
+}
+
+/* ── sigaltstack(2) ─────────────────────────────────────────────────────────
+ * Get/set the alternate signal stack for the current thread.               */
+#define SS_ONSTACK  1
+#define SS_DISABLE  4
+
+typedef struct {
+    void    *ss_sp;
+    int      ss_flags;
+    uint64_t ss_size;
+} kernel_stack_t;
+
+int64_t sys_sigaltstack(const kernel_stack_t *ss, kernel_stack_t *old_ss) {
+    task_t *cur = sched_current();
+    if (!cur) return -ESRCH;
+
+    if (old_ss) {
+        old_ss->ss_sp    = (void *)(uintptr_t)cur->altstack_sp;
+        old_ss->ss_flags = (int)cur->altstack_flags;
+        old_ss->ss_size  = cur->altstack_size;
+    }
+    if (ss) {
+        if (ss->ss_flags & ~(SS_ONSTACK | SS_DISABLE)) return -EINVAL;
+        if (ss->ss_flags & SS_DISABLE) {
+            cur->altstack_sp    = 0;
+            cur->altstack_size  = 0;
+            cur->altstack_flags = SS_DISABLE;
+        } else {
+            if (!ss->ss_sp || ss->ss_size < 2048) return -ENOMEM;
+            cur->altstack_sp    = (uint64_t)(uintptr_t)ss->ss_sp;
+            cur->altstack_size  = ss->ss_size;
+            cur->altstack_flags = 0;
+        }
+    }
+    return 0;
+}
+
+/* ── rt_sigsuspend(2) ───────────────────────────────────────────────────────
+ * Temporarily replace the signal mask and suspend until a signal arrives.  */
+int64_t sys_rt_sigsuspend(const uint64_t *mask, uint64_t sigsetsize) {
+    (void)sigsetsize;
+    task_t *cur = sched_current();
+    if (!cur) return -ESRCH;
+
+    uint32_t old_mask = cur->sig_mask;
+    if (mask) cur->sig_mask = (uint32_t)(*mask & 0xFFFFFFFFULL);
+
+    /* Wait until a signal is pending that is not blocked by the new mask */
+    while (1) {
+        uint32_t pending = cur->sig_pending & ~cur->sig_mask;
+        if (pending) break;
+        sched_sleep(1);
+    }
+
+    cur->sig_mask = old_mask;
+    return -EINTR; /* POSIX: sigsuspend always returns -EINTR */
+}
+
+/* ── clock_getres(2) ────────────────────────────────────────────────────────
+ * Return the resolution of the given clock (we report 1 ms = 1,000,000 ns) */
+#ifndef CLOCK_REALTIME
+#define CLOCK_REALTIME  0
+#define CLOCK_MONOTONIC 1
+#endif
+
+int64_t sys_clock_getres(int clock_id, kernel_timespec_t *res) {
+    if (clock_id != CLOCK_REALTIME && clock_id != CLOCK_MONOTONIC)
+        return -EINVAL;
+    if (res) {
+        res->tv_sec  = 0;
+        res->tv_nsec = 1000000; /* 1 ms resolution */
+    }
     return 0;
 }

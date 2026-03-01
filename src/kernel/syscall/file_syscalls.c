@@ -12,6 +12,7 @@
 #include "sched/sched.h"
 #include "sched/task.h"
 #include "sched/cred.h"
+#include "net/socket_defs.h"
 #include "lib/klog.h"
 #include "lib/string.h"
 #include "mm/kmalloc.h"
@@ -1259,4 +1260,102 @@ int64_t sys_memfd_create(const char *name, unsigned int flags) {
 int64_t sys_inotify_init1(int flags) {
     (void)flags;
     return -ENOSYS;
+}
+
+/* ── select(2) / pselect6(2) ────────────────────────────────────────────────
+ * Convert fd_set bitmasks → struct pollfd[] → call sys_poll() → write back.
+ * fd_set is 128 bytes (1024 bits) on Linux x86-64.                         */
+
+int64_t sys_poll(struct pollfd *fds, uint64_t nfds, int timeout); /* forward */
+
+typedef struct { uint64_t fds_bits[16]; } linux_fd_set_t; /* 1024 bits */
+
+#define FD_ISSET_L(fd, setp) \
+    (((setp)->fds_bits[(fd) >> 6] >> ((fd) & 63)) & 1)
+#define FD_SET_L(fd, setp) \
+    ((setp)->fds_bits[(fd) >> 6] |= (uint64_t)1 << ((fd) & 63))
+
+int64_t sys_select(int nfds, linux_fd_set_t *readfds, linux_fd_set_t *writefds,
+                   linux_fd_set_t *exceptfds, void *timeout) {
+    if (nfds < 0 || nfds > 1024) return -EINVAL;
+
+    /* Build a temporary pollfd array on the stack for small nfds,
+     * or allocate from heap for larger sets.                       */
+    struct pollfd *pfds = NULL;
+    int npfds = 0;
+    struct pollfd stack_pfds[64];
+    bool heap = (nfds > 64);
+    if (heap) {
+        extern void *kmalloc(uint64_t size);
+        pfds = (struct pollfd *)kmalloc((uint64_t)nfds * sizeof(struct pollfd));
+        if (!pfds) return -ENOMEM;
+    } else {
+        pfds = stack_pfds;
+    }
+
+    /* Fill pollfd[] from the three fd_sets */
+    for (int fd = 0; fd < nfds; fd++) {
+        int events = 0;
+        if (readfds   && FD_ISSET_L(fd, readfds))   events |= 1 | 0x40; /* POLLIN|POLLRDNORM */
+        if (writefds  && FD_ISSET_L(fd, writefds))  events |= 4 | 0x100;/* POLLOUT|POLLWRNORM */
+        if (exceptfds && FD_ISSET_L(fd, exceptfds)) events |= 2;        /* POLLPRI */
+        if (!events) continue;
+        pfds[npfds].fd      = fd;
+        pfds[npfds].events  = (short)events;
+        pfds[npfds].revents = 0;
+        npfds++;
+    }
+
+    /* Compute timeout_ms: NULL → infinite (-1), {0,0} → 0 (poll) */
+    int timeout_ms = -1;
+    if (timeout) {
+        /* struct timeval: 8 bytes tv_sec + 8 bytes tv_usec on LP64 */
+        int64_t *tv = (int64_t *)timeout;
+        int64_t ms  = tv[0] * 1000 + tv[1] / 1000;
+        timeout_ms  = (ms > 0x7fffffff) ? 0x7fffffff : (int)ms;
+    }
+
+    int64_t ret = sys_poll(pfds, (uint64_t)npfds, timeout_ms);
+
+    if (ret >= 0) {
+        /* Zero the output fd_sets before writing results back */
+        if (readfds)   for (int i = 0; i < 16; i++) readfds->fds_bits[i]   = 0;
+        if (writefds)  for (int i = 0; i < 16; i++) writefds->fds_bits[i]  = 0;
+        if (exceptfds) for (int i = 0; i < 16; i++) exceptfds->fds_bits[i] = 0;
+
+        int ready = 0;
+        for (int i = 0; i < npfds; i++) {
+            int fd = pfds[i].fd;
+            int rev = pfds[i].revents;
+            if (!rev) continue;
+            if (readfds   && (rev & (1 | 0x40)))  { FD_SET_L(fd, readfds);   ready++; }
+            if (writefds  && (rev & (4 | 0x100))) { FD_SET_L(fd, writefds);  ready++; }
+            if (exceptfds && (rev & 2))            { FD_SET_L(fd, exceptfds); ready++; }
+        }
+        ret = ready;
+    }
+
+    if (heap) {
+        extern void kfree(void *ptr);
+        kfree(pfds);
+    }
+    return ret;
+}
+
+/* pselect6: like select but with nanosecond timespec and optional sigmask */
+int64_t sys_pselect6(int nfds, linux_fd_set_t *readfds, linux_fd_set_t *writefds,
+                     linux_fd_set_t *exceptfds, void *timeout_ts, void *sigmask_arg) {
+    (void)sigmask_arg; /* signal mask handling not fully supported yet */
+
+    /* Convert timespec → timeval-compatible buffer for sys_select */
+    int64_t tv[2] = {0, 0};
+    void *tv_ptr = NULL;
+    if (timeout_ts) {
+        /* struct timespec: 8-byte tv_sec + 8-byte tv_nsec */
+        int64_t *ts = (int64_t *)timeout_ts;
+        tv[0] = ts[0];           /* seconds */
+        tv[1] = ts[1] / 1000;   /* nanoseconds → microseconds */
+        tv_ptr = tv;
+    }
+    return sys_select(nfds, readfds, writefds, exceptfds, tv_ptr);
 }

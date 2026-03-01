@@ -48,6 +48,13 @@ void fbcon_hide_cursor_inst(fbcon_t *c);
 /* Blink tick — call from a periodic timer / scheduler task at ~2 Hz */
 void fbcon_tick(fbcon_t *c);
 
+/* Return physical base address and geometry of the framebuffer.
+ * Needed by /dev/fb0 mmap so user-space can map the real framebuffer pixels.
+ * phys_base is the physical address of the first pixel; pitch_bytes is the
+ * number of bytes per row (may be larger than width*4 due to alignment).    */
+void fbcon_get_fb_info(uint64_t *phys_base, uint32_t *width,
+                       uint32_t *height, uint32_t *pitch_bytes);
+
 /* Report current text grid size (columns/rows). Returns 0 if unavailable. */
 int fbcon_text_cols(void);
 int fbcon_text_rows(void);
