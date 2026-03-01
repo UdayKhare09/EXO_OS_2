@@ -8,8 +8,10 @@
 #include "syscall.h"
 #include "fs/vfs.h"
 #include "fs/fd.h"
+#include "fs/fat32/fat32.h"
 #include "sched/sched.h"
 #include "sched/task.h"
+#include "sched/cred.h"
 #include "lib/klog.h"
 #include "lib/string.h"
 #include "mm/kmalloc.h"
@@ -69,13 +71,24 @@ static int resolve_path_at(int dirfd, const char *upath, char *out) {
 
 static inline task_t *cur_task(void) { return sched_current(); }
 
+static inline int task_has_cap(const task_t *t, uint64_t cap) {
+    return t && capable(&t->cred, cap);
+}
+
+static void vnode_clear_suid_on_write(vnode_t *v) {
+    if (!v) return;
+    if (!VFS_S_ISREG(v->mode)) return;
+    if (v->mode & VFS_S_ISUID)
+        v->mode &= ~VFS_S_ISUID;
+}
+
 static bool task_in_group(const task_t *t, uint32_t gid) {
     if (!t) return false;
-    if (t->gid == gid) return true;
-    uint32_t limit = t->group_count;
+    if (t->cred.gid == gid || t->cred.egid == gid || t->cred.fsgid == gid) return true;
+    uint32_t limit = t->cred.group_count;
     if (limit > TASK_MAX_GROUPS) limit = TASK_MAX_GROUPS;
     for (uint32_t i = 0; i < limit; i++) {
-        if (t->groups[i] == gid)
+        if (t->cred.groups[i] == gid)
             return true;
     }
     return false;
@@ -84,10 +97,19 @@ static bool task_in_group(const task_t *t, uint32_t gid) {
 /* req_mode bits: 4=read, 2=write, 1=execute/search */
 static int check_vnode_access(task_t *t, const vnode_t *v, int req_mode) {
     if (!t || !v) return -EINVAL;
-    if (t->uid == 0) return 0;
+
+    if ((req_mode & (4 | 1)) && task_has_cap(t, CAP_DAC_READ_SEARCH))
+        return 0;
+
+    if (task_has_cap(t, CAP_DAC_OVERRIDE)) {
+        if (!(req_mode & 1))
+            return 0;
+        if (VFS_S_ISDIR(v->mode) || (v->mode & (VFS_S_IXUSR | VFS_S_IXGRP | VFS_S_IXOTH)))
+            return 0;
+    }
 
     uint32_t class_perm;
-    if (t->uid == v->uid)
+    if (t->cred.fsuid == v->uid)
         class_perm = (v->mode >> 6) & 0x7;
     else if (task_in_group(t, v->gid))
         class_perm = (v->mode >> 3) & 0x7;
@@ -120,11 +142,45 @@ static int check_parent_dir_wx(const char *path) {
     return check_path_access(parent, true, 3);
 }
 
+static int sticky_check_unlink_path(task_t *t, const char *path) {
+    if (!t || !path) return -EINVAL;
+
+    char parent_path[VFS_MOUNT_PATH_MAX];
+    path_dirname(path, parent_path, sizeof(parent_path));
+
+    int err = 0;
+    vnode_t *parent = vfs_lookup(parent_path, true, &err);
+    if (!parent) return err ? err : -ENOENT;
+
+    if (!(parent->mode & VFS_S_ISVTX)) {
+        vfs_vnode_put(parent);
+        return 0;
+    }
+
+    if (task_has_cap(t, CAP_FOWNER)) {
+        vfs_vnode_put(parent);
+        return 0;
+    }
+
+    vnode_t *victim = vfs_lookup(path, false, &err);
+    if (!victim) {
+        vfs_vnode_put(parent);
+        return err ? err : -ENOENT;
+    }
+
+    uint32_t euid = t->cred.euid;
+    int allowed = (euid == victim->uid) || (euid == parent->uid);
+
+    vfs_vnode_put(victim);
+    vfs_vnode_put(parent);
+    return allowed ? 0 : -EPERM;
+}
+
 static int apply_vnode_mode(vnode_t *v, uint32_t mode) {
     if (!v) return -EINVAL;
     if (v->ops && v->ops->chmod)
         return v->ops->chmod(v, mode);
-    v->mode = (v->mode & VFS_S_IFMT) | (mode & 0777);
+    v->mode = (v->mode & VFS_S_IFMT) | (mode & 07777);
     return 0;
 }
 
@@ -178,6 +234,7 @@ int64_t sys_pwrite64(int fd, const void *buf, uint64_t count, int64_t offset) {
 
     ssize_t n = v->ops->write(v, buf, (size_t)count, (uint64_t)offset);
     if (n < 0) return n;
+    if (n > 0) vnode_clear_suid_on_write(v);
     return (int64_t)n;
 }
 
@@ -244,6 +301,7 @@ int64_t sys_write(int fd, const void *buf, uint64_t count) {
     ssize_t n = v->ops->write(v, buf, (size_t)count, off);
     if (n < 0) return n;
     f->offset = off + (uint64_t)n;
+    if (n > 0) vnode_clear_suid_on_write(v);
     return (int64_t)n;
 }
 
@@ -344,7 +402,7 @@ static int64_t do_open_abs(const char *path, int flags, uint32_t mode) {
             v = parent->ops->create(parent, name, create_mode);
             vfs_vnode_put(parent);
             if (!v) return -EIO;
-            apply_vnode_owner(v, (int)t->uid, (int)t->gid);
+            apply_vnode_owner(v, (int)t->cred.fsuid, (int)t->cred.fsgid);
             apply_vnode_mode(v, create_mode);
         } else {
             return err ? err : -ENOENT;
@@ -459,7 +517,7 @@ int64_t sys_mkdirat(int dirfd, const char *upath, uint32_t mode) {
     int err = 0;
     vnode_t *v = vfs_lookup(path, true, &err);
     if (v) {
-        apply_vnode_owner(v, (int)t->uid, (int)t->gid);
+        apply_vnode_owner(v, (int)t->cred.fsuid, (int)t->cred.fsgid);
         apply_vnode_mode(v, create_mode);
         vfs_vnode_put(v);
     }
@@ -474,6 +532,9 @@ int64_t sys_unlinkat(int dirfd, const char *upath, int flags) {
     if (r < 0) return r;
 
     r = check_parent_dir_wx(path);
+    if (r < 0) return r;
+
+    r = sticky_check_unlink_path(cur_task(), path);
     if (r < 0) return r;
 
     if (flags & AT_REMOVEDIR)
@@ -645,6 +706,20 @@ int64_t sys_renameat(int olddirfd, const char *old_path, int newdirfd, const cha
     r = check_parent_dir_wx(old_abs); if (r < 0) return r;
     r = check_parent_dir_wx(new_abs); if (r < 0) return r;
 
+    task_t *t = cur_task();
+    if (!t) return -ESRCH;
+
+    r = sticky_check_unlink_path(t, old_abs);
+    if (r < 0) return r;
+
+    int new_err = 0;
+    vnode_t *new_target = vfs_lookup(new_abs, false, &new_err);
+    if (new_target) {
+        vfs_vnode_put(new_target);
+        r = sticky_check_unlink_path(t, new_abs);
+        if (r < 0) return r;
+    }
+
     return vfs_rename(old_abs, new_abs);
 }
 
@@ -662,10 +737,10 @@ int64_t sys_faccessat(int dirfd, const char *upath, int mode, int flags) {
     task_t *t = cur_task();
     if (!t) return -ESRCH;
 
-    if (t->uid == 0) return 0;
+    if (task_has_cap(t, CAP_DAC_OVERRIDE)) return 0;
 
     uint32_t class_perm;
-    if (t->uid == st.st_uid)
+    if (t->cred.fsuid == st.st_uid)
         class_perm = (st.st_mode >> 6) & 0x7;
     else if (task_in_group(t, st.st_gid))
         class_perm = (st.st_mode >> 3) & 0x7;
@@ -693,7 +768,7 @@ int64_t sys_utimensat(int dirfd, const char *upath, const kernel_timespec_t time
         if (!f->vnode) return -EINVAL;
 
         int acc = check_vnode_access(t, f->vnode, 2);
-        if (acc < 0 && t->uid != f->vnode->uid) return -EACCES;
+        if (acc < 0 && t->cred.fsuid != f->vnode->uid) return -EACCES;
 
         uint64_t now = sched_get_ticks() / 1000;
         f->vnode->atime = (int64_t)now;
@@ -712,7 +787,7 @@ int64_t sys_utimensat(int dirfd, const char *upath, const kernel_timespec_t time
     if (!v) return err ? err : -ENOENT;
 
     int acc = check_vnode_access(t, v, 2);
-    if (acc < 0 && t->uid != v->uid) {
+    if (acc < 0 && t->cred.fsuid != v->uid) {
         vfs_vnode_put(v);
         return -EACCES;
     }
@@ -740,12 +815,17 @@ int64_t sys_fchmodat(int dirfd, const char *upath, uint32_t mode, int flags) {
     vnode_t *v = vfs_lookup(path, follow, &err);
     if (!v) return err ? err : -ENOENT;
 
-    if (t->uid != 0 && t->uid != v->uid) {
+    int owner = (t->cred.fsuid == v->uid);
+    if (!owner && !task_has_cap(t, CAP_FOWNER)) {
         vfs_vnode_put(v);
         return -EPERM;
     }
 
-    int rc = apply_vnode_mode(v, mode);
+    uint32_t desired_mode = mode & 07777;
+    if (!task_has_cap(t, CAP_FSETID))
+        desired_mode &= ~(VFS_S_ISUID | VFS_S_ISGID);
+
+    int rc = apply_vnode_mode(v, desired_mode);
     if (rc < 0) {
         vfs_vnode_put(v);
         return rc;
@@ -770,9 +850,20 @@ int64_t sys_fchownat(int dirfd, const char *upath, int owner, int group, int fla
     vnode_t *v = vfs_lookup(path, follow, &err);
     if (!v) return err ? err : -ENOENT;
 
-    if (t->uid != 0) {
+    int owner_match = (t->cred.fsuid == v->uid);
+    bool change_owner = (owner >= 0 && (uint32_t)owner != v->uid);
+    bool change_group = (group >= 0 && (uint32_t)group != v->gid);
+
+    if (change_owner && !task_has_cap(t, CAP_CHOWN)) {
         vfs_vnode_put(v);
         return -EPERM;
+    }
+
+    if (change_group && !task_has_cap(t, CAP_CHOWN)) {
+        if (!owner_match || !task_in_group(t, (uint32_t)group)) {
+            vfs_vnode_put(v);
+            return -EPERM;
+        }
     }
 
     int rc = apply_vnode_owner(v, owner, group);
@@ -794,8 +885,12 @@ int64_t sys_fchmod(int fd, uint32_t mode) {
     if (!t) return -ESRCH;
     file_t *f = fd_get(t, fd);
     if (!f || !f->vnode) return -EBADF;
-    if (t->uid != 0 && t->uid != f->vnode->uid) return -EPERM;
-    int rc = apply_vnode_mode(f->vnode, mode);
+    int owner = (t->cred.fsuid == f->vnode->uid);
+    if (!owner && !task_has_cap(t, CAP_FOWNER)) return -EPERM;
+    uint32_t desired_mode = mode & 07777;
+    if (!task_has_cap(t, CAP_FSETID))
+        desired_mode &= ~(VFS_S_ISUID | VFS_S_ISGID);
+    int rc = apply_vnode_mode(f->vnode, desired_mode);
     if (rc < 0) return rc;
     f->vnode->ctime = (int64_t)(sched_get_ticks() / 1000);
     return 0;
@@ -814,7 +909,15 @@ int64_t sys_fchown(int fd, int owner, int group) {
     if (!t) return -ESRCH;
     file_t *f = fd_get(t, fd);
     if (!f || !f->vnode) return -EBADF;
-    if (t->uid != 0) return -EPERM;
+    int owner_match = (t->cred.fsuid == f->vnode->uid);
+    bool change_owner = (owner >= 0 && (uint32_t)owner != f->vnode->uid);
+    bool change_group = (group >= 0 && (uint32_t)group != f->vnode->gid);
+
+    if (change_owner && !task_has_cap(t, CAP_CHOWN)) return -EPERM;
+    if (change_group && !task_has_cap(t, CAP_CHOWN)) {
+        if (!owner_match || !task_in_group(t, (uint32_t)group))
+            return -EPERM;
+    }
     int rc = apply_vnode_owner(f->vnode, owner, group);
     if (rc < 0) return rc;
     f->vnode->ctime = (int64_t)(sched_get_ticks() / 1000);
@@ -864,11 +967,10 @@ int64_t sys_getdents64(int fd, void *dirp, uint64_t count) {
 int64_t sys_mount(const char *source, const char *target, const char *fstype,
                   uint64_t flags, const void *data) {
     (void)flags;
-    (void)data;
 
     task_t *t = cur_task();
     if (!t) return -ESRCH;
-    if (t->uid != 0) return -EPERM;
+    if (t->cred.uid != 0) return -EPERM;
     if (!target || !target[0]) return -EINVAL;
 
     KLOG_INFO("mount: src='%s' tgt='%s' type='%s' flags=0x%llx\n",
@@ -951,6 +1053,14 @@ int64_t sys_mount(const char *source, const char *target, const char *fstype,
     }
 
     bool auto_fs = (!fstype || !fstype[0] || strcmp(fstype, "auto") == 0);
+
+    if (data) {
+        if (!auto_fs && strcmp(fstype, "fat32") == 0)
+            fat32_set_mount_opts((const char *)data);
+        else if (auto_fs)
+            fat32_set_mount_opts((const char *)data);
+    }
+
     if (!auto_fs) {
         rc = vfs_mount(target_path, dev, fstype);
         if (rc < 0)

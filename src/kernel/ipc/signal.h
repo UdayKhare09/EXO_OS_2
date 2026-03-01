@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
+#include "sched/cred.h"
 
 /* ── Signal numbers (POSIX-compatible subset) ────────────────────────────── */
 #define NSIGS     32
@@ -83,7 +84,10 @@ void          signal_set(struct task *t, int sig, sig_handler_t handler);
 sig_handler_t signal_get(struct task *t, int sig);
 
 /* ── Delivery ────────────────────────────────────────────────────────────── */
-void signal_send(struct task *t, int sig);
+void signal_send_from_cred(struct task *t, int sig, const cred_t *sender_cred);
+static inline void signal_send(struct task *t, int sig) {
+    signal_send_from_cred(t, sig, NULL);
+}
 
 /* Send signal to every non-kthread task whose pgid matches */
 void signal_send_pgrp(uint32_t pgid, int sig);

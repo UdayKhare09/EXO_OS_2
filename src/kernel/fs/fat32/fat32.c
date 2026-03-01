@@ -102,7 +102,80 @@ typedef struct {
     uint32_t  bytes_per_cluster;
     uint32_t  total_clusters;
     uint32_t  fat_size;           /* sectors per FAT                        */
+    uint32_t  uid;
+    uint32_t  gid;
+    uint16_t  fmask;
+    uint16_t  dmask;
 } fat32_sb_t;
+
+typedef struct {
+    uint32_t uid;
+    uint32_t gid;
+    uint16_t fmask;
+    uint16_t dmask;
+} fat32_mount_opts_t;
+
+static fat32_mount_opts_t g_fat32_mount_opts = {
+    .uid = 0,
+    .gid = 0,
+    .fmask = 022,
+    .dmask = 022,
+};
+
+static int fat32_parse_u32(const char *s, uint32_t *out, int octal_only) {
+    if (!s || !s[0] || !out) return -EINVAL;
+    uint64_t v = 0;
+    for (int i = 0; s[i]; i++) {
+        char c = s[i];
+        if (c < '0' || c > '9') return -EINVAL;
+        if (octal_only && c > '7') return -EINVAL;
+        int base = octal_only ? 8 : 10;
+        v = v * (uint64_t)base + (uint64_t)(c - '0');
+        if (v > 0xFFFFFFFFULL) return -EINVAL;
+    }
+    *out = (uint32_t)v;
+    return 0;
+}
+
+void fat32_set_mount_opts(const char *opts) {
+    fat32_mount_opts_t parsed = g_fat32_mount_opts;
+    parsed.uid = 0;
+    parsed.gid = 0;
+    parsed.fmask = 022;
+    parsed.dmask = 022;
+
+    if (opts && opts[0]) {
+        char tmp[256];
+        strncpy(tmp, opts, sizeof(tmp) - 1);
+        tmp[sizeof(tmp) - 1] = '\0';
+
+        char *cur = tmp;
+        while (*cur) {
+            char *tok = cur;
+            while (*cur && *cur != ',') cur++;
+            if (*cur == ',') *cur++ = '\0';
+            if (!tok[0]) continue;
+
+            char *eq = tok;
+            while (*eq && *eq != '=') eq++;
+            if (*eq != '=') continue;
+            *eq++ = '\0';
+
+            uint32_t val = 0;
+            if (strcmp(tok, "uid") == 0) {
+                if (fat32_parse_u32(eq, &val, 0) == 0) parsed.uid = val;
+            } else if (strcmp(tok, "gid") == 0) {
+                if (fat32_parse_u32(eq, &val, 0) == 0) parsed.gid = val;
+            } else if (strcmp(tok, "fmask") == 0) {
+                if (fat32_parse_u32(eq, &val, 1) == 0) parsed.fmask = (uint16_t)(val & 0777);
+            } else if (strcmp(tok, "dmask") == 0) {
+                if (fat32_parse_u32(eq, &val, 1) == 0) parsed.dmask = (uint16_t)(val & 0777);
+            }
+        }
+    }
+
+    g_fat32_mount_opts = parsed;
+}
 
 /* ── Per-file private data (stored in vnode.fs_data) ─────────────────────── */
 typedef struct {
@@ -387,8 +460,12 @@ static vnode_t *make_vnode(fat32_sb_t *sb, fs_inst_t *fsi,
 
     v->ino     = e->first_cluster ? e->first_cluster : 0xFFFF;
     v->size    = e->file_size;
-    v->mode    = (e->attr & FAT32_ATTR_DIRECTORY) ? VFS_S_IFDIR | 0755
-                                                   : VFS_S_IFREG | 0644;
+    if (e->attr & FAT32_ATTR_DIRECTORY)
+        v->mode = VFS_S_IFDIR | (0777 & ~(uint32_t)(sb->dmask & 0777));
+    else
+        v->mode = VFS_S_IFREG | (0666 & ~(uint32_t)(sb->fmask & 0777));
+    v->uid     = sb->uid;
+    v->gid     = sb->gid;
     v->ops     = &g_fat32_ops;
     v->fsi     = fsi;
     v->fs_data = nd;
@@ -845,6 +922,10 @@ static vnode_t *fat32_mount(fs_inst_t *fsi, blkdev_t *dev) {
                             + (uint32_t)bpb.num_fats * bpb.fat_size_32;
     sb->root_cluster        = bpb.root_cluster;
     sb->fat_size            = bpb.fat_size_32;
+    sb->uid                 = g_fat32_mount_opts.uid;
+    sb->gid                 = g_fat32_mount_opts.gid;
+    sb->fmask               = g_fat32_mount_opts.fmask;
+    sb->dmask               = g_fat32_mount_opts.dmask;
 
     uint32_t total_sectors  = bpb.total_sectors_32 ? bpb.total_sectors_32
                                                     : bpb.total_sectors_16;
@@ -865,7 +946,9 @@ static vnode_t *fat32_mount(fs_inst_t *fsi, blkdev_t *dev) {
     vnode_t *root = vfs_alloc_vnode();
     if (!root) { kfree(rnd); kfree(sb); return NULL; }
     root->ino      = sb->root_cluster;
-    root->mode     = VFS_S_IFDIR | 0755;
+    root->mode     = VFS_S_IFDIR | (0777 & ~(uint32_t)(sb->dmask & 0777));
+    root->uid      = sb->uid;
+    root->gid      = sb->gid;
     root->ops      = &g_fat32_ops;
     root->fsi      = fsi;
     root->fs_data  = rnd;

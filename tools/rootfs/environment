@@ -1,11 +1,7 @@
 PATH=/bin:/usr/bin:/sbin:/usr/sbin
 SHELL=/bin/sh
-HOME=/home/root
-USER=root
-LOGNAME=root
 HOSTNAME=exo
 TERM=linux
 TMPDIR=/tmp
-PS1=root@exo:\w# 
 SSL_CERT_FILE=/etc/ssl/cert.pem
 SSL_CERT_DIR=/etc/ssl/certs

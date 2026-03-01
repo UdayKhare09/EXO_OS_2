@@ -142,6 +142,7 @@ EXTERNAL_BIN_STAMP   := $(EXTERNAL_BIN_DIR)/.stamp
 ROOTFS_PROFILE  := tools/rootfs/profile
 ROOTFS_ENV_FILE := tools/rootfs/environment
 ROOTFS_PASSWD   := tools/rootfs/passwd
+ROOTFS_SHADOW   := tools/rootfs/shadow
 ROOTFS_GROUP    := tools/rootfs/group
 ROOTFS_RESOLV   := tools/rootfs/resolv.conf
 ROOTFS_TERMINFO_LINUX := $(shell sh -c 'for p in /usr/share/terminfo/l/linux /lib/terminfo/l/linux /etc/terminfo/l/linux; do [ -f "$$p" ] && { echo "$$p"; exit 0; }; done')
@@ -306,8 +307,22 @@ curl-build: external-bins-build
 # ── init binary (musl static — installed as /sbin/init in the root image) ────
 INIT_SRC := tools/init.c
 INIT_BIN := $(BUILD_DIR)/init
+SU_SRC   := tools/su.c
+SU_BIN   := $(BUILD_DIR)/su
 
 $(INIT_BIN): $(INIT_SRC) check-musl
+	@mkdir -p $(dir $@)
+	$(MUSL_SMOKE_CC) --target=x86_64-linux-musl \
+	    -O2 -fno-stack-protector -static -nostdlib \
+	    -isystem $(MUSL_INC_DIR) \
+	    $(MUSL_LIB_DIR)/crt1.o \
+	    $(MUSL_LIB_DIR)/crti.o \
+	    -o $@ $< \
+	    -L$(MUSL_LIB_DIR) \
+	    -Wl,--start-group -lc -lgcc -Wl,--end-group \
+	    $(MUSL_LIB_DIR)/crtn.o
+
+$(SU_BIN): $(SU_SRC) check-musl
 	@mkdir -p $(dir $@)
 	$(MUSL_SMOKE_CC) --target=x86_64-linux-musl \
 	    -O2 -fno-stack-protector -static -nostdlib \
@@ -331,18 +346,20 @@ $(EFI_IMG): $(KERNEL_ELF) $(LIMINE_DIR)/limine.h
 
 # ── Root partition (ext2, no root needed — debugfs) ───────────────────────────
 $(ROOT_IMG): $(LIBC_DYNAMIC_BINS) $(LIBC_DYNAMIC_LIBS) $(MUSL_RUNTIME_STAMP) \
-			 $(BUSYBOX_BIN) $(EXTERNAL_BIN_STAMP) $(INIT_BIN) \
-		     $(ROOTFS_PROFILE) $(ROOTFS_ENV_FILE) $(ROOTFS_PASSWD) $(ROOTFS_GROUP) $(ROOTFS_RESOLV)
+			 $(BUSYBOX_BIN) $(EXTERNAL_BIN_STAMP) $(INIT_BIN) $(SU_BIN) \
+		     $(ROOTFS_PROFILE) $(ROOTFS_ENV_FILE) $(ROOTFS_PASSWD) $(ROOTFS_SHADOW) $(ROOTFS_GROUP) $(ROOTFS_RESOLV)
 	@echo ">>> Building root partition (ext2)..."
 	dd if=/dev/zero of=$@ bs=512 count=$(ROOT_SECTORS) 2>/dev/null
 	mkfs.ext2 -q -L "EXOOS_ROOT" -b 4096 $@
-	$(foreach d, dev tmp boot proc sys sys/bus sys/bus/usb sys/bus/usb/devices sys/bus/pci sys/bus/pci/devices home home/root etc etc/ssl etc/ssl/certs bin lib usr usr/bin usr/sbin usr/share usr/share/terminfo usr/share/terminfo/l sbin var run mnt, \
+	$(foreach d, dev tmp boot proc sys sys/bus sys/bus/usb sys/bus/usb/devices sys/bus/pci sys/bus/pci/devices home home/root home/uday etc etc/ssl etc/ssl/certs bin lib usr usr/bin usr/sbin usr/share usr/share/terminfo usr/share/terminfo/l sbin var run mnt, \
 	    debugfs -w -R "mkdir $(d)" $@ 2>/dev/null || true ;)
 	debugfs -w -R "write $(LIBC_HELLO_DYN_BIN)  home/root/hello_dynamic"   $@ 2>/dev/null
 	debugfs -w -R "write $(LIBC_DLOPEN_TEST_BIN)  home/root/dlopen_test"   $@ 2>/dev/null
 	debugfs -w -R "write $(LIBC_LIBTEST_SO)  lib/libtest.so"   $@ 2>/dev/null
 	debugfs -w -R "write $(BUSYBOX_BIN)         bin/busybox"       $@ 2>/dev/null
 	debugfs -w -R "write $(BUSYBOX_BIN)         bin/sh"            $@ 2>/dev/null
+	debugfs -w -R "write $(SU_BIN)              bin/su"            $@ 2>/dev/null
+	debugfs -w -R "set_inode_field bin/su mode 0104755"            $@ 2>/dev/null || true
 	debugfs -w -R "write $(INIT_BIN)            sbin/init"         $@ 2>/dev/null
 	debugfs -w -R "write $(MUSL_RUNTIME_DIR)/ld-musl-x86_64.so.1 lib/ld-musl-x86_64.so.1" $@ 2>/dev/null
 	debugfs -w -R "write $(MUSL_RUNTIME_DIR)/libc.so lib/libc.so" $@ 2>/dev/null
@@ -359,6 +376,8 @@ $(ROOT_IMG): $(LIBC_DYNAMIC_BINS) $(LIBC_DYNAMIC_LIBS) $(MUSL_RUNTIME_STAMP) \
 	debugfs -w -R "write $(ROOTFS_PROFILE)      etc/profile"       $@ 2>/dev/null
 	debugfs -w -R "write $(ROOTFS_ENV_FILE)     etc/environment"   $@ 2>/dev/null
 	debugfs -w -R "write $(ROOTFS_PASSWD)       etc/passwd"        $@ 2>/dev/null
+	debugfs -w -R "write $(ROOTFS_SHADOW)       etc/shadow"        $@ 2>/dev/null
+	debugfs -w -R "set_inode_field etc/shadow mode 0100600"        $@ 2>/dev/null || true
 	debugfs -w -R "write $(ROOTFS_GROUP)        etc/group"         $@ 2>/dev/null
 	debugfs -w -R "write $(ROOTFS_RESOLV)       etc/resolv.conf"   $@ 2>/dev/null
 	@if [ -n "$(ROOTFS_CA_BUNDLE)" ] && [ -f "$(ROOTFS_CA_BUNDLE)" ]; then \

@@ -594,7 +594,7 @@ static int ext2_chmod(vnode_t *v, uint32_t mode) {
     if (ext2_read_inode(sb, get_ino(v), &inode) < 0) return -EIO;
     inode.i_mode = (uint16_t)((inode.i_mode & EXT2_IFMT) | (mode & 0x0FFF));
     if (ext2_write_inode(sb, get_ino(v), &inode) < 0) return -EIO;
-    v->mode = (v->mode & VFS_S_IFMT) | (mode & 0777);
+    v->mode = (v->mode & VFS_S_IFMT) | (mode & 07777);
     return 0;
 }
 

@@ -57,8 +57,17 @@ sig_handler_t signal_get(task_t *t, int sig) {
 
 /* ── Delivery ────────────────────────────────────────────────────────────── */
 
-void signal_send(task_t *t, int sig) {
+void signal_send_from_cred(task_t *t, int sig, const cred_t *sender_cred) {
     if (!t || sig <= 0 || sig >= NSIGS) return;
+
+    if (sender_cred) {
+        if (!capable(sender_cred, CAP_KILL) &&
+            sender_cred->euid != t->cred.uid &&
+            sender_cred->uid  != t->cred.uid) {
+            return;
+        }
+    }
+
     /* Atomically set the pending bit */
     __atomic_or_fetch(&t->sig_pending, (1u << sig), __ATOMIC_SEQ_CST);
     /* Wake the task so it dispatches the signal from task context */

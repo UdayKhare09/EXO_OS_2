@@ -94,6 +94,9 @@ int pty_alloc(void) {
             p->ws_xpixel = 0;
             p->ws_ypixel = 0;
             p->fg_pgid  = 1;
+            task_t *cur = sched_current();
+            p->owner_uid = cur ? cur->cred.fsuid : 0;
+            p->owner_gid = 5; /* tty group */
             p->master_open = 1;
             p->slave_open  = 0;
             return i;

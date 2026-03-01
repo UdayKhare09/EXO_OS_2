@@ -318,9 +318,187 @@ static int64_t sc_getppid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e
     { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;
       task_t *t = sched_current(); return t ? (int64_t)t->ppid : 0; }
 static int64_t sc_getuid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
-    { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; task_t *t = sched_current(); return t ? (int64_t)t->uid : 0; }
+    { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; task_t *t = sched_current(); return t ? (int64_t)t->cred.uid : 0; }
 static int64_t sc_getgid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
-    { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; task_t *t = sched_current(); return t ? (int64_t)t->gid : 0; }
+    { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; task_t *t = sched_current(); return t ? (int64_t)t->cred.gid : 0; }
+static int64_t sc_geteuid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; task_t *t = sched_current(); return t ? (int64_t)t->cred.euid : 0; }
+static int64_t sc_getegid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; task_t *t = sched_current(); return t ? (int64_t)t->cred.egid : 0; }
+
+static inline int cred_can_setuid(const task_t *t) {
+    return t && capable(&t->cred, CAP_SETUID);
+}
+
+static inline int cred_can_setgid(const task_t *t) {
+    return t && capable(&t->cred, CAP_SETGID);
+}
+
+static inline int can_set_uid_unpriv(const task_t *t, uint32_t uid) {
+    if (!t) return 0;
+    return uid == t->cred.uid || uid == t->cred.euid || uid == t->cred.suid;
+}
+
+static inline int can_set_gid_unpriv(const task_t *t, uint32_t gid) {
+    if (!t) return 0;
+    return gid == t->cred.gid || gid == t->cred.egid || gid == t->cred.sgid;
+}
+
+static inline uint64_t cap_full_mask_local(void) {
+    return (CAP_LAST_CAP >= 63) ? ~0ULL : ((1ULL << (CAP_LAST_CAP + 1)) - 1ULL);
+}
+
+static inline void cred_fixup_caps_on_euid_change(task_t *t, uint32_t old_euid, uint32_t new_euid) {
+    if (!t || old_euid == new_euid) return;
+    if (t->cred.securebits & SECBIT_NOROOT) return;
+
+    if (old_euid == 0 && new_euid != 0) {
+        if (!t->keep_caps) {
+            t->cred.cap_effective = 0;
+            t->cred.cap_permitted = 0;
+        } else {
+            t->cred.cap_effective &= t->cred.cap_permitted;
+        }
+        return;
+    }
+
+    if (old_euid != 0 && new_euid == 0) {
+        uint64_t full = cap_full_mask_local();
+        t->cred.cap_permitted = full & t->cred.cap_bounding;
+        t->cred.cap_effective = t->cred.cap_permitted;
+        return;
+    }
+
+    t->cred.cap_effective &= t->cred.cap_permitted;
+}
+
+typedef struct {
+    uint32_t version;
+    int pid;
+} linux_cap_user_header_t;
+
+typedef struct {
+    uint32_t effective;
+    uint32_t permitted;
+    uint32_t inheritable;
+} linux_cap_user_data_t;
+
+static int64_t sc_capget(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+{
+    (void)c;(void)d;(void)e;(void)f;
+    linux_cap_user_header_t *hdr = (linux_cap_user_header_t *)a;
+    linux_cap_user_data_t *data = (linux_cap_user_data_t *)b;
+    if (!hdr || !data) return -EFAULT;
+
+    task_t *cur = sched_current();
+    if (!cur) return -ESRCH;
+
+    task_t *target = cur;
+    if (hdr->pid > 0) {
+        target = task_lookup((uint32_t)hdr->pid);
+        if (!target) return -ESRCH;
+    }
+
+    uint64_t eff = target->cred.cap_effective;
+    uint64_t prm = target->cred.cap_permitted;
+    uint64_t inh = target->cred.cap_inheritable;
+
+    data[0].effective   = (uint32_t)(eff & 0xFFFFFFFFu);
+    data[0].permitted   = (uint32_t)(prm & 0xFFFFFFFFu);
+    data[0].inheritable = (uint32_t)(inh & 0xFFFFFFFFu);
+    data[1].effective   = (uint32_t)(eff >> 32);
+    data[1].permitted   = (uint32_t)(prm >> 32);
+    data[1].inheritable = (uint32_t)(inh >> 32);
+    return 0;
+}
+
+static int64_t sc_capset(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+{
+    (void)c;(void)d;(void)e;(void)f;
+    linux_cap_user_header_t *hdr = (linux_cap_user_header_t *)a;
+    linux_cap_user_data_t *data = (linux_cap_user_data_t *)b;
+    if (!hdr || !data) return -EFAULT;
+
+    task_t *cur = sched_current();
+    if (!cur) return -ESRCH;
+
+    task_t *target = cur;
+    if (hdr->pid > 0) {
+        target = task_lookup((uint32_t)hdr->pid);
+        if (!target) return -ESRCH;
+    }
+
+    if (target != cur && !capable(&cur->cred, CAP_SETPCAP))
+        return -EPERM;
+
+    uint64_t new_eff = ((uint64_t)data[1].effective << 32) | data[0].effective;
+    uint64_t new_prm = ((uint64_t)data[1].permitted << 32) | data[0].permitted;
+    uint64_t new_inh = ((uint64_t)data[1].inheritable << 32) | data[0].inheritable;
+
+    if (new_eff & ~new_prm) return -EPERM;
+    if (new_prm & ~target->cred.cap_permitted) return -EPERM;
+    if (new_inh & ~target->cred.cap_bounding) return -EPERM;
+
+    target->cred.cap_effective = new_eff;
+    target->cred.cap_permitted = new_prm;
+    target->cred.cap_inheritable = new_inh;
+    return 0;
+}
+
+static inline int can_signal_target(const task_t *sender, const task_t *target, int sig) {
+    if (!target || target->is_kthread) return 0;
+    if (!sender) return 0;
+    if (capable(&sender->cred, CAP_KILL)) return 1;
+    if (sender->cred.euid == target->cred.uid || sender->cred.uid == target->cred.uid) return 1;
+    if (sig == SIGCONT && sender->sid == target->sid) return 1;
+    return 0;
+}
+
+static inline int cred_setresuid(task_t *t, uint32_t ruid, uint32_t euid, uint32_t suid) {
+    if (!t) return -ESRCH;
+    uint32_t old_euid = t->cred.euid;
+    uint32_t cur_ruid = t->cred.uid;
+    uint32_t cur_euid = t->cred.euid;
+    uint32_t cur_suid = t->cred.suid;
+    uint32_t no_change = (uint32_t)-1;
+
+    if (!cred_can_setuid(t)) {
+        if (ruid != no_change && ruid != cur_ruid && ruid != cur_euid && ruid != cur_suid) return -EPERM;
+        if (euid != no_change && euid != cur_ruid && euid != cur_euid && euid != cur_suid) return -EPERM;
+        if (suid != no_change && suid != cur_ruid && suid != cur_euid && suid != cur_suid) return -EPERM;
+    }
+
+    if (ruid != no_change) t->cred.uid = ruid;
+    if (euid != no_change) {
+        t->cred.euid = euid;
+        t->cred.fsuid = euid;
+    }
+    if (suid != no_change) t->cred.suid = suid;
+    cred_fixup_caps_on_euid_change(t, old_euid, t->cred.euid);
+    return 0;
+}
+
+static inline int cred_setresgid(task_t *t, uint32_t rgid, uint32_t egid, uint32_t sgid) {
+    if (!t) return -ESRCH;
+    uint32_t cur_rgid = t->cred.gid;
+    uint32_t cur_egid = t->cred.egid;
+    uint32_t cur_sgid = t->cred.sgid;
+    uint32_t no_change = (uint32_t)-1;
+
+    if (!cred_can_setgid(t)) {
+        if (rgid != no_change && rgid != cur_rgid && rgid != cur_egid && rgid != cur_sgid) return -EPERM;
+        if (egid != no_change && egid != cur_rgid && egid != cur_egid && egid != cur_sgid) return -EPERM;
+        if (sgid != no_change && sgid != cur_rgid && sgid != cur_egid && sgid != cur_sgid) return -EPERM;
+    }
+
+    if (rgid != no_change) t->cred.gid = rgid;
+    if (egid != no_change) {
+        t->cred.egid = egid;
+        t->cred.fsgid = egid;
+    }
+    if (sgid != no_change) t->cred.sgid = sgid;
+    return 0;
+}
 
 static int64_t sc_setuid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
 {
@@ -328,8 +506,21 @@ static int64_t sc_setuid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,
     task_t *t = sched_current();
     if (!t) return -ESRCH;
     uint32_t uid = (uint32_t)a;
-    if (t->uid != 0 && uid != t->uid) return -EPERM;
-    t->uid = uid;
+    uint32_t old_euid = t->cred.euid;
+
+    if (cred_can_setuid(t)) {
+        t->cred.uid = uid;
+        t->cred.euid = uid;
+        t->cred.suid = uid;
+        t->cred.fsuid = uid;
+        cred_fixup_caps_on_euid_change(t, old_euid, t->cred.euid);
+        return 0;
+    }
+
+    if (!can_set_uid_unpriv(t, uid)) return -EPERM;
+    t->cred.euid = uid;
+    t->cred.fsuid = uid;
+    cred_fixup_caps_on_euid_change(t, old_euid, t->cred.euid);
     return 0;
 }
 
@@ -339,11 +530,21 @@ static int64_t sc_setgid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,
     task_t *t = sched_current();
     if (!t) return -ESRCH;
     uint32_t gid = (uint32_t)a;
-    if (t->uid != 0 && gid != t->gid) return -EPERM;
-    t->gid = gid;
-    if (t->group_count == 0) {
-        t->groups[0] = gid;
-        t->group_count = 1;
+
+    if (cred_can_setgid(t)) {
+        t->cred.gid = gid;
+        t->cred.egid = gid;
+        t->cred.sgid = gid;
+        t->cred.fsgid = gid;
+    } else {
+        if (!can_set_gid_unpriv(t, gid)) return -EPERM;
+        t->cred.egid = gid;
+        t->cred.fsgid = gid;
+    }
+
+    if (t->cred.group_count == 0) {
+        t->cred.groups[0] = gid;
+        t->cred.group_count = 1;
     }
     return 0;
 }
@@ -355,12 +556,12 @@ static int64_t sc_getgroups(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t
     if (!t) return -ESRCH;
     int size = (int)a;
     uint32_t *list = (uint32_t *)b;
-    int count = (int)t->group_count;
+    int count = (int)t->cred.group_count;
     if (size == 0) return count;
     if (size < count) return -EINVAL;
     if (!list) return -EFAULT;
     for (int i = 0; i < count; i++)
-        list[i] = t->groups[i];
+        list[i] = t->cred.groups[i];
     return count;
 }
 
@@ -369,21 +570,111 @@ static int64_t sc_setgroups(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t
     (void)c;(void)d;(void)e;(void)f;
     task_t *t = sched_current();
     if (!t) return -ESRCH;
-    if (t->uid != 0) return -EPERM;
+    if (!capable(&t->cred, CAP_SETGID)) return -EPERM;
     int size = (int)a;
     uint32_t *list = (uint32_t *)b;
     if (size < 0 || size > TASK_MAX_GROUPS) return -EINVAL;
     if (size > 0 && !list) return -EFAULT;
     for (int i = 0; i < size; i++)
-        t->groups[i] = list[i];
+        t->cred.groups[i] = list[i];
     for (int i = size; i < TASK_MAX_GROUPS; i++)
-        t->groups[i] = 0;
-    t->group_count = (uint32_t)size;
-    if (t->group_count == 0) {
-        t->groups[0] = t->gid;
-        t->group_count = 1;
+        t->cred.groups[i] = 0;
+    t->cred.group_count = (uint32_t)size;
+    if (t->cred.group_count == 0) {
+        t->cred.groups[0] = t->cred.gid;
+        t->cred.group_count = 1;
     }
     return 0;
+}
+
+static int64_t sc_setreuid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+{
+    (void)c;(void)d;(void)e;(void)f;
+    task_t *t = sched_current();
+    if (!t) return -ESRCH;
+    return cred_setresuid(t, (uint32_t)a, (uint32_t)b, (uint32_t)-1);
+}
+
+static int64_t sc_setregid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+{
+    (void)c;(void)d;(void)e;(void)f;
+    task_t *t = sched_current();
+    if (!t) return -ESRCH;
+    return cred_setresgid(t, (uint32_t)a, (uint32_t)b, (uint32_t)-1);
+}
+
+static int64_t sc_setresuid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+{
+    (void)d;(void)e;(void)f;
+    task_t *t = sched_current();
+    if (!t) return -ESRCH;
+    return cred_setresuid(t, (uint32_t)a, (uint32_t)b, (uint32_t)c);
+}
+
+static int64_t sc_getresuid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+{
+    (void)d;(void)e;(void)f;
+    task_t *t = sched_current();
+    if (!t) return -ESRCH;
+    uint32_t *ruid = (uint32_t *)a;
+    uint32_t *euid = (uint32_t *)b;
+    uint32_t *suid = (uint32_t *)c;
+    if (!ruid || !euid || !suid) return -EFAULT;
+    *ruid = t->cred.uid;
+    *euid = t->cred.euid;
+    *suid = t->cred.suid;
+    return 0;
+}
+
+static int64_t sc_setresgid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+{
+    (void)d;(void)e;(void)f;
+    task_t *t = sched_current();
+    if (!t) return -ESRCH;
+    return cred_setresgid(t, (uint32_t)a, (uint32_t)b, (uint32_t)c);
+}
+
+static int64_t sc_getresgid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+{
+    (void)d;(void)e;(void)f;
+    task_t *t = sched_current();
+    if (!t) return -ESRCH;
+    uint32_t *rgid = (uint32_t *)a;
+    uint32_t *egid = (uint32_t *)b;
+    uint32_t *sgid = (uint32_t *)c;
+    if (!rgid || !egid || !sgid) return -EFAULT;
+    *rgid = t->cred.gid;
+    *egid = t->cred.egid;
+    *sgid = t->cred.sgid;
+    return 0;
+}
+
+static int64_t sc_setfsuid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+{
+    (void)b;(void)c;(void)d;(void)e;(void)f;
+    task_t *t = sched_current();
+    if (!t) return -ESRCH;
+    uint32_t old = t->cred.fsuid;
+    uint32_t uid = (uint32_t)a;
+
+    if (cred_can_setuid(t) || uid == t->cred.uid || uid == t->cred.euid || uid == t->cred.suid || uid == t->cred.fsuid)
+        t->cred.fsuid = uid;
+
+    return (int64_t)old;
+}
+
+static int64_t sc_setfsgid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+{
+    (void)b;(void)c;(void)d;(void)e;(void)f;
+    task_t *t = sched_current();
+    if (!t) return -ESRCH;
+    uint32_t old = t->cred.fsgid;
+    uint32_t gid = (uint32_t)a;
+
+    if (cred_can_setgid(t) || gid == t->cred.gid || gid == t->cred.egid || gid == t->cred.sgid || gid == t->cred.fsgid)
+        t->cred.fsgid = gid;
+
+    return (int64_t)old;
 }
 
 static int64_t sc_getpgid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
@@ -403,9 +694,26 @@ static int64_t sc_setpgid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e
     int pid = (int)a;
     int pgid = (int)b;
     task_t *cur = sched_current();
+    if (!cur) return -ESRCH;
+
     task_t *t = (pid == 0) ? cur : task_lookup((uint32_t)pid);
     if (!t) return -ESRCH;
+
+    bool self = (t == cur);
+    bool child = (t->parent == cur);
+    if (!self && !child) return -EPERM;
+    if (t->sid != cur->sid) return -EPERM;
+    if (t->pid == t->sid) return -EPERM; /* session leaders cannot change pgid */
+
     if (pgid == 0) pgid = (int)t->pid;
+    if (pgid < 0) return -EINVAL;
+
+    if ((uint32_t)pgid != t->pid) {
+        task_t *g = task_lookup((uint32_t)pgid);
+        if (!g) return -EPERM;
+        if (g->sid != cur->sid) return -EPERM;
+    }
+
     t->pgid = (uint32_t)pgid;
     return 0;
 }
@@ -462,6 +770,95 @@ static int64_t sc_arch_prctl(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_
         default:
             return -EINVAL;
     }
+}
+
+static int64_t sc_prctl(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)f;
+    task_t *cur = sched_current();
+    if (!cur) return -ESRCH;
+
+    switch ((int)a) {
+        case PR_SET_NO_NEW_PRIVS:
+            if (b != 1 || c || d || e) return -EINVAL;
+            cur->no_new_privs = 1;
+            return 0;
+        case PR_GET_NO_NEW_PRIVS:
+            return cur->no_new_privs ? 1 : 0;
+        case PR_SET_KEEPCAPS:
+            if (b > 1) return -EINVAL;
+            cur->keep_caps = b ? 1 : 0;
+            return 0;
+        case PR_GET_KEEPCAPS:
+            return cur->keep_caps ? 1 : 0;
+        case PR_SET_NAME: {
+            const char *src = (const char *)b;
+            if (!src) return -EFAULT;
+            memset(cur->name, 0, TASK_NAME_MAX);
+            strncpy(cur->name, src, 15);
+            cur->name[15] = '\0';
+            return 0;
+        }
+        case PR_GET_NAME: {
+            char *dst = (char *)b;
+            if (!dst) return -EFAULT;
+            memset(dst, 0, 16);
+            strncpy(dst, cur->name, 15);
+            return 0;
+        }
+        case PR_SET_SECCOMP:
+            if (b == SECCOMP_MODE_STRICT) {
+                if (c || d || e) return -EINVAL;
+                if (cur->seccomp_mode != SECCOMP_MODE_DISABLED &&
+                    cur->seccomp_mode != SECCOMP_MODE_STRICT)
+                    return -EINVAL;
+                cur->seccomp_mode = SECCOMP_MODE_STRICT;
+                return 0;
+            }
+            if (b == SECCOMP_MODE_FILTER) {
+                if (!cur->no_new_privs && !capable(&cur->cred, CAP_SYS_ADMIN))
+                    return -EACCES;
+                cur->seccomp_mode = SECCOMP_MODE_FILTER;
+                KLOG_WARN("seccomp: filter mode is a stub; BPF program ignored\n");
+                return 0;
+            }
+            return -EINVAL;
+        case PR_GET_SECCOMP:
+            return (int64_t)cur->seccomp_mode;
+        default:
+            return -EINVAL;
+    }
+}
+
+static int64_t sc_seccomp(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)d;(void)e;(void)f;
+    task_t *cur = sched_current();
+    if (!cur) return -ESRCH;
+
+    uint32_t op = (uint32_t)a;
+    uint32_t flags = (uint32_t)b;
+
+    if (op == SECCOMP_SET_MODE_STRICT) {
+        if (flags != 0 || c != 0) return -EINVAL;
+        if (cur->seccomp_mode != SECCOMP_MODE_DISABLED &&
+            cur->seccomp_mode != SECCOMP_MODE_STRICT)
+            return -EINVAL;
+        cur->seccomp_mode = SECCOMP_MODE_STRICT;
+        return 0;
+    }
+
+    if (op == SECCOMP_SET_MODE_FILTER) {
+        if (!cur->no_new_privs && !capable(&cur->cred, CAP_SYS_ADMIN))
+            return -EACCES;
+        cur->seccomp_mode = SECCOMP_MODE_FILTER;
+        KLOG_WARN("seccomp: filter mode is a stub; BPF program ignored\n");
+        return 0;
+    }
+
+    return -EINVAL;
+}
+
+static inline int seccomp_strict_allows_syscall(uint64_t nr) {
+    return nr == SYS_READ || nr == SYS_WRITE || nr == SYS_EXIT || nr == SYS_RT_SIGRETURN;
 }
 
 static int64_t sc_set_tid_address(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
@@ -861,22 +1258,35 @@ static int64_t sc_kill(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,ui
         /* Signal specific process */
         task_t *target = task_lookup((uint32_t)pid);
         if (!target || target->is_kthread) return -ESRCH;
+        if (!can_signal_target(cur, target, sig)) return -EPERM;
         signal_send(target, sig);
     } else if (pid == 0) {
         /* Signal every process in the caller's process group */
         if (!cur) return -ESRCH;
-        signal_send_pgrp(cur->pgid, sig);
+        for (uint32_t i = 1; i < TASK_TABLE_SIZE; i++) {
+            task_t *t = task_get_from_table(i);
+            if (!t || t->is_kthread || t->pgid != cur->pgid) continue;
+            if (!can_signal_target(cur, t, sig)) continue;
+            signal_send(t, sig);
+        }
     } else if (pid == -1) {
         /* Signal every user process except PID 1 and caller */
         for (uint32_t i = 1; i < TASK_TABLE_SIZE; i++) {
             task_t *t = task_get_from_table(i);
             if (!t || t->is_kthread || t->pid == 1) continue;
             if (cur && t->pid == cur->pid)  continue;
+            if (!can_signal_target(cur, t, sig)) continue;
             signal_send(t, sig);
         }
     } else {
         /* pid < -1: signal process group (-pid) */
-        signal_send_pgrp((uint32_t)(-pid), sig);
+        uint32_t pgrp = (uint32_t)(-pid);
+        for (uint32_t i = 1; i < TASK_TABLE_SIZE; i++) {
+            task_t *t = task_get_from_table(i);
+            if (!t || t->is_kthread || t->pgid != pgrp) continue;
+            if (!can_signal_target(cur, t, sig)) continue;
+            signal_send(t, sig);
+        }
     }
     return 0;
 }
@@ -1040,6 +1450,13 @@ static int64_t sc_clone3(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,
     if (copy_len > sizeof(ca)) copy_len = sizeof(ca);
     memcpy(&ca, (const void *)a, copy_len);
 
+    const uint64_t ns_flags = (uint64_t)CLONE_NEWNS | (uint64_t)CLONE_NEWUTS |
+                              (uint64_t)CLONE_NEWIPC | (uint64_t)CLONE_NEWUSER |
+                              (uint64_t)CLONE_NEWPID | (uint64_t)CLONE_NEWNET |
+                              (uint64_t)CLONE_NEWCGROUP;
+    if (ca.flags & ns_flags)
+        return -EINVAL;
+
     uint64_t child_sp = ca.stack;
     if (ca.stack && ca.stack_size) {
         uint64_t top = ca.stack + ca.stack_size;
@@ -1049,6 +1466,16 @@ static int64_t sc_clone3(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,
 
     uint64_t flags = ca.flags | (ca.exit_signal & 0xFFULL);
     return sys_clone(flags, child_sp, ca.parent_tid, ca.child_tid, ca.tls, g_fork_regs);
+}
+
+static int64_t sc_unshare(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;
+    return -ENOSYS;
+}
+
+static int64_t sc_setns(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;
+    return -ENOSYS;
 }
 
 /* Futex syscall — forward declaration */
@@ -1200,15 +1627,26 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_GETGID]    = sc_getgid,
     [SYS_SETUID]    = sc_setuid,
     [SYS_SETGID]    = sc_setgid,
-    [SYS_GETEUID]   = sc_getuid,
-    [SYS_GETEGID]   = sc_getgid,
+    [SYS_GETEUID]   = sc_geteuid,
+    [SYS_GETEGID]   = sc_getegid,
+    [SYS_SETREUID]  = sc_setreuid,
+    [SYS_SETREGID]  = sc_setregid,
     [SYS_GETGROUPS] = sc_getgroups,
     [SYS_SETGROUPS] = sc_setgroups,
+    [SYS_SETRESUID] = sc_setresuid,
+    [SYS_GETRESUID] = sc_getresuid,
+    [SYS_SETRESGID] = sc_setresgid,
+    [SYS_GETRESGID] = sc_getresgid,
     [SYS_GETPPID]   = sc_getppid,
     [SYS_SETPGID]   = sc_setpgid,
     [SYS_SETSID]    = sc_setsid,
     [SYS_GETPGID]   = sc_getpgid,
+    [SYS_SETFSUID]  = sc_setfsuid,
+    [SYS_SETFSGID]  = sc_setfsgid,
     [SYS_GETSID]    = sc_getsid,
+    [SYS_CAPGET]    = sc_capget,
+    [SYS_CAPSET]    = sc_capset,
+    [SYS_PRCTL]     = sc_prctl,
     [SYS_ARCH_PRCTL]= sc_arch_prctl,
     [SYS_SYNC]      = sc_sync,
     [SYS_MOUNT]     = sc_mount,
@@ -1216,11 +1654,14 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_SET_TID_ADDRESS] = sc_set_tid_address,
     [SYS_SET_ROBUST_LIST] = sc_set_robust_list,
     [SYS_GET_ROBUST_LIST] = sc_get_robust_list,
+    [SYS_UNSHARE]         = sc_unshare,
     [SYS_CLOCK_GETTIME]   = sc_clock_gettime,
     [SYS_CLOCK_NANOSLEEP] = sc_clock_nanosleep,
     [SYS_EXIT_GROUP]= sc_exit_group,
     [SYS_DUP3]      = sc_dup3,
     [SYS_PRLIMIT64] = sc_prlimit64,
+    [SYS_SETNS]     = sc_setns,
+    [SYS_SECCOMP]   = sc_seccomp,
     [SYS_GETRANDOM] = sc_getrandom,
     [SYS_POLL]      = sc_poll,
     [SYS_IOCTL]     = sc_ioctl,
@@ -1280,6 +1721,15 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
 /* ── INT 0x80 handler ─────────────────────────────────────────────────────── */
 static void syscall_dispatch(cpu_regs_t *regs) {
     uint64_t nr = regs->rax;
+    task_t *cur = sched_current();
+
+    if (cur && cur->seccomp_mode == SECCOMP_MODE_STRICT && !seccomp_strict_allows_syscall(nr)) {
+        signal_send(cur, SIGKILL);
+        regs->rax = (uint64_t)-EPERM;
+        if (cur->is_user)
+            signal_deliver_user(cur, regs);
+        return;
+    }
 
     /* sys_fork/clone/sigreturn need access to the full register frame */
     if (nr == SYS_FORK || nr == SYS_CLONE || nr == SYS_CLONE3) g_fork_regs = regs;
@@ -1295,7 +1745,7 @@ static void syscall_dispatch(cpu_regs_t *regs) {
     }
 
     /* Deliver pending signals on return to user-space */
-    task_t *cur = sched_current();
+    cur = sched_current();
     if (cur && cur->is_user)
         signal_deliver_user(cur, regs);
 }
@@ -1304,6 +1754,15 @@ static void syscall_dispatch(cpu_regs_t *regs) {
 void syscall_dispatch_fast(cpu_regs_t *regs) {
     /* Identical dispatch logic — the asm stub already built a cpu_regs_t frame */
     uint64_t nr = regs->rax;
+    task_t *cur = sched_current();
+
+    if (cur && cur->seccomp_mode == SECCOMP_MODE_STRICT && !seccomp_strict_allows_syscall(nr)) {
+        signal_send(cur, SIGKILL);
+        regs->rax = (uint64_t)-EPERM;
+        if (cur->is_user)
+            signal_deliver_user(cur, regs);
+        return;
+    }
 
 
     if (nr == SYS_FORK || nr == SYS_CLONE || nr == SYS_CLONE3) g_fork_regs = regs;
@@ -1320,7 +1779,7 @@ void syscall_dispatch_fast(cpu_regs_t *regs) {
 
 
     /* Deliver pending signals on return to user-space */
-    task_t *cur = sched_current();
+    cur = sched_current();
     if (cur && cur->is_user)
         signal_deliver_user(cur, regs);
 }

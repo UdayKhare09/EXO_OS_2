@@ -134,6 +134,8 @@ static ssize_t  devfs_read(vnode_t *v, void *buf, size_t len, uint64_t off);
 static ssize_t  devfs_write(vnode_t *v, const void *buf, size_t len, uint64_t off);
 static int      devfs_readdir(vnode_t *dir, uint64_t *cookie, vfs_dirent_t *out);
 static int      devfs_stat(vnode_t *v, vfs_stat_t *st);
+static int      devfs_chmod(vnode_t *v, uint32_t mode);
+static int      devfs_chown(vnode_t *v, int owner, int group);
 static vnode_t *devfs_symlink(vnode_t *parent, const char *name, const char *tgt);
 static int      devfs_readlink(vnode_t *v, char *buf, size_t sz);
 static vnode_t *devfs_mount(fs_inst_t *fsi, blkdev_t *dev);
@@ -678,6 +680,21 @@ static int devfs_stat(vnode_t *v, vfs_stat_t *st) {
     return 0;
 }
 
+static int devfs_chmod(vnode_t *v, uint32_t mode) {
+    if (!v) return -EINVAL;
+    v->mode = (v->mode & VFS_S_IFMT) | (mode & 07777);
+    v->ctime = (int64_t)(sched_get_ticks() / 1000);
+    return 0;
+}
+
+static int devfs_chown(vnode_t *v, int owner, int group) {
+    if (!v) return -EINVAL;
+    if (owner >= 0) v->uid = (uint32_t)owner;
+    if (group >= 0) v->gid = (uint32_t)group;
+    v->ctime = (int64_t)(sched_get_ticks() / 1000);
+    return 0;
+}
+
 static void devfs_evict(vnode_t *v) {
     if (!v || !v->fs_data) return;
     devfs_node_t *node = (devfs_node_t *)v->fs_data;
@@ -725,6 +742,8 @@ static fs_ops_t devfs_ops = {
     .symlink  = devfs_symlink,
     .readlink = devfs_readlink,
     .truncate = NULL,
+    .chmod    = devfs_chmod,
+    .chown    = devfs_chown,
     .sync    = NULL,
     .evict   = devfs_evict,
     .mount   = devfs_mount,

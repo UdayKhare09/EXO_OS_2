@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include "mm/pmm.h"        /* for PAGE_SIZE   */
 #include "ipc/signal.h"    /* for sig_handler_t */
+#include "cred.h"
 
 /* Forward-declare file_t to avoid circular include (fs/fd.h includes sched/task.h) */
 struct file;
@@ -11,7 +12,6 @@ struct file;
 #define TASK_NAME_MAX     32
 #define TASK_FD_TABLE_SIZE 256
 #define TASK_CWD_MAX      512
-#define TASK_MAX_GROUPS   8
 
 typedef enum {
     TASK_RUNNABLE  = 0,
@@ -67,10 +67,11 @@ typedef struct task {
     uint32_t      ppid;             /* parent process ID                        */
     uint32_t      pgid;             /* process group ID                         */
     uint32_t      sid;              /* session ID                               */
-    uint32_t      uid, gid;         /* effective user/group IDs                  */
+    cred_t        cred;             /* process credentials                        */
     uint32_t      umask;            /* process file-mode creation mask           */
-    uint32_t      groups[TASK_MAX_GROUPS]; /* supplementary groups              */
-    uint32_t      group_count;      /* number of valid entries in groups[]       */
+    uint8_t       no_new_privs;     /* prctl(PR_SET_NO_NEW_PRIVS)               */
+    uint8_t       keep_caps;        /* prctl(PR_SET_KEEPCAPS)                   */
+    uint8_t       seccomp_mode;     /* 0=disabled, 1=strict, 2=filter(stub)     */
     struct task  *parent;           /* parent task pointer                      */
     struct task  *children;         /* first child (linked via child_next)      */
     struct task  *child_next;       /* next sibling (in parent's children list) */

@@ -44,6 +44,8 @@ typedef struct pty_pair {
     uint16_t   ws_ypixel;
 
     int        fg_pgid;         /* foreground process group          */
+    uint32_t   owner_uid;       /* owner for /dev/pts/<N>            */
+    uint32_t   owner_gid;       /* group for /dev/pts/<N>            */
 
     int        master_open;     /* ref count masters (0 or 1)        */
     int        slave_open;      /* ref count slaves  (0+)            */

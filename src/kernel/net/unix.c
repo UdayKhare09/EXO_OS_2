@@ -12,6 +12,8 @@
 #include "net/socket.h"
 #include "net/socket_defs.h"
 #include "fs/fd.h"
+#include "fs/vfs.h"
+#include "sched/cred.h"
 #include "sched/sched.h"
 #include "sched/task.h"
 #include "sched/waitq.h"
@@ -160,6 +162,52 @@ static unix_sock_t *unix_find_listener(const char *path, int path_len) {
     return NULL;
 }
 
+static int unix_task_in_group(const task_t *t, uint32_t gid) {
+    if (!t) return 0;
+    if (t->cred.gid == gid || t->cred.egid == gid || t->cred.fsgid == gid) return 1;
+    uint32_t n = t->cred.group_count;
+    if (n > TASK_MAX_GROUPS) n = TASK_MAX_GROUPS;
+    for (uint32_t i = 0; i < n; i++)
+        if (t->cred.groups[i] == gid) return 1;
+    return 0;
+}
+
+static int unix_check_path_write_perm(const char *path, int path_len) {
+    if (!path || path_len <= 0) return -EINVAL;
+    if (path[0] == '\0') return 0; /* abstract namespace */
+
+    char kpath[109];
+    int n = path_len;
+    if (n > 108) n = 108;
+    memcpy(kpath, path, (size_t)n);
+    while (n > 0 && kpath[n - 1] == '\0') n--;
+    kpath[n] = '\0';
+    if (!kpath[0]) return -EINVAL;
+
+    int err = 0;
+    vnode_t *v = vfs_lookup(kpath, true, &err);
+    if (!v) return err ? err : -ENOENT;
+
+    task_t *cur = sched_current();
+    if (!cur) {
+        vfs_vnode_put(v);
+        return -ESRCH;
+    }
+
+    if (capable(&cur->cred, CAP_DAC_OVERRIDE)) {
+        vfs_vnode_put(v);
+        return 0;
+    }
+
+    uint32_t perm;
+    if (cur->cred.fsuid == v->uid) perm = (v->mode >> 6) & 7;
+    else if (unix_task_in_group(cur, v->gid)) perm = (v->mode >> 3) & 7;
+    else perm = v->mode & 7;
+
+    vfs_vnode_put(v);
+    return (perm & 2) ? 0 : -EACCES;
+}
+
 /* ── Proto ops ───────────────────────────────────────────────────────────── */
 static int unix_bind(socket_t *sk, const struct sockaddr *addr, socklen_t addrlen) {
     if (!addr || addrlen < 3) return -EINVAL;
@@ -199,6 +247,9 @@ static int unix_connect(socket_t *sk, const struct sockaddr *addr, socklen_t add
     int path_len = (int)addrlen - 2;
     if (path_len <= 0 || path_len > 107) return -EINVAL;
 
+    int pchk = unix_check_path_write_perm(sun->path, path_len);
+    if (pchk < 0) return pchk;
+
     unix_sock_t *listener = unix_find_listener(sun->path, path_len);
     if (!listener) return -ECONNREFUSED;
 
@@ -229,8 +280,8 @@ static int unix_connect(socket_t *sk, const struct sockaddr *addr, socklen_t add
     /* Record peer credentials at connect time */
     task_t *cur = sched_current();
     if (cur) {
-        uc->peer_pid = cur->pid; uc->peer_uid = cur->uid; uc->peer_gid = cur->gid;
-        us->peer_pid = cur->pid; us->peer_uid = cur->uid; us->peer_gid = cur->gid;
+        uc->peer_pid = cur->pid; uc->peer_uid = cur->cred.euid; uc->peer_gid = cur->cred.egid;
+        us->peer_pid = cur->pid; us->peer_uid = cur->cred.euid; us->peer_gid = cur->cred.egid;
     }
 
     /* Enqueue server half on listener's accept queue */
@@ -512,8 +563,8 @@ int unix_socketpair(int type, int sv[2]) {
     task_t *ct = sched_current();
     if (ct) {
         ua->peer_pid = ub->peer_pid = ct->pid;
-        ua->peer_uid = ub->peer_uid = ct->uid;
-        ua->peer_gid = ub->peer_gid = ct->gid;
+        ua->peer_uid = ub->peer_uid = ct->cred.euid;
+        ua->peer_gid = ub->peer_gid = ct->cred.egid;
     }
 
     socket_t *ska = kmalloc(sizeof(socket_t));

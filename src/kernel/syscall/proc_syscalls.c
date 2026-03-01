@@ -245,15 +245,11 @@ int64_t sys_fork(cpu_regs_t *regs) {
     child->ppid    = parent->pid;
     child->pgid    = parent->pgid;
     child->sid     = parent->sid;
-    child->uid     = parent->uid;
-    child->gid     = parent->gid;
+    cred_copy(&child->cred, &parent->cred);
     child->umask   = parent->umask;
     /* fork() inherits exe_path: child /proc/<pid>/exe points at same binary
      * (Linux: mm->exe_file is shared via get_file() across fork). */
     memcpy(child->exe_path, parent->exe_path, TASK_CWD_MAX);
-    child->group_count = parent->group_count;
-    for (uint32_t gi = 0; gi < TASK_MAX_GROUPS; gi++)
-        child->groups[gi] = parent->groups[gi];
     child->parent  = parent;
 
     /* Add to parent's children list */
@@ -387,6 +383,10 @@ static int copy_strings(uintptr_t cr3, char *const user_arr[], char *buf, size_t
 int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
     task_t *cur = sched_current();
     if (!cur) return -ESRCH;
+    uint32_t exec_mode = 0;
+    uint32_t exec_uid = 0;
+    uint32_t exec_gid = 0;
+    int exec_secure = 0;
 
     /* Copy argv/envp into kernel buffers (max 256 strings, 64 KiB total) */
     #define EXEC_MAX_STRS  256
@@ -427,6 +427,9 @@ int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
     int vfs_err = 0;
     vnode_t *vn = vfs_lookup(exec_path, true, &vfs_err);
     if (!vn) { kfree(argv_buf); kfree(envp_buf); return vfs_err ? vfs_err : -ENOENT; }
+    exec_mode = vn->mode;
+    exec_uid = vn->uid;
+    exec_gid = vn->gid;
 
     /* Read ELF into a temporary kernel buffer */
     uint64_t size = vn->size;
@@ -558,6 +561,40 @@ int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
     /* Update brk to end of loaded segments */
     cur->brk_base    = info.brk_start;
     cur->brk_current = info.brk_start;
+
+    uint32_t old_euid = cur->cred.euid;
+
+    /* Apply setuid/setgid credential transitions after successful image load.
+     * no_new_privs suppresses privilege gain through exec. */
+    if (!cur->no_new_privs) {
+        if (exec_mode & VFS_S_ISUID) {
+            cur->cred.euid = exec_uid;
+            cur->cred.suid = exec_uid;
+            cur->cred.fsuid = exec_uid;
+            exec_secure = 1;
+        }
+        if (exec_mode & VFS_S_ISGID) {
+            cur->cred.egid = exec_gid;
+            cur->cred.sgid = exec_gid;
+            cur->cred.fsgid = exec_gid;
+            exec_secure = 1;
+        }
+
+        if ((exec_mode & VFS_S_ISUID) && exec_uid == 0 && !(cur->cred.securebits & SECBIT_NOROOT)) {
+            cur->cred.cap_permitted = (cur->cred.cap_inheritable | cur->cred.cap_bounding) & cur->cred.cap_bounding;
+            cur->cred.cap_effective = cur->cred.cap_permitted;
+        }
+
+        if (!(cur->cred.securebits & SECBIT_NOROOT)) {
+            if (old_euid == 0 && cur->cred.euid != 0) {
+                cur->cred.cap_effective = 0;
+            } else if (old_euid != 0 && cur->cred.euid == 0) {
+                uint64_t full = (CAP_LAST_CAP >= 63) ? ~0ULL : ((1ULL << (CAP_LAST_CAP + 1)) - 1ULL);
+                cur->cred.cap_permitted = full & cur->cred.cap_bounding;
+                cur->cred.cap_effective = cur->cred.cap_permitted;
+            }
+        }
+    }
 
     /* Clear old VMAs and rebuild from ELF info */
     vma_t *v = cur->vma_list;
@@ -708,15 +745,15 @@ int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
     /* 3) Auxiliary vector */
     PUSH_U64(0);                     /* AT_NULL value */
     PUSH_U64(AT_NULL);               /* AT_NULL type  */
-    PUSH_U64(0);                     /* AT_SECURE = 0 */
+    PUSH_U64(exec_secure);           /* AT_SECURE     */
     PUSH_U64(AT_SECURE);
-    PUSH_U64(cur->gid);              /* AT_EGID       */
+    PUSH_U64(cur->cred.egid);        /* AT_EGID       */
     PUSH_U64(AT_EGID);
-    PUSH_U64(cur->uid);              /* AT_EUID       */
+    PUSH_U64(cur->cred.euid);        /* AT_EUID       */
     PUSH_U64(AT_EUID);
-    PUSH_U64(cur->gid);              /* AT_GID        */
+    PUSH_U64(cur->cred.gid);         /* AT_GID        */
     PUSH_U64(AT_GID);
-    PUSH_U64(cur->uid);              /* AT_UID        */
+    PUSH_U64(cur->cred.uid);         /* AT_UID        */
     PUSH_U64(AT_UID);
     PUSH_U64(execfn_user);           /* AT_EXECFN     */
     PUSH_U64(AT_EXECFN);
@@ -1180,12 +1217,8 @@ int64_t sys_clone(uint64_t flags, uint64_t stack, uint64_t parent_tid_ptr,
     child->ppid   = parent->pid;
     child->pgid   = parent->pgid;
     child->sid    = parent->sid;
-    child->uid    = parent->uid;
-    child->gid    = parent->gid;
+    cred_copy(&child->cred, &parent->cred);
     child->umask  = parent->umask;
-    child->group_count = parent->group_count;
-    for (uint32_t gi = 0; gi < TASK_MAX_GROUPS; gi++)
-        child->groups[gi] = parent->groups[gi];
     child->parent = parent;
 
     if (is_thread) {

@@ -10,6 +10,7 @@
 #include "lib/klog.h"
 #include "sched/sched.h"
 #include "sched/task.h"
+#include "sched/cred.h"
 #include "mm/pmm.h"
 #include "arch/x86_64/smp.h"
 #include "drivers/storage/blkdev.h"
@@ -235,16 +236,16 @@ static ssize_t gen_status(uint32_t pid, char *buf, size_t bufsz) {
     off = PA(buf, bufsz, off, "PPid:\t%u\n", (unsigned)t->ppid);
     off = PA(buf, bufsz, off, "TracerPid:\t0\n");
     off = PA(buf, bufsz, off, "Uid:\t%u\t%u\t%u\t%u\n",
-             (unsigned)t->uid, (unsigned)t->uid,
-             (unsigned)t->uid, (unsigned)t->uid);
+             (unsigned)t->cred.uid, (unsigned)t->cred.euid,
+             (unsigned)t->cred.suid, (unsigned)t->cred.fsuid);
     off = PA(buf, bufsz, off, "Gid:\t%u\t%u\t%u\t%u\n",
-             (unsigned)t->gid, (unsigned)t->gid,
-             (unsigned)t->gid, (unsigned)t->gid);
+             (unsigned)t->cred.gid, (unsigned)t->cred.egid,
+             (unsigned)t->cred.sgid, (unsigned)t->cred.fsgid);
     off = PA(buf, bufsz, off, "FDSize:\t%d\n", fdcount > 64 ? fdcount : 64);
     off = PA(buf, bufsz, off, "Groups:");
-    uint32_t ng = t->group_count < (uint32_t)TASK_MAX_GROUPS ? t->group_count : (uint32_t)TASK_MAX_GROUPS;
+    uint32_t ng = t->cred.group_count < (uint32_t)TASK_MAX_GROUPS ? t->cred.group_count : (uint32_t)TASK_MAX_GROUPS;
     for (uint32_t gi = 0; gi < ng; gi++)
-        off = PA(buf, bufsz, off, " %u", (unsigned)t->groups[gi]);
+        off = PA(buf, bufsz, off, " %u", (unsigned)t->cred.groups[gi]);
     off = PA(buf, bufsz, off, "\n");
     off = PA(buf, bufsz, off, "NStgid:\t%u\n", (unsigned)t->pid);
     off = PA(buf, bufsz, off, "NSpid:\t%u\n",  (unsigned)t->pid);
@@ -278,14 +279,17 @@ static ssize_t gen_status(uint32_t pid, char *buf, size_t bufsz) {
     off = PA(buf, bufsz, off, "SigBlk:\t%s\n", hex);
     off = PA(buf, bufsz, off, "SigIgn:\t0000000000000000\n");
     off = PA(buf, bufsz, off, "SigCgt:\t0000000000000000\n");
-    off = PA(buf, bufsz, off, "CapInh:\t0000000000000000\n");
-    const char *capstr = (t->uid == 0) ? "000001ffffffffff" : "0000000000000000";
-    off = PA(buf, bufsz, off, "CapPrm:\t%s\n", capstr);
-    off = PA(buf, bufsz, off, "CapEff:\t%s\n", capstr);
-    off = PA(buf, bufsz, off, "CapBnd:\t000001ffffffffff\n");
+    fmt_hex16((uint64_t)t->cred.cap_inheritable, hex);
+    off = PA(buf, bufsz, off, "CapInh:\t%s\n", hex);
+    fmt_hex16((uint64_t)t->cred.cap_permitted, hex);
+    off = PA(buf, bufsz, off, "CapPrm:\t%s\n", hex);
+    fmt_hex16((uint64_t)t->cred.cap_effective, hex);
+    off = PA(buf, bufsz, off, "CapEff:\t%s\n", hex);
+    fmt_hex16((uint64_t)t->cred.cap_bounding, hex);
+    off = PA(buf, bufsz, off, "CapBnd:\t%s\n", hex);
     off = PA(buf, bufsz, off, "CapAmb:\t0000000000000000\n");
-    off = PA(buf, bufsz, off, "NoNewPrivs:\t0\n");
-    off = PA(buf, bufsz, off, "Seccomp:\t0\n");
+    off = PA(buf, bufsz, off, "NoNewPrivs:\t%u\n", (unsigned)(t->no_new_privs ? 1 : 0));
+    off = PA(buf, bufsz, off, "Seccomp:\t%u\n", (unsigned)t->seccomp_mode);
     off = PA(buf, bufsz, off, "Seccomp_filters:\t0\n");
     off = PA(buf, bufsz, off, "Speculation_Store_Bypass:\tthread vulnerable\n");
     off = PA(buf, bufsz, off, "SpeculationIndirectBranch:\talways enabled\n");
@@ -1335,6 +1339,17 @@ static int procfs_stat(vnode_t *v, vfs_stat_t *st) {
     st->ino     = v->ino;
     st->blksize = 4096;
     if (VFS_S_ISREG(v->mode)) st->size = 4096;
+
+    if (v->fs_data) {
+        procfs_node_t *pn = (procfs_node_t *)v->fs_data;
+        if (pn->pid != 0) {
+            task_t *owner = task_lookup(pn->pid);
+            if (owner) {
+                st->uid = owner->cred.euid;
+                st->gid = owner->cred.egid;
+            }
+        }
+    }
     return 0;
 }
 

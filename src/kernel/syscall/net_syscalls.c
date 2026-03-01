@@ -16,9 +16,11 @@
 #include "gfx/fbcon.h"
 #include "sched/sched.h"
 #include "sched/task.h"
+#include "sched/cred.h"
 #include "ipc/signal.h"
 #include "lib/klog.h"
 #include "lib/string.h"
+#include "net/netutil.h"
 
 extern int64_t sys_pipe2(int pipefd[2], int flags);
 
@@ -135,6 +137,11 @@ static kernel_termios_t g_tty_termios = {
 };
 
 static int g_tty_fg_pgid = 1;
+
+static inline int current_has_cap(uint64_t cap) {
+    task_t *cur = sched_current();
+    return cur && capable(&cur->cred, cap);
+}
 
 uint32_t tty_get_iflag(void) {
     return g_tty_termios.c_iflag;
@@ -256,6 +263,10 @@ static int tty_ioctl(file_t *f, unsigned long cmd, unsigned long arg) {
 
 /* ── socket(2) ───────────────────────────────────────────────────────────── */
 int64_t sys_socket(int domain, int type, int protocol) {
+    int base_type = type & ~(SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if (base_type == SOCK_RAW && !current_has_cap(CAP_NET_RAW))
+        return -EPERM;
+
     int r = socket_create(domain, type, protocol);
     if (r == -1) return -EINVAL;
     return (int64_t)r;
@@ -335,6 +346,23 @@ int64_t sys_bind(int fd, const struct sockaddr *addr, socklen_t addrlen) {
     socket_t *sk = socket_from_fd(fd);
     if (!sk) return -EBADF;
     if (!sk->proto_ops || !sk->proto_ops->bind) return -EINVAL;
+
+    if (addr) {
+        uint16_t port = 0;
+        if (addr->sa_family == AF_INET && addrlen >= (socklen_t)sizeof(struct sockaddr_in)) {
+            const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
+            port = ntohs(sin->sin_port);
+        } else if (addr->sa_family == AF_INET6 && addrlen >= 4) {
+            const uint8_t *raw = (const uint8_t *)addr;
+            uint16_t p = 0;
+            memcpy(&p, raw + 2, sizeof(p));
+            port = ntohs(p);
+        }
+
+        if (port != 0 && port < 1024 && !current_has_cap(CAP_NET_BIND_SERVICE))
+            return -EACCES;
+    }
+
     int r = sk->proto_ops->bind(sk, addr, addrlen);
     if (r == -1) return -EINVAL;
     return (int64_t)r;
@@ -622,8 +650,8 @@ int64_t sys_recvmsg(int fd, msghdr_t *msg, int flags) {
             c[1] = 1;                      /* SOL_SOCKET */
             c[2] = 2;                      /* SCM_CREDENTIALS */
             c[3] = cur ? cur->pid : 0;     /* pid */
-            c[4] = cur ? cur->uid : 0;     /* uid */
-            c[5] = cur ? cur->gid : 0;     /* gid */
+            c[4] = cur ? cur->cred.euid : 0; /* uid */
+            c[5] = cur ? cur->cred.egid : 0; /* gid */
             pos += 24;
         }
 

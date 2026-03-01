@@ -117,11 +117,11 @@ static task_t *task_alloc_common(const char *name, uint32_t cpu_id, int is_kthre
     t->ppid   = 0;
     t->pgid   = t->pid;
     t->sid    = t->pid;
-    t->uid    = 0;
-    t->gid    = 0;
+    cred_init(&t->cred);
     t->umask  = 022;
-    t->group_count = 1;
-    t->groups[0] = t->gid;
+    t->no_new_privs = 0;
+    t->keep_caps = 0;
+    t->seccomp_mode = 0;
     t->parent = NULL;
     t->children   = NULL;
     t->child_next = NULL;

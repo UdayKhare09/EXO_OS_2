@@ -324,7 +324,7 @@ static int tmpfs_truncate(vnode_t *v, uint64_t size) {
 
 static int tmpfs_chmod(vnode_t *v, uint32_t mode) {
     tmpfs_inode_t *ti = vnode_ti(v);
-    ti->mode = (ti->mode & VFS_S_IFMT) | (mode & 0777);
+    ti->mode = (ti->mode & VFS_S_IFMT) | (mode & 07777);
     v->mode  = ti->mode;
     return 0;
 }

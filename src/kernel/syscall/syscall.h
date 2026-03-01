@@ -71,13 +71,24 @@
 #define SYS_SETGID      106
 #define SYS_GETEUID     107
 #define SYS_GETEGID     108
+#define SYS_SETREUID    113
+#define SYS_SETREGID    114
 #define SYS_SETPGID     109
 #define SYS_GETPPID     110
 #define SYS_GETGROUPS   115
 #define SYS_SETGROUPS   116
+#define SYS_SETRESUID   117
+#define SYS_GETRESUID   118
+#define SYS_SETRESGID   119
+#define SYS_GETRESGID   120
 #define SYS_SETSID      112
 #define SYS_GETPGID     121
+#define SYS_SETFSUID    122
+#define SYS_SETFSGID    123
 #define SYS_GETSID      124
+#define SYS_CAPGET      125
+#define SYS_CAPSET      126
+#define SYS_PRCTL       157
 #define SYS_ARCH_PRCTL  158
 #define SYS_SYNC        162
 #define SYS_GETTID      186
@@ -98,6 +109,7 @@
 #define SYS_SET_ROBUST_LIST 273
 #define SYS_GET_ROBUST_LIST 274
 #define SYS_UTIMENSAT   280
+#define SYS_UNSHARE     272
 #define SYS_MADVISE     28
 #define SYS_SENDMSG     46
 #define SYS_RECVMSG     47
@@ -124,6 +136,8 @@
 #define SYS_PIPE2       293
 #define SYS_INOTIFY_INIT1  294
 #define SYS_PRLIMIT64   302
+#define SYS_SETNS       308
+#define SYS_SECCOMP     317
 #define SYS_GETRANDOM   318
 #define SYS_MEMFD_CREATE   319
 #define SYS_CLONE3      435
@@ -157,6 +171,23 @@
 #define ARCH_GET_FS     0x1003
 #define ARCH_GET_GS     0x1004
 
+/* prctl operations (subset) */
+#define PR_GET_KEEPCAPS     7
+#define PR_SET_KEEPCAPS     8
+#define PR_SET_NAME         15
+#define PR_GET_NAME         16
+#define PR_GET_SECCOMP      21
+#define PR_SET_SECCOMP      22
+#define PR_SET_NO_NEW_PRIVS 38
+#define PR_GET_NO_NEW_PRIVS 39
+
+/* seccomp */
+#define SECCOMP_SET_MODE_STRICT 0
+#define SECCOMP_SET_MODE_FILTER 1
+#define SECCOMP_MODE_DISABLED   0
+#define SECCOMP_MODE_STRICT     1
+#define SECCOMP_MODE_FILTER     2
+
 /* Linux open flags */
 #define SYS_O_RDONLY    0
 #define SYS_O_WRONLY    1
@@ -187,6 +218,14 @@
 #define CLONE_FILES     0x00000400
 #define CLONE_SIGHAND   0x00000800
 #define CLONE_THREAD    0x00010000
+#define CLONE_NEWNS     0x00020000
+#define CLONE_SYSVSEM   0x00040000
+#define CLONE_NEWUTS    0x04000000
+#define CLONE_NEWIPC    0x08000000
+#define CLONE_NEWUSER   0x10000000
+#define CLONE_NEWPID    0x20000000
+#define CLONE_NEWNET    0x40000000
+#define CLONE_NEWCGROUP 0x02000000
 
 /* futex ops */
 #define FUTEX_WAIT      0

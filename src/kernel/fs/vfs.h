@@ -55,6 +55,9 @@ typedef struct file_ops file_ops_t;  /* defined in fs/fd.h */
 #define VFS_S_IROTH 0004
 #define VFS_S_IWOTH 0002
 #define VFS_S_IXOTH 0001
+#define VFS_S_ISUID 04000
+#define VFS_S_ISGID 02000
+#define VFS_S_ISVTX 01000
 
 /* ── POSIX stat structure ─────────────────────────────────────────────────── */
 typedef struct {
@@ -144,7 +147,7 @@ struct fs_ops {
     /* Truncate file to `size` bytes. */
     int (*truncate)(vnode_t *v, uint64_t size);
 
-    /* Change permission bits (0777 mask) while preserving file type bits. */
+    /* Change permission bits (07777 mask) while preserving file type bits. */
     int (*chmod)(vnode_t *v, uint32_t mode);
 
     /* Change ownership; owner/group < 0 means unchanged. */

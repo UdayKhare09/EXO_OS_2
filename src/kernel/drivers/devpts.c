@@ -70,7 +70,11 @@ static vnode_t *devpts_lookup(vnode_t *dir, const char *name) {
     if (!p) return NULL; /* no such PTY */
 
     /* Linux: /dev/pts/N is char device crw--w---- root tty */
-    return devpts_alloc_node(1, idx, VFS_S_IFCHR | 0620);
+    vnode_t *v = devpts_alloc_node(1, idx, VFS_S_IFCHR | 0620);
+    if (!v) return NULL;
+    v->uid = p->owner_uid;
+    v->gid = p->owner_gid;
+    return v;
 }
 
 static int devpts_open(vnode_t *v, int flags) {
@@ -143,6 +147,8 @@ static int devpts_stat(vnode_t *v, vfs_stat_t *st) {
     memset(st, 0, sizeof(*st));
     st->mode    = v->mode;
     st->ino     = v->ino;
+    st->uid     = v->uid;
+    st->gid     = v->gid;
     st->blksize = 4096;
     return 0;
 }

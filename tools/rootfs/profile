@@ -1,27 +1,34 @@
 # /etc/profile - EXO_OS defaults
 export PATH="/bin:/usr/bin:/sbin:/usr/sbin"
-export SHELL="/bin/sh"
-export HOME="/home/root"
-export USER="root"
-export LOGNAME="root"
+export SHELL="${SHELL:-/bin/sh}"
+export USER="${USER:-root}"
+if [ -z "$HOME" ]; then
+    if [ "$USER" = "root" ]; then
+        HOME="/home/root"
+    else
+        HOME="/home/$USER"
+    fi
+fi
+export LOGNAME="${LOGNAME:-$USER}"
 export HOSTNAME="exo"
 export TMPDIR="/tmp"
 export SSL_CERT_FILE="/etc/ssl/cert.pem"
 export SSL_CERT_DIR="/etc/ssl/certs"
 
 [ -z "$TERM" ] && TERM="linux"
-[ -z "$PWD" ] && PWD="/"
-[ -z "$PS1" ] && PS1="root@exo:\w# "
+[ -z "$PWD" ] && PWD="$HOME"
+if [ "$USER" = "root" ]; then
+    PS1="$USER@exo:\w# "
+else
+    PS1="$USER@exo:\w$ "
+fi
 
 export TERM
 export PWD
 export PS1
+export HOME
 umask 022
 
 if [ -x /bin/busybox ]; then
     /bin/busybox --install -s /bin >/dev/null 2>&1
-fi
-
-if [ -n "$PS1" ]; then
-    echo "ExoOS 0.1.0 x86_64"
 fi
