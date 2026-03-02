@@ -4,8 +4,10 @@
  * Linux framebuffer console utilities, and any program that uses
  * FBIOGET_FSCREENINFO / FBIOGET_VSCREENINFO / mmap(fd, MAP_SHARED).
  *
- * No write-combining or hardware cursor is attempted; we just expose
+ * No hardware cursor is attempted; we just expose
  * the Limine UEFI GOP framebuffer that fbcon already uses.
+ * The framebuffer mmap uses write-combining (VMM_WC) once cpu_pat_init()
+ * has programmed PAT[1]=WC in IA32_PAT.
  */
 #include "fb.h"
 #include "gfx/fbcon.h"    /* fbcon_get_fb_info() */
@@ -20,14 +22,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* ── Pixel format constants (XRGB8888 — the Limine default on x86-64) ─── */
-/* Each pixel is stored as 0x00RRGGBB in memory (32 bpp, no alpha used).   */
-#define FB_BPP 32
-/* Bit-field layout for XRGB8888:
- *   transp: offset=24, length=0  (no alpha)
- *   red:    offset=16, length=8
- *   green:  offset= 8, length=8
- *   blue:   offset= 0, length=8                                            */
+/* ── Pixel format: sourced dynamically from fbcon ─────────────────────── */
+/* BPP, channel shifts, and channel sizes are read from the running fbcon
+ * instance via fbcon_get_pixel_format() so that FBIOGET_VSCREENINFO always
+ * reflects the real GOP layout (which may be BGR, BGRX, etc.).             */
 
 /* ── Helpers to populate the fixed/variable info structs ─────────────────── */
 
@@ -43,7 +41,7 @@ static void fill_fix(fb_fix_screeninfo_t *fix) {
     for (size_t i = 0; i < nlen; i++) fix->id[i] = name[i];
 
     fix->smem_start  = phys;
-    fix->smem_len    = pitch * h;
+    fix->smem_len    = (uint32_t)((uint64_t)pitch * h);  /* overflow-safe cast */
     fix->type        = FB_TYPE_PACKED_PIXELS;
     fix->type_aux    = 0;
     fix->visual      = FB_VISUAL_TRUECOLOR;
@@ -61,6 +59,10 @@ static void fill_var(fb_var_screeninfo_t *var) {
     fbcon_get_fb_info(&phys, &w, &h, &pitch);
     (void)phys; (void)pitch;
 
+    uint8_t rs, rsz, gs, gsz, bs, bsz;
+    uint32_t bpp;
+    fbcon_get_pixel_format(&rs, &rsz, &gs, &gsz, &bs, &bsz, &bpp);
+
     memset(var, 0, sizeof(*var));
     var->xres         = w;
     var->yres         = h;
@@ -69,14 +71,13 @@ static void fill_var(fb_var_screeninfo_t *var) {
     var->xoffset      = 0;
     var->yoffset      = 0;
 
-    var->bits_per_pixel = FB_BPP;
+    var->bits_per_pixel = bpp;
     var->grayscale      = 0;
 
-    /* XRGB8888: blue at bit 0, green at 8, red at 16, no alpha */
-    var->red.offset = 16; var->red.length = 8; var->red.msb_right = 0;
-    var->green.offset = 8; var->green.length = 8; var->green.msb_right = 0;
-    var->blue.offset = 0; var->blue.length = 8; var->blue.msb_right = 0;
-    var->transp.offset = 0; var->transp.length = 0; var->transp.msb_right = 0;
+    var->red.offset    = rs;  var->red.length    = rsz; var->red.msb_right    = 0;
+    var->green.offset  = gs;  var->green.length  = gsz; var->green.msb_right  = 0;
+    var->blue.offset   = bs;  var->blue.length   = bsz; var->blue.msb_right   = 0;
+    var->transp.offset = 24;  var->transp.length = 0;   var->transp.msb_right = 0;
 
     /* No timing information (Limine abstracts the hardware fully). */
     var->pixclock = 0;
@@ -198,7 +199,8 @@ static int64_t fb_mmap(file_t *f, uint64_t addr, uint64_t len,
         uint64_t va = addr + i * PAGE_SIZE;
         /* Write-through + Write-combining not possible without PAT support.
          * Use present+writable+user — good enough for Limine UEFI GOP.     */
-        vmm_map_page_in(cur->cr3, va, pa, VMM_PRESENT | VMM_WRITE | VMM_USER);
+        vmm_map_page_in(cur->cr3, va, pa,
+                        VMM_PRESENT | VMM_WRITE | VMM_USER | VMM_WC);
     }
     return (int64_t)addr;
 }

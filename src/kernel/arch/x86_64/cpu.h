@@ -11,6 +11,7 @@
 #define MSR_FS_BASE         0xC0000100
 #define MSR_GS_BASE         0xC0000101
 #define MSR_KERN_GS_BASE    0xC0000102
+#define MSR_IA32_PAT        0x277       /* Page Attribute Table MSR */
 
 /* EFER bit: enable SYSCALL/SYSRET */
 #define EFER_SCE            (1ULL << 0)
@@ -39,6 +40,20 @@ static inline bool cpu_has_apic(void) {
     uint32_t eax, ebx, ecx, edx;
     cpuid(1, &eax, &ebx, &ecx, &edx);
     return (edx >> 9) & 1;
+}
+
+/* ── PAT initialisation ──────────────────────────────────────────────────── */
+/* Program IA32_PAT so that PWT=1,PCD=0 (VMM_WC) selects write-combining.
+ *   PAT[0]=WB=0x06  PAT[1]=WC=0x01  PAT[2]=UC-=0x07  PAT[3]=UC=0x00
+ *   PAT[4]=WB=0x06  PAT[5]=WC=0x01  PAT[6]=UC-=0x07  PAT[7]=WT=0x04
+ * PTE bits [PAT,PCD,PWT]=[0,0,1] → PAT[1] = WC  (used by VMM_WC = VMM_PWT). */
+#define CPU_PAT_VALUE  0x0407010600070106ULL
+
+static inline void cpu_pat_init(void) {
+    uint32_t eax, ebx, ecx, edx;
+    cpuid(1, &eax, &ebx, &ecx, &edx);
+    if (edx & (1u << 16))   /* PAT supported (CPUID.1.EDX bit 16) */
+        wrmsr(MSR_IA32_PAT, CPU_PAT_VALUE);
 }
 
 /* ── Port I/O ─────────────────────────────────────────────────────────────── */
@@ -104,7 +119,7 @@ static inline void invlpg(uintptr_t addr) {
  *
  * Sets up:
  *   CR0  — clears EM (disable FP emulation), sets MP, clears TS
- *   CR4  — sets OSFXSR, OSXMMEXCPT, OSXSAVE
+ *   CR4  — sets OSFXSR, OSXMMEXCPT, OSXSAVE, FSGSBASE (if supported)
  *   XCR0 — enables x87, SSE/XMM, AVX/YMM state components
  *   x87  — FNINIT (FCW=0x037F, all exceptions masked)
  *   SSE  — LDMXCSR 0x1F80 (all exceptions masked, round-to-nearest)
@@ -127,7 +142,12 @@ static inline void cpu_enable_fpu(void) {
     bool has_xsave   = (ecx >> 26) & 1;  /* bit 26: XSAVE     */
     bool has_avx     = (ecx >> 28) & 1;  /* bit 28: AVX       */
 
-    /* CR4: conditionally enable OSFXSR, OSXMMEXCPT, OSXSAVE */
+    /* Probe CPUID.7.0 for structured extended features */
+    uint32_t eax7, ebx7, ecx7, edx7;
+    cpuid(7, &eax7, &ebx7, &ecx7, &edx7);
+    bool has_fsgsbase = (ebx7 >> 1) & 1; /* bit 1: FSGSBASE   */
+
+    /* CR4: conditionally enable OSFXSR, OSXMMEXCPT, OSXSAVE, FSGSBASE */
     __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
     if (has_fxsr)
         cr4 |= (1ULL <<  9);   /* OSFXSR     */
@@ -135,6 +155,8 @@ static inline void cpu_enable_fpu(void) {
         cr4 |= (1ULL << 10);   /* OSXMMEXCPT */
     if (has_xsave)
         cr4 |= (1ULL << 18);   /* OSXSAVE    */
+    if (has_fsgsbase)
+        cr4 |= (1ULL << 16);   /* FSGSBASE — allows rdfsbase/wrfsbase in user-mode */
     __asm__ volatile("mov %0, %%cr4" :: "r"(cr4) : "memory");
 
     /* XCR0: enable state components (requires OSXSAVE set first) */

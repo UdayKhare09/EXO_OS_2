@@ -94,8 +94,8 @@ typedef struct task {
     uint64_t      itimer_real_interval;  /* periodic interval in ms (0 = one-shot) */
 
     /* ── IPC + Signals ──────────────────────────────────────────────────── */
-    volatile uint32_t    sig_pending;   /* bitmask: bit N set = signal N pending */
-    uint32_t             sig_mask;      /* signal mask (blocked signals)          */
+    volatile uint64_t    sig_pending;   /* bitmask: bit N set = signal N pending (64 signals) */
+    uint64_t             sig_mask;      /* signal mask (blocked signals, 64-bit)                */
     sig_handler_t       *sig_handlers;  /* [NSIGS] handler table; NULL = all DFL  */
     kernel_sigaction_t  *sigactions;    /* [NSIGS] rt_sigaction table             */
     struct ipc_mailbox  *mailbox;       /* receive message queue                   */

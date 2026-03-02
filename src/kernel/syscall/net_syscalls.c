@@ -29,6 +29,12 @@ extern int64_t sys_pipe2(int pipefd[2], int flags);
 #define TCSETS      0x5402
 #define TCSETSW     0x5403
 #define TCSETSF     0x5404
+/* glibc isatty()/tcgetattr()/tcsetattr() use TCGETS2/TCSETS2 exclusively.
+ * struct termios2 (44 bytes) is byte-for-byte identical to kernel_termios_t. */
+#define TCGETS2     0x802C542AU   /* _IOR('T',0x2A,struct termios2) */
+#define TCSETS2     0x402C542BU   /* _IOW('T',0x2B,struct termios2) */
+#define TCSETSW2    0x402C542CU   /* _IOW('T',0x2C,struct termios2) */
+#define TCSETSF2    0x402C542DU   /* _IOW('T',0x2D,struct termios2) */
 #define TIOCSCTTY   0x540E
 #define TIOCGPGRP   0x540F
 #define TIOCSPGRP   0x5410
@@ -278,13 +284,14 @@ int tty_console_ioctl(file_t *f, unsigned long cmd, unsigned long arg) {
     kernel_termios_t *termios = sess ? &sess->termios : &g_tty_termios;
     int *fg_pgid_ptr = sess ? &sess->fg_pgid : &g_tty_fg_pgid;
 
-    if (cmd == TCGETS) {
+    if (cmd == TCGETS || cmd == TCGETS2) {
         if (!arg) return -EINVAL;
         kernel_termios_t *user_t = (kernel_termios_t *)(uintptr_t)arg;
         *user_t = *termios;
         return 0;
     }
-    if (cmd == TCSETS || cmd == TCSETSW || cmd == TCSETSF) {
+    if (cmd == TCSETS  || cmd == TCSETSW  || cmd == TCSETSF  ||
+        cmd == TCSETS2 || cmd == TCSETSW2 || cmd == TCSETSF2) {
         if (!arg) return -EINVAL;
         const kernel_termios_t *user_t = (const kernel_termios_t *)(uintptr_t)arg;
         *termios = *user_t;

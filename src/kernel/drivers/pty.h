@@ -91,3 +91,10 @@ extern file_ops_t g_pty_master_fops;
 
 /* file_ops for the slave side (installed when /dev/pts/N is opened) */
 extern file_ops_t g_pty_slave_fops;
+
+/* lflag bits (subset; must match values in pty.c) */
+#define LFLAG_ISIG   0x00000001U  /* deliver SIGINT/SIGQUIT on ctrl chars */
+
+/* Return the c_lflag of the active foreground PTY.
+ * Falls back to LFLAG_ISIG when no PTY has an fg process group. */
+uint32_t pty_fg_lflag(void);

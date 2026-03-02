@@ -134,8 +134,21 @@ int fd_setup_stdio(struct task *t, vnode_t *console) {
     if (!t || !console) return -1;
     for (int fd = 0; fd <= 2; fd++) {
         int flags = (fd == 1 || fd == 2) ? O_WRONLY : O_RDONLY;
+        /* Call the vnode's open handler so /dev/console (or /dev/tty) injects
+         * its file_ops (line discipline with echo, ICANON, etc.) via
+         * pending_f_ops — matching the Linux behaviour where PID 1's stdio
+         * goes through the full TTY line discipline from the start.         */
+        if (console->ops && console->ops->open)
+            console->ops->open(console, flags);
         file_t *f = file_alloc(console, flags);
         if (!f) return -1;
+        /* Pick up injected f_ops */
+        if (console->pending_f_ops) {
+            f->f_ops        = console->pending_f_ops;
+            f->private_data = console->pending_priv;
+            console->pending_f_ops = NULL;
+            console->pending_priv  = NULL;
+        }
         strncpy(f->path, "/dev/tty", sizeof(f->path) - 1);
         f->path[sizeof(f->path) - 1] = '\0';
         if (fd_install(t, fd, f) < 0) { file_put(f); return -1; }

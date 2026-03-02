@@ -69,7 +69,7 @@ void signal_send_from_cred(task_t *t, int sig, const cred_t *sender_cred) {
     }
 
     /* Atomically set the pending bit */
-    __atomic_or_fetch(&t->sig_pending, (1u << sig), __ATOMIC_SEQ_CST);
+    __atomic_or_fetch(&t->sig_pending, (1ULL << sig), __ATOMIC_SEQ_CST);
     /* Wake the task so it dispatches the signal from task context */
     sched_unblock(t);
 }
@@ -112,11 +112,11 @@ void signal_dispatch(task_t *t) {
     if (!t) return;
 
     /* Atomically snapshot and clear all pending bits */
-    uint32_t pending = __atomic_exchange_n(&t->sig_pending, 0u, __ATOMIC_SEQ_CST);
+    uint64_t pending = __atomic_exchange_n(&t->sig_pending, 0ULL, __ATOMIC_SEQ_CST);
     if (!pending) return;
 
     for (int sig = 1; sig < NSIGS; sig++) {
-        if (!(pending & (1u << sig))) continue;
+        if (!(pending & (1ULL << sig))) continue;
 
         /* SIGKILL: mark dead — scheduler will clean up */
         if (sig == SIGKILL) {
@@ -148,15 +148,15 @@ bool signal_deliver_user(task_t *t, void *regs_ptr) {
     cpu_regs_t *regs = (cpu_regs_t *)regs_ptr;
 
     /* Check for pending, unmasked signals */
-    uint32_t pending = __atomic_load_n(&t->sig_pending, __ATOMIC_SEQ_CST);
-    uint32_t deliverable = pending & ~t->sig_mask;
+    uint64_t pending = __atomic_load_n(&t->sig_pending, __ATOMIC_SEQ_CST);
+    uint64_t deliverable = pending & ~t->sig_mask;
     if (!deliverable) return false;
 
     for (int sig = 1; sig < NSIGS; sig++) {
-        if (!(deliverable & (1u << sig))) continue;
+        if (!(deliverable & (1ULL << sig))) continue;
 
         /* Clear the pending bit */
-        __atomic_and_fetch(&t->sig_pending, ~(1u << sig), __ATOMIC_SEQ_CST);
+        __atomic_and_fetch(&t->sig_pending, ~(1ULL << sig), __ATOMIC_SEQ_CST);
 
         /* SIGKILL: terminate immediately */
         if (sig == SIGKILL) {
@@ -276,8 +276,8 @@ bool signal_deliver_user(task_t *t, void *regs_ptr) {
 
         /* Block signals during handler execution */
         if (!(sa_flags & SA_NODEFER))
-            t->sig_mask |= (1u << sig);
-        t->sig_mask |= (uint32_t)sa_mask;
+            t->sig_mask |= (1ULL << sig);
+        t->sig_mask |= sa_mask;
 
         /* Redirect execution to handler */
         regs->rdi = (uint64_t)sig;    /* first arg = signal number */
@@ -347,12 +347,12 @@ int64_t sys_rt_sigprocmask(int how, const uint64_t *set,
     if (!cur) return -ESRCH;
 
     if (oldset)
-        *oldset = (uint64_t)cur->sig_mask;
+        *oldset = cur->sig_mask;
 
     if (set) {
-        uint32_t s = (uint32_t)*set;
+        uint64_t s = *set;
         /* Never allow blocking SIGKILL or SIGSTOP */
-        s &= ~((1u << SIGKILL) | (1u << SIGSTOP));
+        s &= ~((1ULL << SIGKILL) | (1ULL << SIGSTOP));
 
         switch (how) {
             case SIG_BLOCK:   cur->sig_mask |= s;  break;
@@ -404,7 +404,7 @@ int64_t sys_rt_sigreturn(void *regs_ptr) {
     regs->rflags = frame->rflags;
 
     /* Restore signal mask */
-    cur->sig_mask = (uint32_t)frame->sig_mask;
+    cur->sig_mask = frame->sig_mask;
 
     return regs->rax;  /* return original rax so the restored syscall result is correct */
 }

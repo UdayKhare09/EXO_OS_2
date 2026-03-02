@@ -27,7 +27,10 @@
 #define SYS_ACCESS       21
 #define SYS_PIPE         22
 #define SYS_SELECT       23
+#define SYS_MREMAP       25
+#define SYS_MSYNC        26
 #define SYS_SCHED_YIELD  24
+#define SYS_PAUSE        34
 #define SYS_DUP         32
 #define SYS_DUP2        33
 #define SYS_NANOSLEEP   35
@@ -63,6 +66,7 @@
 #define SYS_LCHOWN      94
 #define SYS_UMASK       95
 #define SYS_GETRLIMIT   97
+#define SYS_GETRUSAGE   98
 #define SYS_SYSINFO     99
 #define SYS_TIMES       100
 #define SYS_MOUNT      165
@@ -77,6 +81,7 @@
 #define SYS_SETREGID    114
 #define SYS_SETPGID     109
 #define SYS_GETPPID     110
+#define SYS_GETPGRP     111
 #define SYS_GETGROUPS   115
 #define SYS_SETGROUPS   116
 #define SYS_SETRESUID   117
@@ -97,6 +102,7 @@
 #define SYS_SYNC        162
 #define SYS_GETTID      186
 #define SYS_TKILL       200
+#define SYS_TIME        201   /* time(time_t *tloc) — seconds since epoch */
 #define SYS_FUTEX       202
 #define SYS_GETDENTS64  217
 #define SYS_SET_TID_ADDRESS 218
@@ -147,6 +153,9 @@
 #define SYS_GETRANDOM   318
 #define SYS_MEMFD_CREATE   319
 #define SYS_CLONE3      435
+#define SYS_STATX        332
+#define SYS_RSEQ         334
+#define SYS_FACCESSAT2   439
 
 /* *at constants */
 #define AT_FDCWD        (-100)

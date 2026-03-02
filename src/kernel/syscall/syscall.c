@@ -762,6 +762,14 @@ static int64_t sc_getsid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,
     return (int64_t)t->sid;
 }
 
+/* getpgrp() == getpgid(0): return PGID of calling process */
+static int64_t sc_getpgrp(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+{
+    (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;
+    task_t *cur = sched_current();
+    return cur ? (int64_t)cur->pgid : -ESRCH;
+}
+
 static int64_t sc_mmap(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { return sys_mmap(a,b,(int)c,(int)d,(int)e,(int64_t)f); }
 static int64_t sc_munmap(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
@@ -1115,6 +1123,15 @@ static int64_t sc_times(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,u
     return ticks_100hz;
 }
 
+/* time(2) — returns seconds since Unix epoch; optionally writes to *tloc */
+static int64_t sc_time(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)b;(void)c;(void)d;(void)e;(void)f;
+    int64_t secs = (int64_t)(realtime_ms_now() / 1000ULL);
+    int64_t *tloc = (int64_t *)a;
+    if (tloc) *tloc = secs;
+    return secs;
+}
+
 static int64_t sc_gettimeofday(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
     (void)c;(void)d;(void)e;(void)f;
     kernel_timeval_t *tv = (kernel_timeval_t *)a;
@@ -1224,6 +1241,11 @@ static int64_t sc_prlimit64(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t
 }
 
 static int64_t sc_faccessat(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)e;(void)f;
+    return sys_faccessat((int)a, (const char *)b, (int)c, (int)d);
+}
+/* faccessat2 (439) has identical semantics to faccessat but with explicit flags */
+static int64_t sc_faccessat2(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
     (void)e;(void)f;
     return sys_faccessat((int)a, (const char *)b, (int)c, (int)d);
 }
@@ -1584,6 +1606,111 @@ static int64_t sc_futimesat(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t
     return sys_utimensat((int)a, (const char *)b, NULL, 0);
 }
 
+/* ── glibc compatibility stubs (A4–A8) ───────────────────────────────────── */
+
+/*
+ * mremap (nr 25): glibc realloc uses this for large buffers.
+ * Returning -ENOSYS causes glibc to fall back to malloc+memcpy+free.
+ */
+static int64_t sc_mremap(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;
+    return -ENOSYS;
+}
+
+/*
+ * msync (nr 26): flush dirty pages in a mapped region back to the backing
+ * file via the page cache.  A stub returning 0 is safe for now; it means
+ * MAP_SHARED writes may not be persistent across a crash, but glibc itself
+ * will not fail.
+ */
+static int64_t sc_msync(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;
+    /* TODO: walk VMAs in [a, a+b) and writeback dirty pagecache pages */
+    return 0;
+}
+
+/*
+ * getrusage (nr 98): return resource usage for the calling process or its
+ * children.  We return a zeroed struct; bash/Python probe this at startup
+ * and cope gracefully with all-zero values.
+ */
+
+/* struct rusage (Linux ABI) — kernel-side definition */
+typedef struct {
+    struct { long tv_sec; long tv_usec; } ru_utime;   /* user time   */
+    struct { long tv_sec; long tv_usec; } ru_stime;   /* system time */
+    long ru_maxrss;        /* maximum resident set size   */
+    long ru_ixrss;         /* integral shared memory size */
+    long ru_idrss;         /* integral unshared data size */
+    long ru_isrss;         /* integral unshared stack size*/
+    long ru_minflt;        /* page reclaims               */
+    long ru_majflt;        /* page faults                 */
+    long ru_nswap;         /* swaps                       */
+    long ru_inblock;       /* block input operations      */
+    long ru_oublock;       /* block output operations     */
+    long ru_msgsnd;        /* messages sent               */
+    long ru_msgrcv;        /* messages received           */
+    long ru_nsignals;      /* signals received            */
+    long ru_nvcsw;         /* voluntary context switches  */
+    long ru_nivcsw;        /* involuntary context switches*/
+} kernel_rusage_t;
+
+#define RUSAGE_SELF     0
+#define RUSAGE_CHILDREN (-1)
+
+static int64_t sc_getrusage(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)c;(void)d;(void)e;(void)f;
+    int who = (int)a;
+    kernel_rusage_t *ru = (kernel_rusage_t *)b;
+    if (!ru) return -EFAULT;
+    if (who != RUSAGE_SELF && who != RUSAGE_CHILDREN) return -EINVAL;
+    /* Copy zero-filled rusage via the current page table */
+    task_t *cur = sched_current();
+    if (!cur) return -ESRCH;
+    /* Write through HHDM for the user pointer */
+    uint64_t *pte = vmm_get_pte(cur->cr3, (uintptr_t)ru);
+    if (!pte || !(*pte & VMM_PRESENT)) return -EFAULT;
+    uintptr_t phys = (*pte) & VMM_PTE_ADDR_MASK;
+    uintptr_t off  = (uintptr_t)ru & (PAGE_SIZE - 1);
+    /* struct rusage is 144 bytes; assume it fits within one page */
+    kernel_rusage_t *kru = (kernel_rusage_t *)(vmm_phys_to_virt(phys) + off);
+    memset(kru, 0, sizeof(kernel_rusage_t));
+    return 0;
+}
+
+/*
+ * statx (nr 332): glibc 2.28+ calls this first; returning -ENOSYS causes
+ * glibc to fall back to fstatat/stat which are fully implemented.
+ */
+static int64_t sc_statx(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;
+    return -ENOSYS;
+}
+
+/*
+ * rseq (nr 334): restartable sequences, added in Linux 4.18.
+ * glibc 2.35+ calls this unconditionally at thread startup.
+ * Returning -ENOSYS is the correct response for kernels that do not
+ * implement rseq; glibc handles this gracefully.
+ */
+static int64_t sc_rseq(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;
+    return -ENOSYS;
+}
+
+/*
+ * pause (nr 34): sleep until a signal is received.
+ */
+static int64_t sc_pause(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;
+    task_t *cur = sched_current();
+    if (!cur) return -ESRCH;
+    /* Block until signal_deliver_user wakes us */
+    while (!__atomic_load_n(&cur->sig_pending, __ATOMIC_SEQ_CST))
+        sched_sleep(5);
+    return -EINTR;
+}
+
 /* Sparse dispatch table indexed by syscall number */
 #define SYSCALL_TABLE_SIZE 512
 static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
@@ -1623,6 +1750,7 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_KILL]      = sc_kill,
     [SYS_UNAME]     = sc_uname,
     [SYS_TKILL]     = sc_tkill,
+    [SYS_TIME]      = sc_time,
     [SYS_TGKILL]    = sc_tgkill,
     [SYS_GETCWD]    = sc_getcwd,
     [SYS_CHDIR]     = sc_chdir,
@@ -1659,6 +1787,7 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_GETRESGID] = sc_getresgid,
     [SYS_GETPPID]   = sc_getppid,
     [SYS_SETPGID]   = sc_setpgid,
+    [SYS_GETPGRP]   = sc_getpgrp,
     [SYS_SETSID]    = sc_setsid,
     [SYS_GETPGID]   = sc_getpgid,
     [SYS_SETFSUID]  = sc_setfsuid,
@@ -1743,6 +1872,14 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_SIGALTSTACK]    = sc_sigaltstack,
     [SYS_RT_SIGSUSPEND]  = sc_rt_sigsuspend,
     [SYS_CLOCK_GETRES]   = sc_clock_getres,
+    /* Phase 8: glibc compatibility */
+    [SYS_MREMAP]         = sc_mremap,
+    [SYS_MSYNC]          = sc_msync,
+    [SYS_GETRUSAGE]      = sc_getrusage,
+    [SYS_PAUSE]          = sc_pause,
+    [SYS_STATX]          = sc_statx,
+    [SYS_RSEQ]           = sc_rseq,
+    [SYS_FACCESSAT2]     = sc_faccessat2,
 };
 
 /* ── INT 0x80 handler ─────────────────────────────────────────────────────── */

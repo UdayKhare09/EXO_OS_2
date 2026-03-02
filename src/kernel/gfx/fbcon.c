@@ -56,12 +56,17 @@ typedef enum {
 } ansi_state_t;
 
 /* ── Console struct ──────────────────────────────────────────────────────── */
-#define MAX_CSI_PARAMS 8
+#define MAX_CSI_PARAMS 16   /* must be ≥ 5 for truecolor 38;2;r;g;b */
 
 struct fbcon {
     /* Framebuffer */
     uint32_t *fb;
     uint32_t  fb_w, fb_h, fb_pitch_u32;   /* pitch in uint32_t units */
+
+    /* Pixel format (from Limine GOP, may differ on non-XRGB hardware) */
+    uint8_t  red_shift, green_shift, blue_shift;
+    uint8_t  red_size,  green_size,  blue_size;
+    uint32_t bpp;                          /* must be 32 */
 
     /* Font metrics */
     int cw, ch;        /* cell width / height in px */
@@ -73,7 +78,7 @@ struct fbcon {
     int col, row;
     int saved_col, saved_row;
 
-    /* Current colours */
+    /* Current colours (stored as packed pixel values in the FB's format) */
     uint32_t fg, bg;
     bool bold;
     bool inverse;
@@ -92,6 +97,14 @@ struct fbcon {
     int scroll_top;
     int scroll_bottom;
 
+    /* Alternate screen (ESC[?1049h / ESC[?47h) */
+    bool alt_screen;
+    int  alt_saved_col, alt_saved_row;
+
+    /* UTF-8 multi-byte accumulator */
+    uint32_t utf8_accum;
+    int      utf8_remain;   /* continuation bytes still expected */
+
     /* ANSI parser */
     ansi_state_t ansi;
     int  csi_params[MAX_CSI_PARAMS];
@@ -109,6 +122,46 @@ static inline void put_pixel(fbcon_t *c, int x, int y, uint32_t colour) {
     c->fb[y * c->fb_pitch_u32 + x] = colour;
 }
 
+/* Pack r/g/b bytes into a pixel word using the framebuffer's channel layout.
+ * Always sets the top byte to 0xFF ("no alpha").                            */
+static inline uint32_t pack_pixel(const fbcon_t *c,
+                                   uint8_t r, uint8_t g, uint8_t b) {
+    return 0xFF000000u
+         | ((uint32_t)r << c->red_shift)
+         | ((uint32_t)g << c->green_shift)
+         | ((uint32_t)b << c->blue_shift);
+}
+
+/* Convert a compile-time ARGB8888 palette entry to the hardware pixel format.
+ * The input is always 0xAARRGGBB (as used in g_palette[]).                 */
+static inline uint32_t palette_to_pixel(const fbcon_t *c, uint32_t argb) {
+    uint8_t r = (uint8_t)((argb >> 16) & 0xFF);
+    uint8_t g = (uint8_t)((argb >>  8) & 0xFF);
+    uint8_t b = (uint8_t)( argb        & 0xFF);
+    return pack_pixel(c, r, g, b);
+}
+
+/* Build the standard 256-colour palette entry for index n.
+ * 0-15  → ANSI palette (g_palette)
+ * 16-231 → 6×6×6 colour cube
+ * 232-255 → 24-step grayscale                                             */
+static uint32_t color256(const fbcon_t *c, int n) {
+    if (n < 0) n = 0;
+    if (n < 16) return palette_to_pixel(c, g_palette[n]);
+    if (n < 232) {
+        n -= 16;
+        int bi = n % 6; n /= 6;
+        int gi = n % 6; int ri = n / 6;
+        uint8_t rv = ri ? (uint8_t)(55 + 40 * ri) : 0;
+        uint8_t gv = gi ? (uint8_t)(55 + 40 * gi) : 0;
+        uint8_t bv = bi ? (uint8_t)(55 + 40 * bi) : 0;
+        return pack_pixel(c, rv, gv, bv);
+    }
+    /* grayscale */
+    uint8_t v = (uint8_t)(8 + 10 * (n - 232));
+    return pack_pixel(c, v, v, v);
+}
+
 /* Fill a rect with a solid colour */
 static void fill_rect(fbcon_t *c, int x, int y, int w, int h, uint32_t col) {
     for (int dy = 0; dy < h; dy++)
@@ -116,14 +169,23 @@ static void fill_rect(fbcon_t *c, int x, int y, int w, int h, uint32_t col) {
             put_pixel(c, x + dx, y + dy, col);
 }
 
-/* Draw one character cell at pixel (px, py) with the given glyph bitmap */
-static void draw_glyph(fbcon_t *c, int px, int py, char ch, uint32_t fg, uint32_t bg) {
-    const uint8_t *bmp = font_get_glyph((unsigned char)ch);
+/* Draw one character cell at pixel (px, py) for Unicode codepoint cp. */
+static void draw_glyph(fbcon_t *c, int px, int py, uint32_t cp,
+                       uint32_t fg, uint32_t bg) {
+    const uint8_t *bmp = font_get_glyph(cp);
 
     /* Background fill */
     fill_rect(c, px, py, c->cw, c->ch, bg);
 
     if (!bmp) return;
+
+    /* Unpack fg/bg using stored channel shifts for correct alpha blend. */
+    uint8_t fg_r = (uint8_t)((fg >> c->red_shift)   & 0xFF);
+    uint8_t fg_g = (uint8_t)((fg >> c->green_shift) & 0xFF);
+    uint8_t fg_b = (uint8_t)((fg >> c->blue_shift)  & 0xFF);
+    uint8_t bg_r = (uint8_t)((bg >> c->red_shift)   & 0xFF);
+    uint8_t bg_g = (uint8_t)((bg >> c->green_shift) & 0xFF);
+    uint8_t bg_b = (uint8_t)((bg >> c->blue_shift)  & 0xFF);
 
     /* Blend each pixel using the alpha coverage byte from the atlas */
     for (int gy = 0; gy < c->ch; gy++) {
@@ -134,11 +196,11 @@ static void draw_glyph(fbcon_t *c, int px, int py, char ch, uint32_t fg, uint32_
                 put_pixel(c, px + gx, py + gy, fg);
             } else {
                 /* Simple alpha blend: out = fg*a/255 + bg*(255-a)/255 */
-                uint32_t fa = a, ba = 255 - a;
-                uint8_t r = (uint8_t)(((fg >> 16 & 0xFF) * fa + (bg >> 16 & 0xFF) * ba) / 255);
-                uint8_t g_ = (uint8_t)(((fg >>  8 & 0xFF) * fa + (bg >>  8 & 0xFF) * ba) / 255);
-                uint8_t b_ = (uint8_t)(((fg       & 0xFF) * fa + (bg       & 0xFF) * ba) / 255);
-                put_pixel(c, px + gx, py + gy, 0xFF000000 | (r << 16) | (g_ << 8) | b_);
+                uint32_t fa = a, ba = 255u - a;
+                uint8_t r  = (uint8_t)((fg_r * fa + bg_r * ba) / 255);
+                uint8_t g_ = (uint8_t)((fg_g * fa + bg_g * ba) / 255);
+                uint8_t b_ = (uint8_t)((fg_b * fa + bg_b * ba) / 255);
+                put_pixel(c, px + gx, py + gy, pack_pixel(c, r, g_, b_));
             }
         }
     }
@@ -194,7 +256,11 @@ static void cursor_draw(fbcon_t *c) {
             int fb_x = px + x;
             if ((unsigned)fb_x >= c->fb_w) continue;
             uint32_t p = c->fb[fb_y * c->fb_pitch_u32 + fb_x];
-            c->fb[fb_y * c->fb_pitch_u32 + fb_x] = 0xFF000000u | (~p & 0x00FFFFFFu);
+            /* Invert each channel independently using stored shifts */
+            uint8_t pr = (uint8_t)~((p >> c->red_shift)   & 0xFF);
+            uint8_t pg = (uint8_t)~((p >> c->green_shift) & 0xFF);
+            uint8_t pb = (uint8_t)~((p >> c->blue_shift)  & 0xFF);
+            c->fb[fb_y * c->fb_pitch_u32 + fb_x] = pack_pixel(c, pr, pg, pb);
         }
     }
 
@@ -345,7 +411,9 @@ static void apply_sgr(fbcon_t *c) {
     for (int i = 0; i < c->csi_nparams; i++) {
         int p = c->csi_params[i];
         if (p == 0) {
-            c->fg = COL_FG_DEFAULT; c->bg = COL_BG_DEFAULT; c->bold = false; c->inverse = false;
+            c->fg = palette_to_pixel(c, COL_FG_DEFAULT);
+            c->bg = palette_to_pixel(c, COL_BG_DEFAULT);
+            c->bold = false; c->inverse = false;
         } else if (p == 1) {
             c->bold = true;
         } else if (p == 2) {
@@ -355,17 +423,43 @@ static void apply_sgr(fbcon_t *c) {
         } else if (p == 27) {
             c->inverse = false;
         } else if (p == 39) {
-            c->fg = g_palette[c->bold ? 15 : 7];
+            c->fg = palette_to_pixel(c, g_palette[c->bold ? 15 : 7]);
         } else if (p == 49) {
-            c->bg = COL_BG_DEFAULT;
+            c->bg = palette_to_pixel(c, COL_BG_DEFAULT);
         } else if (p >= 30 && p <= 37) {
-            c->fg = g_palette[(p - 30) + (c->bold ? 8 : 0)];
+            c->fg = palette_to_pixel(c, g_palette[(p - 30) + (c->bold ? 8 : 0)]);
         } else if (p >= 40 && p <= 47) {
-            c->bg = g_palette[p - 40];
+            c->bg = palette_to_pixel(c, g_palette[p - 40]);
         } else if (p >= 90 && p <= 97) {
-            c->fg = g_palette[(p - 90) + 8];
+            c->fg = palette_to_pixel(c, g_palette[(p - 90) + 8]);
         } else if (p >= 100 && p <= 107) {
-            c->bg = g_palette[(p - 100) + 8];
+            c->bg = palette_to_pixel(c, g_palette[(p - 100) + 8]);
+        /* ── 256-colour: ESC[38;5;n m  /  ESC[48;5;n m ── */
+        } else if (p == 38 && i + 1 < c->csi_nparams && c->csi_params[i + 1] == 5) {
+            if (i + 2 < c->csi_nparams)
+                c->fg = color256(c, c->csi_params[i + 2]);
+            i += 2;
+        } else if (p == 48 && i + 1 < c->csi_nparams && c->csi_params[i + 1] == 5) {
+            if (i + 2 < c->csi_nparams)
+                c->bg = color256(c, c->csi_params[i + 2]);
+            i += 2;
+        /* ── Truecolor: ESC[38;2;r;g;b m  /  ESC[48;2;r;g;b m ── */
+        } else if (p == 38 && i + 1 < c->csi_nparams && c->csi_params[i + 1] == 2) {
+            if (i + 4 < c->csi_nparams) {
+                uint8_t r = (uint8_t)c->csi_params[i + 2];
+                uint8_t g = (uint8_t)c->csi_params[i + 3];
+                uint8_t b = (uint8_t)c->csi_params[i + 4];
+                c->fg = pack_pixel(c, r, g, b);
+            }
+            i += 4;
+        } else if (p == 48 && i + 1 < c->csi_nparams && c->csi_params[i + 1] == 2) {
+            if (i + 4 < c->csi_nparams) {
+                uint8_t r = (uint8_t)c->csi_params[i + 2];
+                uint8_t g = (uint8_t)c->csi_params[i + 3];
+                uint8_t b = (uint8_t)c->csi_params[i + 4];
+                c->bg = pack_pixel(c, r, g, b);
+            }
+            i += 4;
         }
     }
 }
@@ -517,6 +611,24 @@ static void csi_dispatch(fbcon_t *c, char cmd) {
                     cursor_draw(c);
                 } else if (p == 7) {
                     c->autowrap = true;
+                } else if (p == 47) {
+                    /* ESC[?47h — switch to alternate screen (simple clear) */
+                    if (!c->alt_screen) {
+                        c->alt_screen    = true;
+                        c->alt_saved_col = c->col;
+                        c->alt_saved_row = c->row;
+                        fill_rect(c, 0, 0, (int)c->fb_w, (int)c->fb_h, c->bg);
+                        c->col = 0; c->row = 0;
+                    }
+                } else if (p == 1049) {
+                    /* ESC[?1049h — save cursor, switch to blank alt screen */
+                    if (!c->alt_screen) {
+                        c->alt_screen    = true;
+                        c->alt_saved_col = c->col;
+                        c->alt_saved_row = c->row;
+                        fill_rect(c, 0, 0, (int)c->fb_w, (int)c->fb_h, c->bg);
+                        c->col = 0; c->row = 0;
+                    }
                 }
             }
         } else {
@@ -538,6 +650,24 @@ static void csi_dispatch(fbcon_t *c, char cmd) {
                     cursor_erase(c);
                 } else if (p == 7) {
                     c->autowrap = false;
+                } else if (p == 47) {
+                    /* ESC[?47l — restore main screen */
+                    if (c->alt_screen) {
+                        c->alt_screen = false;
+                        fill_rect(c, 0, 0, (int)c->fb_w, (int)c->fb_h, c->bg);
+                        c->col = c->alt_saved_col;
+                        c->row = c->alt_saved_row;
+                        clamp_cursor(c);
+                    }
+                } else if (p == 1049) {
+                    /* ESC[?1049l — restore main screen + cursor */
+                    if (c->alt_screen) {
+                        c->alt_screen = false;
+                        fill_rect(c, 0, 0, (int)c->fb_w, (int)c->fb_h, c->bg);
+                        c->col = c->alt_saved_col;
+                        c->row = c->alt_saved_row;
+                        clamp_cursor(c);
+                    }
                 }
             }
         } else {
@@ -576,8 +706,41 @@ static void emit_char(fbcon_t *c, char ch) {
         }
         if ((unsigned char)ch < 0x20 || (unsigned char)ch == 0x7F) {
             /* Ignore remaining C0 controls (e.g. BEL) and DEL for now. */
+            c->utf8_remain = 0; /* discard any partial UTF-8 on C0 */
             return;
         }
+        /* ── UTF-8 multi-byte start byte (0xC0-0xFD) ──────────────────── */
+        if ((unsigned char)ch >= 0xC0) {
+            c->utf8_remain = 0;
+            if      ((unsigned char)ch >= 0xF0) { c->utf8_accum = ch & 0x07; c->utf8_remain = 3; }
+            else if ((unsigned char)ch >= 0xE0) { c->utf8_accum = ch & 0x0F; c->utf8_remain = 2; }
+            else                                { c->utf8_accum = ch & 0x1F; c->utf8_remain = 1; }
+            return;
+        }
+        /* ── UTF-8 continuation byte (0x80-0xBF) ──────────────────────── */
+        if ((unsigned char)ch >= 0x80) {
+            if (c->utf8_remain > 0) {
+                c->utf8_accum = (c->utf8_accum << 6) | ((unsigned char)ch & 0x3F);
+                if (--c->utf8_remain > 0) return;  /* wait for more bytes */
+                /* ── Full codepoint assembled — fall through to draw ── */
+                uint32_t ucp = c->utf8_accum;
+                c->utf8_accum = 0;
+                if (c->wrap_pending) { c->col = 0; linefeed(c); c->wrap_pending = false; }
+                {
+                    int px = c->col * c->cw, py = c->row * c->ch;
+                    uint32_t fg = c->inverse ? c->bg : c->fg;
+                    uint32_t bg = c->inverse ? c->fg : c->bg;
+                    draw_glyph(c, px, py, ucp, fg, bg);
+                    if (c->col >= c->cols - 1) c->wrap_pending = c->autowrap;
+                    else                       c->col++;
+                }
+            } else {
+                c->utf8_remain = 0; /* stray continuation — discard */
+            }
+            return;
+        }
+        /* ── ASCII / reset any stale UTF-8 state ─────────────────────── */
+        c->utf8_remain = 0;
         if (ch == '\t') {
             if (c->wrap_pending) {
                 c->col = 0;
@@ -604,7 +767,7 @@ static void emit_char(fbcon_t *c, char ch) {
             int px = c->col * c->cw, py = c->row * c->ch;
             uint32_t fg = c->inverse ? c->bg : c->fg;
             uint32_t bg = c->inverse ? c->fg : c->bg;
-            draw_glyph(c, px, py, ch, fg, bg);
+            draw_glyph(c, px, py, (uint32_t)(unsigned char)ch, fg, bg);
             if (c->col >= c->cols - 1) {
                 c->wrap_pending = c->autowrap;
             } else {
@@ -661,10 +824,19 @@ static void emit_char(fbcon_t *c, char ch) {
 
 void fbcon_init(const fbcon_fb_t *fb) {
     fbcon_t *c = &g_fbcon_storage;
-    c->fb          = fb->fb;
-    c->fb_w        = fb->width;
-    c->fb_h        = fb->height;
+    c->fb           = fb->fb;
+    c->fb_w         = fb->width;
+    c->fb_h         = fb->height;
     c->fb_pitch_u32 = fb->pitch / 4;
+
+    /* Pixel format from Limine GOP (default XRGB8888 if not supplied) */
+    c->bpp         = (fb->bpp != 0) ? fb->bpp : 32;
+    c->red_shift   = fb->red_shift;
+    c->green_shift = fb->green_shift;
+    c->blue_shift  = fb->blue_shift;
+    c->red_size    = fb->red_size   ? fb->red_size   : 8;
+    c->green_size  = fb->green_size ? fb->green_size : 8;
+    c->blue_size   = fb->blue_size  ? fb->blue_size  : 8;
 
     c->cw = g_font_atlas.cell_w;
     c->ch = g_font_atlas.cell_h;
@@ -674,8 +846,8 @@ void fbcon_init(const fbcon_fb_t *fb) {
 
     c->col = 0; c->row = 0;
     c->saved_col = 0; c->saved_row = 0;
-    c->fg  = COL_FG_DEFAULT;
-    c->bg  = COL_BG_DEFAULT;
+    c->fg  = palette_to_pixel(c, COL_FG_DEFAULT);
+    c->bg  = palette_to_pixel(c, COL_BG_DEFAULT);
     c->bold = false;
     c->inverse = false;
     c->autowrap = true;
@@ -690,8 +862,13 @@ void fbcon_init(const fbcon_fb_t *fb) {
     c->cursor_backup = kmalloc((size_t)c->cw * (size_t)c->ch * sizeof(uint32_t));
     c->ansi           = ANSI_NORMAL;
     c->csi_private    = false;
-    c->scroll_top = 0;
-    c->scroll_bottom = c->rows - 1;
+    c->scroll_top     = 0;
+    c->scroll_bottom  = c->rows - 1;
+    c->alt_screen     = false;
+    c->alt_saved_col  = 0;
+    c->alt_saved_row  = 0;
+    c->utf8_accum     = 0;
+    c->utf8_remain    = 0;
 
     /* Clear screen */
     fill_rect(c, 0, 0, (int)c->fb_w, (int)c->fb_h, c->bg);
@@ -747,6 +924,49 @@ void fbcon_printf_inst(fbcon_t *c, const char *fmt, ...) {
     if (c->cursor_visible) cursor_draw(c);
 }
 
+/* ── fbcon_get_dimensions ─────────────────────────────────────────────────
+ * Report the current text-grid dimensions and pixel extents.  Used by pty.c
+ * so freshly allocated PTY pairs inherit the real console size.            */
+void fbcon_get_dimensions(uint32_t *cols, uint32_t *rows,
+                          uint32_t *xpixel, uint32_t *ypixel) {
+    if (!g_fbcon) {
+        if (cols)   *cols   = 80;
+        if (rows)   *rows   = 24;
+        if (xpixel) *xpixel = 0;
+        if (ypixel) *ypixel = 0;
+        return;
+    }
+    if (cols)   *cols   = (uint32_t)g_fbcon->cols;
+    if (rows)   *rows   = (uint32_t)g_fbcon->rows;
+    if (xpixel) *xpixel = g_fbcon->fb_w;
+    if (ypixel) *ypixel = g_fbcon->fb_h;
+}
+
+/* ── fbcon_get_pixel_format ────────────────────────────────────────────────
+ * Return per-channel shift/size values so that fb.c can fill
+ * FBIOGET_VSCREENINFO correctly regardless of GOP pixel layout.            */
+void fbcon_get_pixel_format(uint8_t *red_shift,   uint8_t *red_size,
+                            uint8_t *green_shift, uint8_t *green_size,
+                            uint8_t *blue_shift,  uint8_t *blue_size,
+                            uint32_t *bpp) {
+    /* Sensible XRGB8888 defaults when fbcon is not yet up */
+    uint8_t  rs = 16, gs = 8, bs = 0, rsz = 8, gsz = 8, bsz = 8;
+    uint32_t b  = 32;
+    if (g_fbcon) {
+        rs  = g_fbcon->red_shift;   rsz = g_fbcon->red_size;
+        gs  = g_fbcon->green_shift; gsz = g_fbcon->green_size;
+        bs  = g_fbcon->blue_shift;  bsz = g_fbcon->blue_size;
+        b   = g_fbcon->bpp;
+    }
+    if (red_shift)   *red_shift   = rs;
+    if (red_size)    *red_size    = rsz;
+    if (green_shift) *green_shift = gs;
+    if (green_size)  *green_size  = gsz;
+    if (blue_shift)  *blue_shift  = bs;
+    if (blue_size)   *blue_size   = bsz;
+    if (bpp)         *bpp         = b;
+}
+
 /* ── fbcon_get_fb_info ─────────────────────────────────────────────────────
  * Return framebuffer geometry and the *physical* base address of the pixel
  * buffer.  Used by /dev/fb0 to fill FBIOGET_FSCREENINFO and to mmap the
@@ -764,6 +984,6 @@ void fbcon_get_fb_info(uint64_t *phys_base, uint32_t *width,
     if (phys_base)   *phys_base   = vmm_virt_to_phys((uintptr_t)g_fbcon->fb);
     if (width)       *width       = g_fbcon->fb_w;
     if (height)      *height      = g_fbcon->fb_h;
-    /* fb_pitch_u32 is pitch in uint32_t units; multiply by 4 for bytes. */
-    if (pitch_bytes) *pitch_bytes = g_fbcon->fb_pitch_u32 * 4u;
+    /* fb_pitch_u32 is pitch in uint32_t units; multiply by bytes-per-pixel. */
+    if (pitch_bytes) *pitch_bytes = g_fbcon->fb_pitch_u32 * (g_fbcon->bpp / 8u);
 }

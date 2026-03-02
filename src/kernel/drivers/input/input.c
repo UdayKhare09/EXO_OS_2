@@ -4,6 +4,7 @@
 #include "lib/klog.h"
 #include "arch/x86_64/cpu.h"   /* cpu_mfence */
 #include "ipc/signal.h"
+#include "drivers/pty.h"     /* pty_fg_lflag(), LFLAG_ISIG */
 
 /* Defined in syscall/net_syscalls.c */
 extern void tty_signal_foreground(int sig);
@@ -139,8 +140,12 @@ void input_push_key(uint8_t modifiers, uint8_t keycode, uint8_t state) {
             if (keycode >= 0x04 && keycode <= 0x1D) {
                 char ctrl = (char)(1 + (keycode - 0x04));
                 if (ctrl == 0x03) {
-                    /* Ctrl-C: interrupt foreground process group */
-                    tty_signal_foreground(SIGINT);
+                    /* Ctrl-C: only deliver SIGINT when ISIG is set in the
+                     * foreground PTY's c_lflag (POSIX / Linux semantics). */
+                    if (pty_fg_lflag() & LFLAG_ISIG)
+                        tty_signal_foreground(SIGINT);
+                    else
+                        tty_char_push(ctrl);
                 } else {
                     tty_char_push(ctrl);
                 }

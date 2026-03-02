@@ -4,7 +4,12 @@
 #include "sched/cred.h"
 
 /* ── Signal numbers (POSIX-compatible subset) ────────────────────────────── */
-#define NSIGS     32
+#define NSIGS     64   /* POSIX (1-31) + real-time (32-63) */
+
+/* Real-time signal range (glibc NPTL uses SIGRTMIN for thread
+ * cancellation and SIGRTMAX for internal thread barriers). */
+#define SIGRTMIN  32
+#define SIGRTMAX  63
 
 #define SIGHUP     1   /* hangup                       */
 #define SIGINT     2   /* interrupt (Ctrl-C)           */

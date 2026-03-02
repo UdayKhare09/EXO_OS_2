@@ -15,6 +15,7 @@
  * SIGWINCH: TIOCSWINSZ on master delivers SIGWINCH to slave's fg pgrp.
  */
 #include "drivers/pty.h"
+#include "gfx/fbcon.h"      /* fbcon_get_dimensions() */
 #include "mm/kmalloc.h"
 #include "lib/string.h"
 #include "lib/klog.h"
@@ -30,21 +31,31 @@
 #define TCSETS      0x5402
 #define TCSETSW     0x5403
 #define TCSETSF     0x5404
+#define TCGETS2     0x802C542AU
+#define TCSETS2     0x402C542BU
+#define TCSETSW2    0x402C542CU
+#define TCSETSF2    0x402C542DU
 #define TIOCGPGRP   0x540F
 #define TIOCSPGRP   0x5410
 #define TIOCGWINSZ  0x5413
 #define TIOCSWINSZ  0x5414
 #define TIOCSCTTY   0x540E
 #define TIOCNOTTY   0x5422
+#define FIONREAD    0x541BU  /* bytes available to read         */
+#define TIOCOUTQ    0x5411U  /* bytes in output buffer          */
+#define TCFLSH      0x540BU  /* flush queues                    */
 #define TIOCGPTN    0x80045430U  /* get PTY slave number (uint) */
 #define TIOCSPTLCK  0x40045431U  /* lock/unlock PTY             */
 #define TIOCPTYGNAME 0x40805453U /* macOS compat — ignore       */
 
-#define OFLAG_OPOST 0x00000001U
-#define OFLAG_ONLCR 0x00000004U
-#define LFLAG_ECHO  0x00000008U
+#define OFLAG_OPOST  0x00000001U
+#define OFLAG_ONLCR  0x00000004U
+#define LFLAG_ECHO   0x00000008U
 #define LFLAG_ICANON 0x00000002U
-#define IFLAG_ICRNL 0x00000100U
+#define LFLAG_ISIG   0x00000001U  /* deliver signals on ctrl chars */
+#define IFLAG_ICRNL  0x00000100U
+/* /dev/pts/<N> gid must match 'tty' in /etc/group */
+#define PTY_TTY_GID  5U
 
 typedef struct {
     uint32_t c_iflag;
@@ -87,16 +98,20 @@ int pty_alloc(void) {
             static const uint8_t cc_def[19] = {
                 3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0, 0, 0 };
             memcpy(p->c_cc, cc_def, 19);
-            p->c_ispeed = 38400;
-            p->c_ospeed = 38400;
-            p->ws_row   = 24;
-            p->ws_col   = 80;
-            p->ws_xpixel = 0;
-            p->ws_ypixel = 0;
+            p->c_ispeed = 0;  /* speed 0 = unknown; glibc accepts this */
+            p->c_ospeed = 0;
+            {
+                uint32_t cols = 80, rows = 24, xpx = 0, ypx = 0;
+                fbcon_get_dimensions(&cols, &rows, &xpx, &ypx);
+                p->ws_col    = (uint16_t)cols;
+                p->ws_row    = (uint16_t)rows;
+                p->ws_xpixel = (uint16_t)xpx;
+                p->ws_ypixel = (uint16_t)ypx;
+            }
             p->fg_pgid  = 1;
             task_t *cur = sched_current();
             p->owner_uid = cur ? cur->cred.fsuid : 0;
-            p->owner_gid = 5; /* tty group */
+            p->owner_gid = PTY_TTY_GID;
             p->master_open = 1;
             p->slave_open  = 0;
             return i;
@@ -108,6 +123,18 @@ int pty_alloc(void) {
 void pty_free(int index) {
     if (index < 0 || index >= PTY_MAX) return;
     g_pty_table[index].open = 0;
+}
+
+uint32_t pty_fg_lflag(void) {
+    /* Return c_lflag of the first open PTY that has a foreground pgroup.
+     * Falls back to LFLAG_ISIG so ctrl+C fires SIGINT even before any PTY
+     * has been allocated (e.g., at the kernel login shell). */
+    for (int i = 0; i < PTY_MAX; i++) {
+        pty_pair_t *p = &g_pty_table[i];
+        if (p->open && p->fg_pgid > 0)
+            return p->c_lflag;
+    }
+    return LFLAG_ISIG;
 }
 
 pty_pair_t *pty_get(int index) {
@@ -224,7 +251,7 @@ static int pty_master_ioctl(file_t *f, unsigned long cmd, unsigned long arg) {
         pty_signal_winch(p);
         return 0;
     }
-    if (cmd == TCGETS) {
+    if (cmd == TCGETS || cmd == TCGETS2) {
         pty_termios_t *ts = (pty_termios_t *)(uintptr_t)arg;
         if (!ts) return -EINVAL;
         ts->c_iflag  = p->c_iflag;
@@ -237,7 +264,8 @@ static int pty_master_ioctl(file_t *f, unsigned long cmd, unsigned long arg) {
         ts->c_ospeed = p->c_ospeed;
         return 0;
     }
-    if (cmd == TCSETS || cmd == TCSETSW || cmd == TCSETSF) {
+    if (cmd == TCSETS  || cmd == TCSETSW  || cmd == TCSETSF  ||
+        cmd == TCSETS2 || cmd == TCSETSW2 || cmd == TCSETSF2) {
         const pty_termios_t *ts = (const pty_termios_t *)(uintptr_t)arg;
         if (!ts) return -EINVAL;
         p->c_iflag  = ts->c_iflag;

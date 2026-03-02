@@ -20,10 +20,17 @@
 
 /* ── Framebuffer descriptor passed in from Limine ───────────────────────── */
 typedef struct {
-    uint32_t *fb;       /* HHDM-mapped linear framebuffer                   */
-    uint32_t  width;    /* horizontal pixels                                 */
-    uint32_t  height;   /* vertical pixels                                   */
-    uint32_t  pitch;    /* bytes per row  (may be > width*4 due to padding)  */
+    uint32_t *fb;          /* HHDM-mapped linear framebuffer                */
+    uint32_t  width;       /* horizontal pixels                             */
+    uint32_t  height;      /* vertical pixels                               */
+    uint32_t  pitch;       /* bytes per row (may be > width*bpp/8)          */
+    uint32_t  bpp;         /* bits per pixel — must be 32                   */
+    uint8_t   red_shift;   /* bit position of red   channel LSB (e.g. 16)   */
+    uint8_t   green_shift; /* bit position of green channel LSB (e.g.  8)   */
+    uint8_t   blue_shift;  /* bit position of blue  channel LSB (e.g.  0)   */
+    uint8_t   red_size;    /* bits in red   channel (typically 8)           */
+    uint8_t   green_size;  /* bits in green channel (typically 8)           */
+    uint8_t   blue_size;   /* bits in blue  channel (typically 8)           */
 } fbcon_fb_t;
 
 /* ── Console instance ───────────────────────────────────────────────────── */
@@ -62,3 +69,15 @@ int fbcon_text_rows(void);
 /* Report current framebuffer pixel size. Returns 0 if unavailable. */
 int fbcon_pixel_width(void);
 int fbcon_pixel_height(void);
+
+/* Report current text grid dimensions and pixel extents.
+ * Falls back to 80×24 / 0px if fbcon is not yet initialised.          */
+void fbcon_get_dimensions(uint32_t *cols, uint32_t *rows,
+                          uint32_t *xpixel, uint32_t *ypixel);
+
+/* Return per-channel shift values used by the framebuffer.
+ * Needed by fb.c so FBIOGET_VSCREENINFO reflects the real pixel layout.  */
+void fbcon_get_pixel_format(uint8_t *red_shift,   uint8_t *red_size,
+                            uint8_t *green_shift, uint8_t *green_size,
+                            uint8_t *blue_shift,  uint8_t *blue_size,
+                            uint32_t *bpp);

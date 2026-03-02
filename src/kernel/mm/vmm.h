@@ -15,6 +15,9 @@
 #define VMM_GLOBAL    (1ULL << 8)
 #define VMM_COW       (1ULL << 9)   /* software: copy-on-write       */
 #define VMM_NX        (1ULL << 63)  /* no-execute                   */
+/* Write-combining: uses PAT[1] after cpu_pat_init() programs IA32_PAT.
+ * Requires PWT=1, PCD=0 in the PTE — same as VMM_PWT.                     */
+#define VMM_WC        VMM_PWT       /* write-combining (PAT[1])      */
 
 #define VMM_KERNEL_RW  (VMM_PRESENT | VMM_WRITE)
 #define VMM_MMIO       (VMM_PRESENT | VMM_WRITE | VMM_PCD | VMM_PWT)

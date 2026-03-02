@@ -312,9 +312,29 @@ int64_t sys_fork(cpu_regs_t *regs) {
 #define AT_EUID         12
 #define AT_GID          13
 #define AT_EGID         14
+#define AT_HWCAP        16   /* CPU feature flags (CPUID EAX=1 EDX)          */
+#define AT_CLKTCK       17   /* frequency of times(2) clock; glibc expects 100 */
 #define AT_SECURE       23
 #define AT_RANDOM       25
+#define AT_HWCAP2       26   /* extended CPU feature flags (CPUID EAX=7 ECX)  */
 #define AT_EXECFN       31
+
+/* Read CPU feature bits for the auxiliary vector. */
+static void exec_cpuid_features(uint32_t *hwcap_out, uint32_t *hwcap2_out) {
+    uint32_t eax, ebx, ecx, edx;
+    /* HWCAP: CPUID leaf 1, EDX */
+    eax = 1; ecx = 0;
+    __asm__ volatile("cpuid"
+        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+        : "a"(eax), "c"(ecx));
+    *hwcap_out = edx;
+    /* HWCAP2: CPUID leaf 7, sub-leaf 0, ECX (extended features) */
+    eax = 7; ecx = 0;
+    __asm__ volatile("cpuid"
+        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+        : "a"(eax), "c"(ecx));
+    *hwcap2_out = ecx;
+}
 
 static inline uint64_t exec_rdtsc(void) {
     uint32_t lo, hi;
@@ -606,23 +626,26 @@ int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
     }
     cur->vma_list = NULL;
 
-    /* Set up user stack */
+    /* Set up user stack.
+     * Pre-map 256 KiB at the top so env/argv/auxv writes succeed immediately.
+     * The VMA covers the full 8 MiB; the demand-pager handles the rest. */
     uintptr_t user_stack_top = USER_STACK_TOP;
-    uintptr_t stack_pages = 8;  /* 32 KiB initial stack */
-    for (uintptr_t i = 0; i < stack_pages; i++) {
+#define EXEC_STACK_PREMAP_PAGES 64u    /* 256 KiB pre-mapped at top */
+#define EXEC_STACK_VMA_PAGES    2048u  /* 8 MiB VMA (matches Linux default) */
+    for (uintptr_t i = 0; i < EXEC_STACK_PREMAP_PAGES; i++) {
         uintptr_t pg = pmm_alloc_pages(1);
         if (pg) {
             memset((void *)vmm_phys_to_virt(pg), 0, PAGE_SIZE);
             vmm_map_page_in(cur->cr3,
-                            user_stack_top - (stack_pages - i) * PAGE_SIZE,
+                            user_stack_top - (EXEC_STACK_PREMAP_PAGES - i) * PAGE_SIZE,
                             pg, VMM_USER_RW);
         }
     }
 
-    /* Add stack VMA */
+    /* Add stack VMA covering the full 8 MiB so stack growth is demand-paged */
     vma_t *stack_vma = kmalloc(sizeof(vma_t));
     if (stack_vma) {
-        stack_vma->start = user_stack_top - stack_pages * PAGE_SIZE;
+        stack_vma->start = user_stack_top - EXEC_STACK_VMA_PAGES * PAGE_SIZE;
         stack_vma->end   = user_stack_top;
         stack_vma->flags = VMA_READ | VMA_WRITE | VMA_USER | VMA_STACK;
         stack_vma->file = NULL;
@@ -647,7 +670,9 @@ int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
      */
     uintptr_t sp = user_stack_top;
 
-    /* 1) Copy string data to top of stack */
+    /* Read CPU feature flags once for the auxv */
+    uint32_t hwcap = 0, hwcap2 = 0;
+    exec_cpuid_features(&hwcap, &hwcap2);
     uintptr_t argv_user[EXEC_MAX_STRS];
     uintptr_t envp_user[EXEC_MAX_STRS];
     uintptr_t execfn_user = 0;
@@ -728,8 +753,16 @@ int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
     kfree(argv_buf);
     kfree(envp_buf);
 
-    /* 2) Align to 16 bytes */
-    sp &= ~0xFULL;
+    /* 2) Align stack pre-push so final user %rsp alignment is stable.
+     * We push an odd/even number of 8-byte words depending on argc/envc;
+     * compensate up-front so final %rsp is always 16-byte aligned. */
+    {
+        const uint64_t auxv_words = 34; /* 17 (type,value) pairs including AT_NULL */
+        uint64_t total_push_words = auxv_words + (uint64_t)envc + (uint64_t)argc + 3;
+        sp &= ~0xFULL;
+        if (total_push_words & 1ULL)
+            sp -= 8;
+    }
 
     /* Helper: push a uint64_t to the user stack */
     #define PUSH_U64(val) do {                                              \
@@ -771,6 +804,12 @@ int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
     PUSH_U64(AT_PHNUM);
     PUSH_U64(info.phdr_vaddr);       /* AT_PHDR       */
     PUSH_U64(AT_PHDR);
+    PUSH_U64(hwcap2);                /* AT_HWCAP2     */
+    PUSH_U64(AT_HWCAP2);
+    PUSH_U64(100ULL);                /* AT_CLKTCK = 100 Hz (Linux default) */
+    PUSH_U64(AT_CLKTCK);
+    PUSH_U64(hwcap);                 /* AT_HWCAP      */
+    PUSH_U64(AT_HWCAP);
 
     /* 4) envp array (NULL-terminated) */
     PUSH_U64(0);  /* NULL terminator */

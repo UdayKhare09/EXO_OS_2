@@ -299,9 +299,17 @@ void sched_tick(void) {
     cpu_info_t *ci_ctx = smp_self();
     if (ci_ctx) ci_ctx->kernel_stack_top = next_kstack_top;
 
-    /* If switching to a user task, load its FS base (TLS pointer) */
-    if (next->is_user && next->fs_base) {
-        wrmsr(0xC0000100, next->fs_base);  /* MSR_FS_BASE */
+    /* If switching to a user task, load its FS base (TLS pointer).
+     * Also save the outgoing user task's FS base — glibc may have updated
+     * it directly via wrfsbase (when CR4.FSGSBASE is set), so we must read
+     * it back from the MSR rather than trusting task->fs_base. */
+    if (prev && prev->is_user) {
+        prev->fs_base = rdmsr(0xC0000100);  /* capture wrfsbase updates */
+    }
+    if (next->is_user) {
+        wrmsr(0xC0000100, next->fs_base);   /* MSR_FS_BASE */
+    } else {
+        wrmsr(0xC0000100, 0);               /* zero FS for kernel tasks */
     }
 
     /* Perform context switch */

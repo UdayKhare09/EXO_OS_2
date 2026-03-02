@@ -28,6 +28,7 @@
 #include "mm/vmm.h"
 #include "mm/kmalloc.h"
 #include "lib/klog.h"
+#include "lib/spinlock.h"
 #include "lib/string.h"
 
 #include <stdint.h>
@@ -124,6 +125,9 @@ typedef struct {
     /* DMA bounce buffer — allocated via PMM so physical address is HHDM */
     uintptr_t dma_phys;          /* physical address of bounce page          */
     uint8_t  *dma_virt;          /* virtual address  of bounce page          */
+
+    /* Queue + bounce buffer are single-instance; all requests must serialize. */
+    spinlock_t io_lock;
 } virtio_blk_priv_t;
 
 /* ── I/O helpers ─────────────────────────────────────────────────────────── */
@@ -163,6 +167,8 @@ static int virtio_blk_rw(blkdev_t *dev, uint64_t lba, uint32_t count,
                           void *buf, bool write) {
     virtio_blk_priv_t *p = (virtio_blk_priv_t *)dev->priv;
     uint8_t *data = (uint8_t *)buf;
+
+    spinlock_acquire(&p->io_lock);
 
     /* DMA bounce buffer pointers at known physical addresses */
     virtio_blk_req_hdr_t *hdr    = (virtio_blk_req_hdr_t *)(p->dma_virt + DMA_OFF_HDR);
@@ -238,8 +244,13 @@ static int virtio_blk_rw(blkdev_t *dev, uint64_t lba, uint32_t count,
             }
         }
 
-        if (ret < 0) return -1;
+        if (ret < 0) {
+            spinlock_release(&p->io_lock);
+            return -1;
+        }
     }
+
+    spinlock_release(&p->io_lock);
     return 0;
 }
 
@@ -263,6 +274,8 @@ static uint32_t vblk_block_size(blkdev_t *dev) {
 
 static int vblk_flush(blkdev_t *dev) {
     virtio_blk_priv_t *p = (virtio_blk_priv_t *)dev->priv;
+    spinlock_acquire(&p->io_lock);
+
     /* FLUSH uses only 2 descriptors: header + status (no data) */
     uint16_t d0 = 0, d1 = 1;
 
@@ -293,6 +306,7 @@ static int vblk_flush(blkdev_t *dev) {
     uint32_t timeout = 10000000;
     while (p->used->idx == p->last_used_idx && --timeout) io_wait();
     if (timeout) p->last_used_idx++;
+    spinlock_release(&p->io_lock);
     return (timeout ? 0 : -1);
 }
 
@@ -339,6 +353,11 @@ static int probe_one(pci_device_t *pci) {
         KLOG_ERR("virtio-blk: queue 0 size is 0\n");
         return -1;
     }
+    if (qsz > VQUEUE_MAX_SIZE) {
+        KLOG_ERR("virtio-blk: queue size %u exceeds driver max %u\n",
+                 qsz, (unsigned)VQUEUE_MAX_SIZE);
+        return -1;
+    }
 
     /* Virtqueue layout (page-aligned):
      *   [desc table] [avail ring] [<pad to page>] [used ring]
@@ -383,6 +402,7 @@ static int probe_one(pci_device_t *pci) {
     priv->capacity       = capacity;
     priv->dma_phys       = dma_phys;
     priv->dma_virt       = dma_virt;
+    spinlock_init(&priv->io_lock);
 
     /* Write queue PFN (in VirtIO pages = 4096 B) */
     outl(io + VIRT_REG_QUEUE_PFN, (uint32_t)(q_phys / VQUEUE_ALIGN));

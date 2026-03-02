@@ -13,6 +13,7 @@
 #include "mm/vmm.h"
 #include "lib/string.h"
 #include "lib/klog.h"
+#include "lib/spinlock.h"
 #include "drivers/storage/blkdev.h"
 #include "gfx/fbcon.h"
 #include "drivers/input/input.h"
@@ -109,12 +110,16 @@ static ssize_t tty_console_read(file_t *f, void *buf, size_t len) {
     /* ── Canonical mode: full Linux n_tty line discipline ──────────────
      * Buffer characters locally, process erase/kill/signal/EOF,
      * echo to screen, and deliver a complete line to the caller.
-     * A static buffer is fine here because the physical console is a
-     * single-session device; PTYs have their own per-pair buffers.      */
+     * Protected by a spinlock so concurrent readers (e.g. forked glibc
+     * processes) don't corrupt the shared line buffer.                  */
 #define LBUF_MAX 4096
+    static spinlock_t lbuf_lock;
     static char   lbuf[LBUF_MAX];
     static size_t llen   = 0;
     static bool   lready = false;
+    static bool   lbuf_lock_inited = false;
+    if (!lbuf_lock_inited) { spinlock_init(&lbuf_lock); lbuf_lock_inited = true; }
+    spinlock_acquire(&lbuf_lock);
 
     /* Deliver leftover data from a previous partial read */
     if (lready && llen > 0) {
@@ -123,6 +128,7 @@ static ssize_t tty_console_read(file_t *f, void *buf, size_t len) {
         llen -= take;
         if (llen > 0) memmove(lbuf, lbuf + take, llen);
         else          lready = false;
+        spinlock_release(&lbuf_lock);
         return (ssize_t)take;
     }
     lready = false;
@@ -132,6 +138,7 @@ static ssize_t tty_console_read(file_t *f, void *buf, size_t len) {
         if (input_tty_getchar_nonblock(&ch) != 0) {
             if (f->flags & O_NONBLOCK) {
                 if (llen > 0) goto deliver;
+                spinlock_release(&lbuf_lock);
                 return -EAGAIN;
             }
             sched_sleep(1);
@@ -221,7 +228,9 @@ static ssize_t tty_console_read(file_t *f, void *buf, size_t len) {
 
         /* VEOF: ^D — deliver line without newline; empty buffer means EOF */
         if (veof && ch == veof) {
-            if (llen == 0) return 0;  /* EOF */
+            if (llen == 0) {
+                return 0;  /* EOF */
+            }
             goto deliver;
         }
 
@@ -253,6 +262,7 @@ deliver:;
     memcpy(dst, lbuf, take);
     llen -= take;
     if (llen > 0) { memmove(lbuf, lbuf + take, llen); lready = true; }
+    spinlock_release(&lbuf_lock);
     return (ssize_t)take;
 }
 
@@ -866,6 +876,15 @@ static int devfs_open(vnode_t *v, int flags) {
             v->pending_f_ops = &g_tty_console_fops;
             v->pending_priv  = NULL;
         }
+        return 0;
+    }
+
+    if (node->dev_type == DEV_CONSOLE) {
+        /* /dev/console → always the physical console line discipline.
+         * On Linux, /dev/console is a full TTY with echo, ICANON, etc.
+         * Route through the same file_ops as /dev/tty console path.     */
+        v->pending_f_ops = &g_tty_console_fops;
+        v->pending_priv  = NULL;
         return 0;
     }
 

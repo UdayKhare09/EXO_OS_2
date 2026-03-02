@@ -329,8 +329,63 @@ static void launcher_exec_path(launcher_t *launcher, const char *args) {
         return;
     }
 
+    uintptr_t user_entry = info.entry;
+    uint64_t at_base = 0;
+    uint64_t interp_top = USER_MMAP_BASE;
+
+    if (info.has_interp) {
+        int ivfs_err = 0;
+        vnode_t *ivn = vfs_lookup(info.interp_path, true, &ivfs_err);
+        if (!ivn) {
+            fbcon_printf_inst(con, "  exec: missing interpreter '%s'\n", info.interp_path);
+            vmm_destroy_address_space(pml4);
+            return;
+        }
+
+        uint64_t isize = ivn->size;
+        if (isize == 0 || isize > (64ULL * 1024 * 1024)) {
+            fbcon_printf_inst(con, "  exec: bad interpreter size (%llu)\n", isize);
+            vfs_vnode_put(ivn);
+            vmm_destroy_address_space(pml4);
+            return;
+        }
+
+        void *ibuf = kmalloc(isize);
+        if (!ibuf) {
+            fbcon_puts_inst(con, "  exec: out of memory loading interpreter\n");
+            vfs_vnode_put(ivn);
+            vmm_destroy_address_space(pml4);
+            return;
+        }
+
+        ssize_t ird = ivn->ops->read(ivn, ibuf, isize, 0);
+        vfs_vnode_put(ivn);
+        if (ird < 0 || (uint64_t)ird != isize) {
+            fbcon_printf_inst(con, "  exec: interpreter read error (%ld)\n", ird);
+            kfree(ibuf);
+            vmm_destroy_address_space(pml4);
+            return;
+        }
+
+        elf_info_t iinfo;
+        uint64_t interp_bias = USER_MMAP_BASE;
+        int ir = elf_load(ibuf, isize, pml4, interp_bias, &iinfo);
+        kfree(ibuf);
+        if (ir < 0) {
+            fbcon_printf_inst(con, "  exec: interpreter ELF load failed (%d)\n", ir);
+            vmm_destroy_address_space(pml4);
+            return;
+        }
+
+        user_entry = iinfo.entry;
+        at_base = iinfo.load_base;
+        if (iinfo.brk_start > interp_top)
+            interp_top = iinfo.brk_start;
+    }
+
     uintptr_t user_stack_top = USER_STACK_TOP;
-    uintptr_t stack_pages = 8;
+#define USER_STACK_PAGES 2048u   /* 8 MiB user stack (matches Linux default) */
+    uintptr_t stack_pages = USER_STACK_PAGES;
     for (uintptr_t i = 0; i < stack_pages; i++) {
         uintptr_t pg = pmm_alloc_pages(1);
         if (pg) {
@@ -417,9 +472,25 @@ static void launcher_exec_path(launcher_t *launcher, const char *args) {
             uintptr_t ph2 = (*pte2) & 0x000FFFFFFFFFF000ULL;
             uintptr_t of2 = sp & (PAGE_SIZE - 1);
             rp_virt = (uint64_t *)(vmm_phys_to_virt(ph2) + of2);
-            /* Fill 16 bytes with deterministic pseudo-random (fine for boot) */
-            rp_virt[0] = 0xDEADBEEFCAFEBABEULL ^ (uint64_t)(uintptr_t)fullpath;
-            rp_virt[1] = 0xFEEDFACEFACEFEEDULL ^ (uint64_t)sp;
+            /* Use RDRAND if available (CPUID.1.ECX bit 30), else RDTSC mix */
+            uint64_t r0, r1;
+            uint32_t eax_c, ebx_c, ecx_c, edx_c;
+            cpuid(1, &eax_c, &ebx_c, &ecx_c, &edx_c);
+            if (ecx_c & (1u << 30)) {
+                uint8_t ok;
+                __asm__ volatile("rdrand %0; setc %1" : "=r"(r0), "=qm"(ok));
+                __asm__ volatile("rdrand %0; setc %1" : "=r"(r1), "=qm"(ok));
+                (void)ok;
+            } else {
+                /* RDTSC xorshift fallback */
+                uint64_t tsc; __asm__ volatile("rdtsc" : "=A"(tsc));
+                r0 = tsc ^ (uint64_t)(uintptr_t)fullpath;
+                r0 ^= r0 << 13; r0 ^= r0 >> 7; r0 ^= r0 << 17;
+                r1 = r0 ^ (uint64_t)sp;
+                r1 ^= r1 << 13; r1 ^= r1 >> 7; r1 ^= r1 << 17;
+            }
+            rp_virt[0] = r0;
+            rp_virt[1] = r1;
         }
     }
 
@@ -442,6 +513,8 @@ static void launcher_exec_path(launcher_t *launcher, const char *args) {
     EXEC_PUSH(0);    EXEC_PUSH(12);  /* AT_EUID  = 12 */
     EXEC_PUSH(0);    EXEC_PUSH(11);  /* AT_UID   = 11 */
     EXEC_PUSH(0);    EXEC_PUSH(23);  /* AT_SECURE = 23 */
+    EXEC_PUSH(at_base);              /* AT_BASE value  */
+    EXEC_PUSH(7);                    /* AT_BASE = 7    */
     EXEC_PUSH(info.entry);           /* AT_ENTRY value */
     EXEC_PUSH(9);                    /* AT_ENTRY = 9   */
     EXEC_PUSH(PAGE_SIZE);            /* AT_PAGESZ value */
@@ -465,7 +538,7 @@ static void launcher_exec_path(launcher_t *launcher, const char *args) {
     #undef EXEC_PUSH
 
     uint32_t cpu = sched_pick_cpu();
-    task_t *t = task_create_user(fullpath, pml4, info.entry, sp, cpu);
+    task_t *t = task_create_user(fullpath, pml4, user_entry, sp, cpu);
     if (!t) {
         fbcon_puts_inst(con, "  exec: failed to create task\n");
         vmm_destroy_address_space(pml4);
@@ -475,6 +548,8 @@ static void launcher_exec_path(launcher_t *launcher, const char *args) {
     t->brk_base    = info.brk_start;
     t->brk_current = info.brk_start;
     t->mmap_next   = USER_MMAP_BASE;
+    if (interp_top > t->mmap_next)
+        t->mmap_next = (interp_top + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
     const char *initial_cwd = (launcher && launcher->cwd[0]) ? launcher->cwd : "/";
     strncpy(t->cwd, initial_cwd, TASK_CWD_MAX - 1);
     t->cwd[TASK_CWD_MAX - 1] = '\0';
@@ -625,6 +700,7 @@ void kmain(void) {
 
     /* ── 5. VMM ───────────────────────────────────────────────────────────── */
     vmm_init(hhdm_req.response->offset, read_cr3());
+    cpu_pat_init();  /* program IA32_PAT so VMM_WC → write-combining (PAT[1]) */
 
     /* ── 5a. Kernel heap ──────────────────────────────────────────────────── */
     kmalloc_init();
@@ -701,11 +777,22 @@ void kmain(void) {
         KLOG_INFO("gfx: GOP framebuffer %lux%lu bpp=%u pitch=%lu\n",
                   lfb->width, lfb->height, lfb->bpp, lfb->pitch);
 
+        if (lfb->bpp != 32) {
+            KLOG_ERR("gfx: unsupported framebuffer depth %u bpp — halting\n", lfb->bpp);
+            goto halt;
+        }
         fbcon_fb_t fbdesc = {
-            .fb    = (uint32_t *)lfb->address,
-            .width  = (uint32_t)lfb->width,
-            .height = (uint32_t)lfb->height,
-            .pitch  = (uint32_t)lfb->pitch,
+            .fb          = (uint32_t *)lfb->address,
+            .width       = (uint32_t)lfb->width,
+            .height      = (uint32_t)lfb->height,
+            .pitch       = (uint32_t)lfb->pitch,
+            .bpp         = lfb->bpp,
+            .red_shift   = lfb->red_mask_shift,
+            .green_shift = lfb->green_mask_shift,
+            .blue_shift  = lfb->blue_mask_shift,
+            .red_size    = lfb->red_mask_size,
+            .green_size  = lfb->green_mask_size,
+            .blue_size   = lfb->blue_mask_size,
         };
         fbcon_init(&fbdesc);
         KLOG_INFO("gfx: fbcon initialised (%ux%u px)\n",
