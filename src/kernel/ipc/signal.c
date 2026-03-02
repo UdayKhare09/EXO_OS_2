@@ -226,7 +226,17 @@ bool signal_deliver_user(task_t *t, void *regs_ptr) {
         }
 
         /* ── Build sigframe on user stack ─────────────────────────────── */
-        uintptr_t user_sp = regs->rsp;
+        /* If SA_ONSTACK and the task has an active alternate signal stack,
+         * deliver on the altstack (top = base + size).  Otherwise use the
+         * current user RSP.  Matches Linux behaviour for glibc/pthreads. */
+        uintptr_t user_sp;
+        if ((sa_flags & SA_ONSTACK) && t->altstack_sp &&
+            !(t->altstack_flags & SS_DISABLE)) {
+            /* Top of alternate stack: base + size, then let alignment below apply */
+            user_sp = (uintptr_t)(t->altstack_sp + t->altstack_size);
+        } else {
+            user_sp = regs->rsp;
+        }
 
         /* Ensure 16-byte alignment, then allocate sigframe */
         user_sp = (user_sp - sizeof(sigframe_t)) & ~0xFULL;

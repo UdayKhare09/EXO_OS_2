@@ -86,7 +86,9 @@ static int sock_file_poll(file_t *f, int events) {
 
 static int sock_file_ioctl(file_t *f, unsigned long cmd, unsigned long arg) {
     (void)f; (void)cmd; (void)arg;
-    return -1;  /* TODO: SIOCG* ioctls */
+    /* SIOCG/SIOCS network interface ioctls are handled directly in sys_ioctl
+     * before f_ops->ioctl is dispatched.  Return EINVAL for anything else. */
+    return -EINVAL;
 }
 
 file_ops_t g_socket_file_ops = {

@@ -1,4 +1,0 @@
-#!/bin/sh
-# Minimal fish command placeholder for EXO_OS rootfs.
-# Until a real fish binary is packaged, fall back to POSIX shell.
-exec /bin/sh "$@"

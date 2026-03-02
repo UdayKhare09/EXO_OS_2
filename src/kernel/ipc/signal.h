@@ -29,6 +29,7 @@
 #define SIGXFSZ   25   /* file size limit exceeded     */
 
 /* SA flags */
+#define SA_ONSTACK    0x08000000  /* deliver signal on alternate stack  */
 #define SA_RESTORER   0x04000000
 #define SA_SIGINFO    0x00000004
 #define SA_RESTART    0x10000000
@@ -36,6 +37,10 @@
 #define SA_RESETHAND  0x80000000
 #define SA_NOCLDSTOP  0x00000001
 #define SA_NOCLDWAIT  0x00000002
+
+/* Alternate signal stack state flags (sigaltstack / task->altstack_flags) */
+#define SS_ONSTACK    1  /* task is currently executing on the altstack    */
+#define SS_DISABLE    2  /* alternate stack is disabled                     */
 
 /* sigprocmask how */
 #define SIG_BLOCK     0

@@ -45,6 +45,8 @@ extern int64_t sys_pipe2(int pipefd[2], int flags);
 #define SIOCSIFADDR   0x8916
 #define SIOCGIFBRDADDR 0x8919
 #define SIOCGIFHWADDR  0x8927
+#define SIOCGIFMTU     0x8921
+#define SIOCGIFINDEX   0x8933
 
 #define IFF_UP         0x0001
 #define IFF_BROADCAST  0x0002
@@ -65,6 +67,8 @@ typedef struct {
         struct sockaddr     ifru_broadaddr;
         struct sockaddr     ifru_hwaddr;
         int16_t             ifru_flags;
+        int                 ifru_ifindex;   /* SIOCGIFINDEX            */
+        int                 ifru_mtu;       /* SIOCGIFMTU              */
     } ifr_ifru;
 } kernel_ifreq_t;
 
@@ -81,6 +85,8 @@ typedef struct {
 #define ifr_broadaddr ifr_ifru.ifru_broadaddr
 #define ifr_hwaddr    ifr_ifru.ifru_hwaddr
 #define ifr_flags     ifr_ifru.ifru_flags
+#define ifr_ifindex   ifr_ifru.ifru_ifindex
+#define ifr_mtu       ifr_ifru.ifru_mtu
 
 static netdev_t *ioctl_pick_dev(const char ifname[16]) {
     if (ifname && ifname[0]) {
@@ -598,7 +604,8 @@ int64_t sys_ioctl(int fd, unsigned long cmd, unsigned long arg) {
         if (cmd == SIOCGIFFLAGS || cmd == SIOCSIFFLAGS ||
             cmd == SIOCGIFADDR || cmd == SIOCSIFADDR ||
             cmd == SIOCGIFNETMASK || cmd == SIOCSIFNETMASK ||
-            cmd == SIOCGIFBRDADDR || cmd == SIOCGIFHWADDR) {
+            cmd == SIOCGIFBRDADDR || cmd == SIOCGIFHWADDR ||
+            cmd == SIOCGIFMTU || cmd == SIOCGIFINDEX) {
             kernel_ifreq_t *ifr = (kernel_ifreq_t *)(uintptr_t)arg;
             if (!ifr) return -EINVAL;
 
@@ -650,6 +657,16 @@ int64_t sys_ioctl(int fd, unsigned long cmd, unsigned long arg) {
                 memset(&ifr->ifr_hwaddr, 0, sizeof(ifr->ifr_hwaddr));
                 ifr->ifr_hwaddr.sa_family = ARPHRD_ETHER;
                 memcpy(ifr->ifr_hwaddr.sa_data, dev->mac, ETH_ALEN);
+                return 0;
+            }
+
+            if (cmd == SIOCGIFMTU) {
+                ifr->ifr_mtu = (int)dev->mtu;
+                return 0;
+            }
+
+            if (cmd == SIOCGIFINDEX) {
+                ifr->ifr_ifindex = (int)dev->dev_id;
                 return 0;
             }
         }
