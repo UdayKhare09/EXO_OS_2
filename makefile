@@ -103,7 +103,7 @@ TRAMPOLINE_BIN := $(BUILD_DIR)/obj/arch/x86_64/trampoline.bin
 TRAMPOLINE_OBJ := $(BUILD_DIR)/obj/arch/x86_64/trampoline.o
 
 # ── Font pipeline (host tool: TrueType → C array) ────────────────────────────
-FONT_SIZE     ?= 20             # override with: make FONT_SIZE=16
+FONT_SIZE     ?= 20
 FONT_TOOL     := $(BUILD_DIR)/tools/gen_font
 FONT_TTF      := $(SRC_DIR)/gfx/3rdparty/font.ttf
 FONT_DATA_C   := $(BUILD_DIR)/gfx_font_data.c
@@ -124,34 +124,22 @@ GLIBC_LD_SO      ?= $(shell ldconfig -p 2>/dev/null | awk '/ld-linux-x86-64\.so\
 GLIBC_LIBCRYPT   ?= $(shell ldconfig -p 2>/dev/null | awk '/libcrypt\.so\.2 .*x86-64/{print $$NF; exit}; /libcrypt\.so\.1 .*x86-64/{print $$NF; exit}')
 
 GLIBC_SMOKE_DIR      := $(BUILD_DIR)/glibc-test
-LIBC_SMOKE_DIR       := $(GLIBC_SMOKE_DIR)
 GLIBC_RUNTIME_DIR    := $(GLIBC_SMOKE_DIR)/lib
 GLIBC_RUNTIME_STAMP  := $(GLIBC_RUNTIME_DIR)/.stamp
 GLIBC_DEPS_STAMP     := $(GLIBC_SMOKE_DIR)/.deps-stamp
-
-LIBC_HELLO_DYN_BIN   := $(GLIBC_SMOKE_DIR)/hello_dynamic
-LIBC_DLOPEN_TEST_BIN := $(GLIBC_SMOKE_DIR)/dlopen_test
-LIBC_LIBTEST_SO      := $(GLIBC_SMOKE_DIR)/libtest.so
-LIBC_DYNAMIC_BINS    := $(LIBC_HELLO_DYN_BIN) $(LIBC_DLOPEN_TEST_BIN)
-LIBC_DYNAMIC_LIBS    := $(LIBC_LIBTEST_SO)
-
-LIBC_HELLO_DYN_SRC   := tools/hello_dynamic.c
-LIBC_DLOPEN_TEST_SRC := tools/dlopen_test.c
-LIBC_LIBTEST_SO_SRC  := tools/libtest.c
 
 # ── Coreutils + shell from host ──────────────────────────────────────────────
 HOST_SHELL   ?= $(shell which bash 2>/dev/null || which dash 2>/dev/null)
 HOST_CORE_BINS := ls cat echo cp mv rm mkdir chmod ln pwd env id whoami \
                   grep sed awk sort head tail wc cut tr date uname find xargs \
                   true false test stat touch sleep kill ps clear which poweroff reboot \
-				  fish ssh ping dig vi vim nano less
+                  fish ssh ping dig vi vim nano less
 COREUTILS_DIR   := $(GLIBC_SMOKE_DIR)/coreutils
 COREUTILS_STAMP := $(COREUTILS_DIR)/.stamp
 
 # ── External binaries (configured in script) ─────────────────────────────────
 EXTERNAL_BIN_LIST_SH := tools/rootfs/external_bins.sh
 EXTERNAL_BIN_DIR     := $(GLIBC_SMOKE_DIR)/external-bin
-
 EXTERNAL_BIN_STAMP   := $(EXTERNAL_BIN_DIR)/.stamp
 
 # ── rootfs config files ──────────────────────────────────────────────
@@ -167,8 +155,8 @@ ROOTFS_TERMINFO_LINUX := $(shell sh -c 'for p in /usr/share/terminfo/l/linux /li
 ROOTFS_CA_BUNDLE := $(shell sh -c 'for p in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do [ -f "$$p" ] && { echo "$$p"; exit 0; }; done')
 
 # ── QEMU flags (shared between run and run-debug) ─────────────────────────────
-QEMU_MEMORY   ?= 6G            # override: make QEMU_MEMORY=4G
-QEMU_SMP      ?= 6             # override: make QEMU_SMP=8
+QEMU_MEMORY   ?= 6G
+QEMU_SMP      ?= 6
 QEMU_FLAGS := \
     -machine q35 \
     -cpu host \
@@ -188,7 +176,6 @@ QEMU_FLAGS := \
     -no-reboot
 
 .PHONY: all clean distclean run run-debug
-.PHONY: check-glibc libc-smoke coreutils-build external-bins-build curl-build glibc-rootfs
 
 all: $(DISK_IMG)
 
@@ -217,8 +204,6 @@ $(FONT_DATA_OBJ): $(FONT_DATA_C) $(BUILD_DIR)/limine.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-
-
 # ── Trampoline: flat binary wrapped in an ELF object ─────────────────────────
 $(TRAMPOLINE_BIN): $(TRAMPOLINE_SRC)
 	@mkdir -p $(dir $@)
@@ -226,8 +211,8 @@ $(TRAMPOLINE_BIN): $(TRAMPOLINE_SRC)
 
 $(TRAMPOLINE_OBJ): $(TRAMPOLINE_BIN)
 	$(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
-	    --rename-section .data=.rodata,alloc,load,readonly,data,contents \
-	    $< $@
+		--rename-section .data=.rodata,alloc,load,readonly,data,contents \
+		$< $@
 
 # ── Kernel ────────────────────────────────────────────────────────────────────
 $(BUILD_DIR)/obj/%.c.o: $(SRC_DIR)/%.c $(BUILD_DIR)/limine.h
@@ -246,48 +231,23 @@ $(KERNEL_ELF): $(ALL_OBJS)
 	@echo ">>> Linking kernel..."
 	$(LD) $(LDFLAGS) $^ -o $@
 
-# ── glibc dynamic binaries ──────────────────────────────────────────────────
-check-glibc:
+# ── glibc dynamic binaries and setup ────────────────────────────────────────
+$(GLIBC_RUNTIME_STAMP):
 	@test -f "$(GLIBC_LIBC)" || (echo "Missing glibc: run 'apt install gcc' or set GLIBC_LIBC"; exit 1)
 	@test -f "$(GLIBC_LD_SO)" || (echo "Missing dynamic linker: $(GLIBC_LD_SO)"; exit 1)
 	@test -f "$(GLIBC_LIBCRYPT)" || (echo "Missing libcrypt: $(GLIBC_LIBCRYPT)"; exit 1)
-
-# Usage: $(call glibc-link-dynamic, OUTPUT, SOURCE, LIBS)
-define glibc-link-dynamic
-	$(USER_CC) -O2 -o $(1) $(2) $(3) \
-	    -Wl,-dynamic-linker,$(USER_LINKER)
-endef
-
-# Usage: $(call glibc-link-shared, OUTPUT, SOURCE, LIBS)
-define glibc-link-shared
-	$(USER_CC) -O2 -fPIC -shared -o $(1) $(2) $(3)
-endef
-
-$(LIBC_HELLO_DYN_BIN): $(LIBC_HELLO_DYN_SRC) check-glibc
-	@mkdir -p $(dir $@)
-	$(call glibc-link-dynamic,$@,$<,-lc)
-
-$(LIBC_DLOPEN_TEST_BIN): $(LIBC_DLOPEN_TEST_SRC) check-glibc
-	@mkdir -p $(dir $@)
-	$(call glibc-link-dynamic,$@,$<,-ldl)
-
-$(LIBC_LIBTEST_SO): $(LIBC_LIBTEST_SO_SRC) check-glibc
-	@mkdir -p $(dir $@)
-	$(call glibc-link-shared,$@,$<,)
-
-$(GLIBC_RUNTIME_STAMP): check-glibc makefile
 	@mkdir -p $(GLIBC_RUNTIME_DIR)
 	cp $(GLIBC_LIBC)      $(GLIBC_RUNTIME_DIR)/libc.so.6
 	cp $(GLIBC_LIBM)      $(GLIBC_RUNTIME_DIR)/libm.so.6
 	@if [ -n "$(GLIBC_LIBDL)" ] && [ -f "$(GLIBC_LIBDL)" ]; then \
-	    cp $(GLIBC_LIBDL) $(GLIBC_RUNTIME_DIR)/libdl.so.2; \
+		cp $(GLIBC_LIBDL) $(GLIBC_RUNTIME_DIR)/libdl.so.2; \
 	else \
-	    cp $(GLIBC_LIBC)  $(GLIBC_RUNTIME_DIR)/libdl.so.2; \
+		cp $(GLIBC_LIBC)  $(GLIBC_RUNTIME_DIR)/libdl.so.2; \
 	fi
 	@if [ -n "$(GLIBC_LIBPTHREAD)" ] && [ -f "$(GLIBC_LIBPTHREAD)" ]; then \
-	    cp $(GLIBC_LIBPTHREAD) $(GLIBC_RUNTIME_DIR)/libpthread.so.0; \
+		cp $(GLIBC_LIBPTHREAD) $(GLIBC_RUNTIME_DIR)/libpthread.so.0; \
 	else \
-	    cp $(GLIBC_LIBC)       $(GLIBC_RUNTIME_DIR)/libpthread.so.0; \
+		cp $(GLIBC_LIBC)       $(GLIBC_RUNTIME_DIR)/libpthread.so.0; \
 	fi
 	cp $(GLIBC_LD_SO)     $(GLIBC_RUNTIME_DIR)/ld-linux-x86-64.so.2
 	cp $(GLIBC_LIBCRYPT)  $(GLIBC_RUNTIME_DIR)/libcrypt.so.2
@@ -297,15 +257,15 @@ $(COREUTILS_STAMP):
 	@echo ">>> Staging coreutils + shell from host..."
 	@mkdir -p $(COREUTILS_DIR)
 	@set -e; for bin in $(HOST_CORE_BINS); do \
-	    p=$$(which $$bin 2>/dev/null) || continue; \
-	    cp "$$p" "$(COREUTILS_DIR)/$$bin"; \
-	    chmod +x "$(COREUTILS_DIR)/$$bin"; \
+		p=$$(which $$bin 2>/dev/null) || continue; \
+		cp "$$p" "$(COREUTILS_DIR)/$$bin"; \
+		chmod +x "$(COREUTILS_DIR)/$$bin"; \
 	done
 	@if [ -n "$(HOST_SHELL)" ] && [ -f "$(HOST_SHELL)" ]; then \
-	    cp "$(HOST_SHELL)" "$(COREUTILS_DIR)/sh"; \
-	    chmod +x "$(COREUTILS_DIR)/sh"; \
+		cp "$(HOST_SHELL)" "$(COREUTILS_DIR)/sh"; \
+		chmod +x "$(COREUTILS_DIR)/sh"; \
 	else \
-	    echo "!!! warning: no bash/dash found on host; /bin/sh will be missing"; \
+		echo "!!! warning: no bash/dash found on host; /bin/sh will be missing"; \
 	fi
 	@touch $@
 
@@ -315,17 +275,12 @@ $(EXTERNAL_BIN_STAMP): $(EXTERNAL_BIN_LIST_SH)
 	@set -e; \
 	. ./$(EXTERNAL_BIN_LIST_SH); \
 	external_bins | while read -r name url; do \
-	    if [ -z "$$name" ] || [ -z "$$url" ]; then continue; fi; \
-	    echo "    - $$name <= $$url"; \
-	    curl -L --fail -o "$(EXTERNAL_BIN_DIR)/$$name" "$$url"; \
-	    chmod +x "$(EXTERNAL_BIN_DIR)/$$name"; \
+		if [ -z "$$name" ] || [ -z "$$url" ]; then continue; fi; \
+		echo "    - $$name <= $$url"; \
+		curl -L --fail -o "$(EXTERNAL_BIN_DIR)/$$name" "$$url"; \
+		chmod +x "$(EXTERNAL_BIN_DIR)/$$name"; \
 	done
 	@touch $@
-
-libc-smoke:      $(LIBC_DYNAMIC_BINS) $(LIBC_DYNAMIC_LIBS) $(GLIBC_RUNTIME_STAMP)
-coreutils-build: $(COREUTILS_STAMP)
-external-bins-build: $(EXTERNAL_BIN_STAMP)
-curl-build: external-bins-build
 
 # ── init / su (glibc static — installed as /sbin/init and /bin/su in rootfs) ──
 INIT_SRC := tools/init.c
@@ -333,11 +288,11 @@ INIT_BIN := $(BUILD_DIR)/init
 SU_SRC   := tools/su.c
 SU_BIN   := $(BUILD_DIR)/su
 
-$(INIT_BIN): $(INIT_SRC) check-glibc
+$(INIT_BIN): $(INIT_SRC)
 	@mkdir -p $(dir $@)
 	$(USER_CC) -O2 -o $@ $< -lcrypt -Wl,-dynamic-linker,$(USER_LINKER)
 
-$(SU_BIN): $(SU_SRC) check-glibc
+$(SU_BIN): $(SU_SRC)
 	@mkdir -p $(dir $@)
 	$(USER_CC) -O2 -o $@ $< -lcrypt -Wl,-dynamic-linker,$(USER_LINKER)
 
@@ -360,68 +315,63 @@ $(GLIBC_DEPS_STAMP): $(GLIBC_RUNTIME_STAMP) $(COREUTILS_STAMP) $(EXTERNAL_BIN_ST
 	 xargs -r ldd < /tmp/exo_bins.txt 2>/dev/null \
 	 | awk '/=> \//{print $$3}' | sort -u \
 	 | while read so; do \
-	     [ -f "$$so" ] || continue; \
-	     name=$$(basename "$$so"); \
-	     dest="$(GLIBC_RUNTIME_DIR)/$$name"; \
-	     [ -f "$$dest" ] || { echo "  staging $$name"; cp "$$so" "$$dest"; }; \
+		 [ -f "$$so" ] || continue; \
+		 name=$$(basename "$$so"); \
+		 dest="$(GLIBC_RUNTIME_DIR)/$$name"; \
+		 [ -f "$$dest" ] || { echo "  staging $$name"; cp "$$so" "$$dest"; }; \
 	   done
 	@touch $@
 
-$(ROOT_IMG): makefile $(LIBC_DYNAMIC_BINS) $(LIBC_DYNAMIC_LIBS) $(GLIBC_DEPS_STAMP) \
-			 $(COREUTILS_STAMP) $(EXTERNAL_BIN_STAMP) $(INIT_BIN) $(SU_BIN) \
-		     $(ROOTFS_PROFILE) $(ROOTFS_ENV_FILE) $(ROOTFS_PASSWD) $(ROOTFS_SHADOW) \
-		     $(ROOTFS_GROUP) $(ROOTFS_RESOLV) $(ROOTFS_NSSWITCH) $(ROOTFS_LD_CONF)
+$(ROOT_IMG): $(GLIBC_DEPS_STAMP) $(COREUTILS_STAMP) $(EXTERNAL_BIN_STAMP) $(INIT_BIN) $(SU_BIN) \
+             $(ROOTFS_PROFILE) $(ROOTFS_ENV_FILE) $(ROOTFS_PASSWD) $(ROOTFS_SHADOW) \
+             $(ROOTFS_GROUP) $(ROOTFS_RESOLV) $(ROOTFS_NSSWITCH) $(ROOTFS_LD_CONF)
 	@echo ">>> Building root partition (ext2)..."
 	dd if=/dev/zero of=$@ bs=512 count=$(ROOT_SECTORS) 2>/dev/null
 	mkfs.ext2 -q -L "EXOOS_ROOT" -b 4096 $@
 	$(foreach d, dev tmp boot proc sys sys/bus sys/bus/usb sys/bus/usb/devices sys/bus/pci \
-	    sys/bus/pci/devices home home/root home/uday \
-	    etc etc/ssl etc/ssl/certs \
-	    bin lib lib/x86_64-linux-gnu lib64 \
-	    usr usr/bin usr/sbin usr/lib usr/lib/x86_64-linux-gnu \
-	    usr/share usr/share/terminfo usr/share/terminfo/l \
-	    sbin var run mnt dev/shm, \
-	    debugfs -w -R "mkdir $(d)" $@ 2>/dev/null || true ;)
+		sys/bus/pci/devices home home/root home/uday \
+		etc etc/ssl etc/ssl/certs \
+		bin lib lib/x86_64-linux-gnu lib64 \
+		usr usr/bin usr/sbin usr/lib usr/lib/x86_64-linux-gnu \
+		usr/share usr/share/terminfo usr/share/terminfo/l \
+		sbin var run mnt dev/shm, \
+		debugfs -w -R "mkdir $(d)" $@ 2>/dev/null || true ;)
 	@# ── glibc runtime + all auto-discovered .so deps ──────────────────────────
 	@# Writes every .so in GLIBC_RUNTIME_DIR to lib/x86_64-linux-gnu/, lib/, and
 	@# usr/lib/ so ld-linux finds deps regardless of /etc/ld.so.cache presence.
 	@# ld-linux itself also lands in lib64/ (canonical PT_INTERP path).
 	@for so in $(GLIBC_RUNTIME_DIR)/*.so*; do \
-	    [ -f "$$so" ] || continue; \
-	    n=$$(basename "$$so"); \
-	    case "$$n" in \
-	      ld-linux*) \
-	        debugfs -w -R "write $$so lib64/$$n" $@ 2>/dev/null; \
-	        debugfs -w -R "write $$so lib/$$n"   $@ 2>/dev/null; \
-	        ;; \
-	      *) \
-	        debugfs -w -R "write $$so lib/x86_64-linux-gnu/$$n" $@ 2>/dev/null; \
-	        debugfs -w -R "write $$so lib/$$n"                   $@ 2>/dev/null; \
-	        debugfs -w -R "write $$so usr/lib/$$n"               $@ 2>/dev/null; \
-	        ;; \
-	    esac; \
+		[ -f "$$so" ] || continue; \
+		n=$$(basename "$$so"); \
+		case "$$n" in \
+		  ld-linux*) \
+			debugfs -w -R "write $$so lib64/$$n" $@ 2>/dev/null; \
+			debugfs -w -R "write $$so lib/$$n"   $@ 2>/dev/null; \
+			;; \
+		  *) \
+			debugfs -w -R "write $$so lib/x86_64-linux-gnu/$$n" $@ 2>/dev/null; \
+			debugfs -w -R "write $$so lib/$$n"                   $@ 2>/dev/null; \
+			debugfs -w -R "write $$so usr/lib/$$n"               $@ 2>/dev/null; \
+			;; \
+		esac; \
 	  done
-	debugfs -w -R "write $(LIBC_LIBTEST_SO) lib/x86_64-linux-gnu/libtest.so" $@ 2>/dev/null
 	@# ── coreutils + shell ────────────────────────────────────────────────────
 	@for f in $(COREUTILS_DIR)/*; do \
-	    [ -f "$$f" ] || continue; \
-	    n=$$(basename "$$f"); \
-	    debugfs -w -R "write $$f bin/$$n" $@ 2>/dev/null; \
+		[ -f "$$f" ] || continue; \
+		n=$$(basename "$$f"); \
+		debugfs -w -R "write $$f bin/$$n" $@ 2>/dev/null; \
 	done
-	@# ── test binaries ────────────────────────────────────────────────────────
-	debugfs -w -R "write $(LIBC_HELLO_DYN_BIN)   home/root/hello_dynamic"  $@ 2>/dev/null
-	debugfs -w -R "write $(LIBC_DLOPEN_TEST_BIN) home/root/dlopen_test"    $@ 2>/dev/null
 	@# ── system binaries ──────────────────────────────────────────────────────
 	debugfs -w -R "write $(SU_BIN)               bin/su"                   $@ 2>/dev/null
 	debugfs -w -R "set_inode_field bin/su mode 0104755"                     $@ 2>/dev/null || true
 	debugfs -w -R "write $(INIT_BIN)             sbin/init"                $@ 2>/dev/null
 	@# ── external binaries ────────────────────────────────────────────────────
 	@if [ -d "$(EXTERNAL_BIN_DIR)" ]; then \
-	    for f in $(EXTERNAL_BIN_DIR)/*; do \
-	        [ -f "$$f" ] || continue; \
-	        n=$$(basename "$$f"); \
-	        debugfs -w -R "write $$f bin/$$n" $@ 2>/dev/null; \
-	    done; \
+		for f in $(EXTERNAL_BIN_DIR)/*; do \
+			[ -f "$$f" ] || continue; \
+			n=$$(basename "$$f"); \
+			debugfs -w -R "write $$f bin/$$n" $@ 2>/dev/null; \
+		done; \
 	fi
 	@# ── rootfs config ────────────────────────────────────────────────────────
 	debugfs -w -R "write $(ROOTFS_PROFILE)      etc/profile"               $@ 2>/dev/null
@@ -434,16 +384,17 @@ $(ROOT_IMG): makefile $(LIBC_DYNAMIC_BINS) $(LIBC_DYNAMIC_LIBS) $(GLIBC_DEPS_STA
 	debugfs -w -R "write $(ROOTFS_NSSWITCH)     etc/nsswitch.conf"         $@ 2>/dev/null
 	debugfs -w -R "write $(ROOTFS_LD_CONF)      etc/ld.so.conf"            $@ 2>/dev/null
 	@if [ -n "$(ROOTFS_CA_BUNDLE)" ] && [ -f "$(ROOTFS_CA_BUNDLE)" ]; then \
-	    debugfs -w -R "write $(ROOTFS_CA_BUNDLE) etc/ssl/cert.pem" $@ 2>/dev/null; \
-	    debugfs -w -R "write $(ROOTFS_CA_BUNDLE) etc/ssl/certs/ca-certificates.crt" $@ 2>/dev/null; \
+		debugfs -w -R "write $(ROOTFS_CA_BUNDLE) etc/ssl/cert.pem" $@ 2>/dev/null; \
+		debugfs -w -R "write $(ROOTFS_CA_BUNDLE) etc/ssl/certs/ca-certificates.crt" $@ 2>/dev/null; \
 	else \
-	    echo "!!! warning: host CA bundle not found; HTTPS cert validation may fail in guest"; \
+		echo "!!! warning: host CA bundle not found; HTTPS cert validation may fail in guest"; \
 	fi
 	@if [ -n "$(ROOTFS_TERMINFO_LINUX)" ] && [ -f "$(ROOTFS_TERMINFO_LINUX)" ]; then \
-	    debugfs -w -R "write $(ROOTFS_TERMINFO_LINUX) usr/share/terminfo/l/linux" $@ 2>/dev/null; \
+		debugfs -w -R "write $(ROOTFS_TERMINFO_LINUX) usr/share/terminfo/l/linux" $@ 2>/dev/null; \
 	else \
-	    echo "!!! warning: linux terminfo entry not found on host; nano may fail with TERM=linux"; \
+		echo "!!! warning: linux terminfo entry not found on host; nano may fail with TERM=linux"; \
 	fi
+
 # ── Data partition (ext2) ─────────────────────────────────────────────────────
 $(DATA_IMG):
 	@echo ">>> Building data partition (ext2)..."
@@ -477,9 +428,9 @@ run-debug: $(DISK_IMG) $(OVMF_VARS)
 # ── Clean ─────────────────────────────────────────────────────────────────────
 clean:
 	rm -rf $(BUILD_DIR)/obj $(KERNEL_ELF) $(DISK_IMG) \
-	       $(EFI_IMG) $(ROOT_IMG) $(DATA_IMG) $(BUILD_DIR)/limine.h \
-	       $(FONT_DATA_C) $(FONT_DATA_OBJ) $(OVMF_VARS) \
-	       $(LIBC_SMOKE_DIR)
+		   $(EFI_IMG) $(ROOT_IMG) $(DATA_IMG) $(BUILD_DIR)/limine.h \
+		   $(FONT_DATA_C) $(FONT_DATA_OBJ) $(OVMF_VARS) \
+		   $(GLIBC_SMOKE_DIR)
 
 distclean:
 	rm -rf $(BUILD_DIR)
