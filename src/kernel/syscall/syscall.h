@@ -51,6 +51,8 @@
 #define SYS_FCHOWNAT    260
 #define SYS_RENAMEAT    264
 #define SYS_FCNTL       72
+#define SYS_FSYNC       74
+#define SYS_FDATASYNC   75
 #define SYS_GETCWD      79
 #define SYS_CHDIR       80
 #define SYS_RENAME      82
@@ -162,6 +164,8 @@
 #define AT_SYMLINK_NOFOLLOW 0x100
 #define AT_REMOVEDIR    0x200
 #define AT_EACCESS      0x200
+#define AT_NO_AUTOMOUNT 0x800
+#define AT_EMPTY_PATH   0x1000
 
 /* ── Network syscall numbers (Linux x86-64 ABI) ─────────────────────────── */
 #define SYS_POLL        7

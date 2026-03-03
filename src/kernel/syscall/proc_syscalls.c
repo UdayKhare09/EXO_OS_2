@@ -260,6 +260,14 @@ int64_t sys_fork(cpu_regs_t *regs) {
     vma_list_clone(child, parent);
     fd_table_clone(child, parent);
 
+    /* Copy parent's FPU / SSE / AVX state into child so it inherits exact
+     * register values at the point of fork (POSIX). The parent's CPU-side
+     * FPU state was already flushed to parent->fpu_state by task_switch_asm
+     * before the current syscall entry.  A child that immediately exec()s will
+     * reset its state via sys_execve anyway. */
+    if (parent->fpu_state && child->fpu_state)
+        memcpy(child->fpu_state, parent->fpu_state, PAGE_SIZE);
+
     /* Copy memory management state */
     child->brk_base    = parent->brk_base;
     child->brk_current = parent->brk_current;
@@ -859,6 +867,34 @@ int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
     frame->r12 = sp;                 /* new user RSP (with argc/argv/auxv) */
 
     cur->rsp = kstack_top;
+
+    /* Reset FPU / SSE / AVX state for the new process image.
+     * execve must not inherit the parent's MXCSR or x87 FCW; an unmasked
+     * SSE exception flag left by the parent (e.g. gcc → cc1) would fire
+     * #XF on the very first SSE instruction in the child.
+     *
+     * We write explicit well-known values into the legacy FXSAVE region of the
+     * XSAVE buffer and set XSTATE_BV so XRSTOR loads those values directly
+     * (not from the CPU's INIT state, which is less reliable across vendors):
+     *
+     *   Byte  0–1  : FCW        = 0x037F  (x87: mask all exceptions, 64-bit prec.)
+     *   Byte  2–3  : FSW        = 0x0000  (x87: clear status word)
+     *   Byte  4    : FTW        = 0x00    (x87: all tags = empty, abridged)
+     *   Byte 24–27 : MXCSR     = 0x1F80  (SSE: mask all, round-to-nearest)
+     *   Byte 28–31 : MXCSR_MASK= 0xFFFF  (allow all MXCSR bits to be set)
+     *   Byte 512+  : XSTATE_BV = 0x0007  (x87|SSE|AVX explicitly stored)
+     */
+    memset(cur->fpu_state, 0, PAGE_SIZE);
+    *(uint16_t *)(cur->fpu_state +   0) = 0x037F;  /* FCW */
+    *(uint32_t *)(cur->fpu_state +  24) = 0x1F80;  /* MXCSR */
+    *(uint32_t *)(cur->fpu_state +  28) = 0xFFFF;  /* MXCSR_MASK */
+    *(uint64_t *)(cur->fpu_state + 512) = 0x0007;  /* XSTATE_BV: x87+SSE+AVX */
+    __asm__ volatile(
+        "mov $7, %%eax\n\t"   /* component mask: x87|SSE|AVX */
+        "xor %%edx, %%edx\n\t"
+        "xrstor64 (%0)\n\t"
+        : : "r"(cur->fpu_state) : "eax", "edx", "memory"
+    );
 
     /* Jump there NOW */
     __asm__ volatile(

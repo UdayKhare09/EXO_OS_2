@@ -500,6 +500,18 @@ static void csi_dispatch(fbcon_t *c, char cmd) {
         c->wrap_pending = false;
         clamp_cursor(c);
         break;
+    case 'E': /* CNL: cursor next line */
+        c->row += p0;
+        c->col = 0;
+        c->wrap_pending = false;
+        clamp_cursor(c);
+        break;
+    case 'F': /* CPL: cursor previous line */
+        c->row -= p0;
+        c->col = 0;
+        c->wrap_pending = false;
+        clamp_cursor(c);
+        break;
     case 'G':
         c->col = p0 - 1;
         c->wrap_pending = false;
@@ -519,6 +531,24 @@ static void csi_dispatch(fbcon_t *c, char cmd) {
         break;
     case 'M':
         delete_lines(c, p0);
+        c->wrap_pending = false;
+        break;
+    case 'S': /* SU: scroll up within current scroll region */
+        for (int i = 0; i < p0; i++)
+            scroll_up_region(c, c->scroll_top, c->scroll_bottom);
+        c->wrap_pending = false;
+        break;
+    case 'T': /* SD: scroll down within current scroll region */
+        for (int i = 0; i < p0; i++)
+            scroll_down_region(c, c->scroll_top, c->scroll_bottom);
+        c->wrap_pending = false;
+        break;
+    case 'X': /* ECH: erase characters from cursor */
+        if (c->col < c->cols) {
+            int n = p0;
+            if (n > c->cols - c->col) n = c->cols - c->col;
+            fill_rect(c, c->col * c->cw, c->row * c->ch, n * c->cw, c->ch, c->bg);
+        }
         c->wrap_pending = false;
         break;
     case 'J':
@@ -782,6 +812,44 @@ static void emit_char(fbcon_t *c, char ch) {
             for (int i = 0; i < MAX_CSI_PARAMS; i++) c->csi_params[i] = 0;
             c->csi_nparams = 0;
             c->csi_private = false;
+        } else if (ch == 'D') { /* IND: index */
+            linefeed(c);
+            c->ansi = ANSI_NORMAL;
+        } else if (ch == 'E') { /* NEL: next line */
+            c->col = 0;
+            linefeed(c);
+            c->wrap_pending = false;
+            c->ansi = ANSI_NORMAL;
+        } else if (ch == 'M') { /* RI: reverse index */
+            if (c->row >= c->scroll_top && c->row <= c->scroll_bottom) {
+                if (c->row == c->scroll_top) {
+                    scroll_down_region(c, c->scroll_top, c->scroll_bottom);
+                } else {
+                    c->row--;
+                }
+            } else if (c->row > 0) {
+                c->row--;
+            }
+            c->wrap_pending = false;
+            c->ansi = ANSI_NORMAL;
+        } else if (ch == 'c') { /* RIS: reset to initial state */
+            c->col = 0;
+            c->row = 0;
+            c->saved_col = 0;
+            c->saved_row = 0;
+            c->scroll_top = 0;
+            c->scroll_bottom = c->rows - 1;
+            c->fg = palette_to_pixel(c, COL_FG_DEFAULT);
+            c->bg = palette_to_pixel(c, COL_BG_DEFAULT);
+            c->bold = false;
+            c->inverse = false;
+            c->autowrap = true;
+            c->newline_mode = false;
+            c->wrap_pending = false;
+            c->utf8_accum = 0;
+            c->utf8_remain = 0;
+            fill_rect(c, 0, 0, (int)c->fb_w, (int)c->fb_h, c->bg);
+            c->ansi = ANSI_NORMAL;
         } else if (ch == '7') {
             c->saved_row = c->row;
             c->saved_col = c->col;

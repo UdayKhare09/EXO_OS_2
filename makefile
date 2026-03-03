@@ -19,14 +19,14 @@ LIMINE_TAG  := v8.x-binary
 LIMINE_REPO := https://github.com/limine-bootloader/limine.git
 
 # ── Disk layout (512-byte sectors) ───────────────────────────────────────────
-DISK_SIZE_MB := 512
+DISK_SIZE_MB := 8192
 # p1: EFI System — 64 MiB; guarantees ≥65525 FAT32 clusters (UEFI spec)
 EFI_START    := 2048
 EFI_END      := 133119
 EFI_SECTORS  := $(shell echo $$(($(EFI_END) - $(EFI_START) + 1)))
 # p2: Linux root — fixed-size partition
 ROOT_START    := 133120
-ROOT_SIZE_MB  := 256
+ROOT_SIZE_MB  := 6144
 ROOT_SECTORS  := $(shell echo $$(($(ROOT_SIZE_MB) * 2048)))
 ROOT_END      := $(shell echo $$(($(ROOT_START) + $(ROOT_SECTORS) - 1)))
 # p3: Linux data — remainder up to backup GPT
@@ -128,6 +128,17 @@ GLIBC_RUNTIME_DIR    := $(GLIBC_SMOKE_DIR)/lib
 GLIBC_RUNTIME_STAMP  := $(GLIBC_RUNTIME_DIR)/.stamp
 GLIBC_DEPS_STAMP     := $(GLIBC_SMOKE_DIR)/.deps-stamp
 
+# ── GCC compiler (host copy staged into rootfs) ──────────────────────────────
+GCC_VERSION  := $(shell gcc -dumpversion 2>/dev/null)
+GCC_TRIPLET  := $(shell gcc -dumpmachine 2>/dev/null)
+GCC_LIBDIR   := $(shell dirname $$(gcc -print-libgcc-file-name 2>/dev/null))
+
+COMPILER_BIN_DIR  := $(GLIBC_SMOKE_DIR)/compiler-bin
+COMPILER_INT_DIR  := $(GLIBC_SMOKE_DIR)/compiler-int
+COMPILER_INC_DIR  := $(GLIBC_SMOKE_DIR)/compiler-inc
+COMPILER_DBG_CMDS := $(GLIBC_SMOKE_DIR)/compiler-debugfs-cmds.txt
+COMPILER_STAMP    := $(COMPILER_BIN_DIR)/.stamp
+
 # ── Coreutils + shell from host ──────────────────────────────────────────────
 HOST_SHELL   ?= $(shell which bash 2>/dev/null || which dash 2>/dev/null)
 HOST_CORE_BINS := ls cat echo cp mv rm mkdir chmod ln pwd env id whoami \
@@ -151,6 +162,7 @@ ROOTFS_PASSWD   := tools/rootfs/passwd
 ROOTFS_SHADOW   := tools/rootfs/shadow
 ROOTFS_GROUP    := tools/rootfs/group
 ROOTFS_RESOLV   := tools/rootfs/resolv.conf
+ROOTFS_MAIN_C   := tools/rootfs/main.c
 ROOTFS_TERMINFO_LINUX := $(shell sh -c 'for p in /usr/share/terminfo/l/linux /lib/terminfo/l/linux /etc/terminfo/l/linux; do [ -f "$$p" ] && { echo "$$p"; exit 0; }; done')
 ROOTFS_CA_BUNDLE := $(shell sh -c 'for p in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do [ -f "$$p" ] && { echo "$$p"; exit 0; }; done')
 
@@ -254,20 +266,18 @@ $(GLIBC_RUNTIME_STAMP):
 	@touch $@
 
 $(COREUTILS_STAMP):
-	@echo ">>> Staging coreutils + shell from host..."
-	@mkdir -p $(COREUTILS_DIR)
-	@set -e; for bin in $(HOST_CORE_BINS); do \
-		p=$$(which $$bin 2>/dev/null) || continue; \
-		cp "$$p" "$(COREUTILS_DIR)/$$bin"; \
-		chmod +x "$(COREUTILS_DIR)/$$bin"; \
-	done
-	@if [ -n "$(HOST_SHELL)" ] && [ -f "$(HOST_SHELL)" ]; then \
-		cp "$(HOST_SHELL)" "$(COREUTILS_DIR)/sh"; \
-		chmod +x "$(COREUTILS_DIR)/sh"; \
-	else \
-		echo "!!! warning: no bash/dash found on host; /bin/sh will be missing"; \
-	fi
-	@touch $@
+	@HOST_CORE_BINS="$(HOST_CORE_BINS)" HOST_SHELL="$(HOST_SHELL)" \
+		COREUTILS_DIR="$(COREUTILS_DIR)" sh tools/rootfs/stage_bins.sh
+
+$(COMPILER_STAMP): $(GLIBC_RUNTIME_STAMP) tools/rootfs/stage_compiler.sh
+	@GCC_VERSION="$(GCC_VERSION)" GCC_TRIPLET="$(GCC_TRIPLET)" \
+		GCC_LIBDIR="$(GCC_LIBDIR)" \
+		COMPILER_BIN_DIR="$(COMPILER_BIN_DIR)" \
+		COMPILER_INT_DIR="$(COMPILER_INT_DIR)" \
+		COMPILER_INC_DIR="$(COMPILER_INC_DIR)" \
+		COMPILER_DBG_CMDS="$(COMPILER_DBG_CMDS)" \
+		SRC_KERNEL_DIR="$(SRC_DIR)" \
+		sh tools/rootfs/stage_compiler.sh
 
 $(EXTERNAL_BIN_STAMP): $(EXTERNAL_BIN_LIST_SH)
 	@echo ">>> Fetching external binaries from $(EXTERNAL_BIN_LIST_SH)..."
@@ -308,9 +318,10 @@ $(EFI_IMG): $(KERNEL_ELF) $(LIMINE_DIR)/limine.h
 
 # ── Root partition (ext2, no root needed — debugfs) ───────────────────────────
 # Auto-discover all transitive .so deps of every staged binary and copy to GLIBC_RUNTIME_DIR
-$(GLIBC_DEPS_STAMP): $(GLIBC_RUNTIME_STAMP) $(COREUTILS_STAMP) $(EXTERNAL_BIN_STAMP) $(INIT_BIN) $(SU_BIN)
+$(GLIBC_DEPS_STAMP): $(GLIBC_RUNTIME_STAMP) $(COREUTILS_STAMP) $(EXTERNAL_BIN_STAMP) $(INIT_BIN) $(SU_BIN) $(COMPILER_STAMP)
 	@echo ">>> Auto-discovering shared library dependencies..."
-	@find $(COREUTILS_DIR) $(EXTERNAL_BIN_DIR) -maxdepth 1 -type f 2>/dev/null > /tmp/exo_bins.txt; \
+	@find $(COREUTILS_DIR) $(EXTERNAL_BIN_DIR) $(COMPILER_BIN_DIR) $(COMPILER_INT_DIR) \
+	     -maxdepth 1 -type f 2>/dev/null > /tmp/exo_bins.txt; \
 	 for b in $(INIT_BIN) $(SU_BIN); do [ -f "$$b" ] && echo "$$b"; done >> /tmp/exo_bins.txt; \
 	 xargs -r ldd < /tmp/exo_bins.txt 2>/dev/null \
 	 | awk '/=> \//{print $$3}' | sort -u \
@@ -322,7 +333,7 @@ $(GLIBC_DEPS_STAMP): $(GLIBC_RUNTIME_STAMP) $(COREUTILS_STAMP) $(EXTERNAL_BIN_ST
 	   done
 	@touch $@
 
-$(ROOT_IMG): $(GLIBC_DEPS_STAMP) $(COREUTILS_STAMP) $(EXTERNAL_BIN_STAMP) $(INIT_BIN) $(SU_BIN) \
+$(ROOT_IMG): $(GLIBC_DEPS_STAMP) $(COREUTILS_STAMP) $(EXTERNAL_BIN_STAMP) $(INIT_BIN) $(SU_BIN) $(COMPILER_STAMP) \
              $(ROOTFS_PROFILE) $(ROOTFS_ENV_FILE) $(ROOTFS_PASSWD) $(ROOTFS_SHADOW) \
              $(ROOTFS_GROUP) $(ROOTFS_RESOLV) $(ROOTFS_NSSWITCH) $(ROOTFS_LD_CONF)
 	@echo ">>> Building root partition (ext2)..."
@@ -333,6 +344,7 @@ $(ROOT_IMG): $(GLIBC_DEPS_STAMP) $(COREUTILS_STAMP) $(EXTERNAL_BIN_STAMP) $(INIT
 		etc etc/ssl etc/ssl/certs \
 		bin lib lib/x86_64-linux-gnu lib64 \
 		usr usr/bin usr/sbin usr/lib usr/lib/x86_64-linux-gnu \
+		usr/include \
 		usr/share usr/share/terminfo usr/share/terminfo/l \
 		sbin var run mnt dev/shm, \
 		debugfs -w -R "mkdir $(d)" $@ 2>/dev/null || true ;)
@@ -347,6 +359,7 @@ $(ROOT_IMG): $(GLIBC_DEPS_STAMP) $(COREUTILS_STAMP) $(EXTERNAL_BIN_STAMP) $(INIT
 		  ld-linux*) \
 			debugfs -w -R "write $$so lib64/$$n" $@ 2>/dev/null; \
 			debugfs -w -R "write $$so lib/$$n"   $@ 2>/dev/null; \
+			debugfs -w -R "write $$so usr/lib/$$n" $@ 2>/dev/null; \
 			;; \
 		  *) \
 			debugfs -w -R "write $$so lib/x86_64-linux-gnu/$$n" $@ 2>/dev/null; \
@@ -378,6 +391,7 @@ $(ROOT_IMG): $(GLIBC_DEPS_STAMP) $(COREUTILS_STAMP) $(EXTERNAL_BIN_STAMP) $(INIT
 	debugfs -w -R "write $(ROOTFS_ENV_FILE)     etc/environment"           $@ 2>/dev/null
 	debugfs -w -R "write $(ROOTFS_PASSWD)       etc/passwd"                $@ 2>/dev/null
 	debugfs -w -R "write $(ROOTFS_SHADOW)       etc/shadow"                $@ 2>/dev/null
+	debugfs -w -R "write $(ROOTFS_MAIN_C)       home/root/main.c"              $@ 2>/dev/null
 	debugfs -w -R "set_inode_field etc/shadow mode 0100600"                 $@ 2>/dev/null || true
 	debugfs -w -R "write $(ROOTFS_GROUP)        etc/group"                 $@ 2>/dev/null
 	debugfs -w -R "write $(ROOTFS_RESOLV)       etc/resolv.conf"           $@ 2>/dev/null
@@ -393,6 +407,13 @@ $(ROOT_IMG): $(GLIBC_DEPS_STAMP) $(COREUTILS_STAMP) $(EXTERNAL_BIN_STAMP) $(INIT
 		debugfs -w -R "write $(ROOTFS_TERMINFO_LINUX) usr/share/terminfo/l/linux" $@ 2>/dev/null; \
 	else \
 		echo "!!! warning: linux terminfo entry not found on host; nano may fail with TERM=linux"; \
+	fi
+	@# ── compiler binaries, internals, and header trees ─────────────────────
+	@if [ -f "$(COMPILER_DBG_CMDS)" ]; then \
+		echo ">>> Writing compiler + headers to root image..."; \
+		debugfs -w -f "$(COMPILER_DBG_CMDS)" $@ 2>/dev/null; \
+	else \
+		echo "!!! warning: compiler not staged; $(COMPILER_DBG_CMDS) missing"; \
 	fi
 
 # ── Data partition (ext2) ─────────────────────────────────────────────────────

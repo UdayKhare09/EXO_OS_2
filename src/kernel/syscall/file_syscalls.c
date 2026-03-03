@@ -27,6 +27,8 @@ static void fill_linux_stat(linux_stat_t *lst, const vfs_stat_t *st);
 int64_t sys_read(int fd, void *buf, uint64_t count);
 int64_t sys_fstat(int fd, linux_stat_t *buf);
 int64_t sys_fstatat(int dirfd, const char *upath, linux_stat_t *buf, int flags);
+int64_t sys_fsync(int fd);
+int64_t sys_fdatasync(int fd);
 int64_t sys_sendfile(int out_fd, int in_fd, uint64_t *offset, uint64_t count);
 int64_t sys_mkdirat(int dirfd, const char *upath, uint32_t mode);
 int64_t sys_unlinkat(int dirfd, const char *upath, int flags);
@@ -478,13 +480,13 @@ int64_t sys_openat(int dirfd, const char *upath, int flags, uint32_t mode) {
 int64_t sys_fstatat(int dirfd, const char *upath, linux_stat_t *buf, int flags) {
     if (!buf) return -EINVAL;
 
-    /* AT_EMPTY_PATH: stat the fd itself (used for fstat via fstatat) */
-    #define AT_EMPTY_PATH 0x1000
-    if (flags & AT_EMPTY_PATH) {
+    const int supported = AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH;
+    if (flags & ~supported) return -EINVAL;
+
+    /* AT_EMPTY_PATH: stat the fd itself (used by glibc for fstat-like probes) */
+    if ((flags & AT_EMPTY_PATH) && (!upath || !upath[0])) {
         return sys_fstat(dirfd, buf);
     }
-
-    if (flags & ~(AT_SYMLINK_NOFOLLOW)) return -EINVAL;
 
     char path[VFS_MOUNT_PATH_MAX];
     int r = resolve_path_at(dirfd, upath, path);
@@ -566,6 +568,26 @@ int64_t sys_symlinkat(const char *target, int newdirfd, const char *linkpath) {
 /* ── sys_close ───────────────────────────────────────────────────────────── */
 int64_t sys_close(int fd) {
     return fd_close(cur_task(), fd) == 0 ? 0 : -EBADF;
+}
+
+int64_t sys_fsync(int fd) {
+    task_t *t = cur_task();
+    file_t *f = fd_get(t, fd);
+    if (!f) return -EBADF;
+
+    /* Non-VFS descriptors (pipes/sockets/eventfd/etc.) have no inode to flush. */
+    if (!f->vnode) return -EINVAL;
+
+    if (f->vnode->ops && f->vnode->ops->sync) {
+        int r = f->vnode->ops->sync(f->vnode);
+        if (r < 0) return r;
+    }
+    return 0;
+}
+
+int64_t sys_fdatasync(int fd) {
+    /* No separate metadata/data distinction yet; treat as fsync(). */
+    return sys_fsync(fd);
 }
 
 /* ── vfs_stat → convert to linux_stat_t ────────────────────────────────── */

@@ -1,5 +1,5 @@
 # /etc/profile - EXO_OS defaults
-export PATH="/bin:/usr/bin:/sbin:/usr/sbin"
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 export SHELL="${SHELL:-/bin/sh}"
 export USER="${USER:-root}"
 if [ -z "$HOME" ]; then
@@ -14,6 +14,12 @@ export HOSTNAME="exo"
 export TMPDIR="/tmp"
 export SSL_CERT_FILE="/etc/ssl/cert.pem"
 export SSL_CERT_DIR="/etc/ssl/certs"
+
+# Compiler defaults
+export CC="gcc"
+export CXX="g++"
+export CPATH="/usr/include"
+export LIBRARY_PATH="/usr/lib:/lib"
 
 [ -z "$TERM" ] && TERM="linux"
 [ -z "$PWD" ] && PWD="$HOME"

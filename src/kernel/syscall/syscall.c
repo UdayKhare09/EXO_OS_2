@@ -35,6 +35,8 @@ int64_t sys_pwrite64(int fd, const void *buf, uint64_t count, int64_t offset);
 int64_t sys_open(const char *path, int flags, uint32_t mode);
 int64_t sys_openat(int dirfd, const char *path, int flags, uint32_t mode);
 int64_t sys_close(int fd);
+int64_t sys_fsync(int fd);
+int64_t sys_fdatasync(int fd);
 int64_t sys_stat(const char *path, linux_stat_t *buf);
 int64_t sys_fstat(int fd, linux_stat_t *buf);
 int64_t sys_lstat(const char *path, linux_stat_t *buf);
@@ -174,8 +176,12 @@ static int64_t sc_sendfile(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t 
     { (void)e;(void)f; return sys_sendfile((int)a,(int)b,(uint64_t*)c,d); }
 static int64_t sc_sync(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; vfs_sync_all(); return 0; }
-    static int64_t sc_eventfd2(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
-        { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; return -ENOSYS; }
+static int64_t sc_fsync(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)b;(void)c;(void)d;(void)e;(void)f; return sys_fsync((int)a); }
+static int64_t sc_fdatasync(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)b;(void)c;(void)d;(void)e;(void)f; return sys_fdatasync((int)a); }
+static int64_t sc_eventfd2(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; return -ENOSYS; }
 
 /* ── sys_exit: properly terminate the task ────────────────────────────────── */
 static int64_t sc_exit(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
@@ -1838,6 +1844,8 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_READLINK]       = sc_readlink,
     [SYS_READLINKAT]     = sc_readlinkat,
     [SYS_FCNTL]          = sc_fcntl,
+    [SYS_FSYNC]          = sc_fsync,
+    [SYS_FDATASYNC]      = sc_fdatasync,
     [SYS_FSTATAT]        = sc_fstatat,
     [SYS_FCHOWNAT]       = sc_fchownat,
     [SYS_FUTIMESAT]      = sc_futimesat,
