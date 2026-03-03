@@ -801,6 +801,7 @@ static int fat32_rmdir(vnode_t *parent, const char *name) {
 
 static int fat32_stat(vnode_t *v, vfs_stat_t *st) {
     memset(st, 0, sizeof(*st));
+    st->dev   = v->fsi ? v->fsi->dev_id : 0;
     st->ino   = v->ino;
     st->mode  = v->mode;
     st->size  = v->size;

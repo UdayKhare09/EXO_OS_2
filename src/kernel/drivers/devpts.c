@@ -145,6 +145,7 @@ static int devpts_readdir(vnode_t *dir, uint64_t *cookie, vfs_dirent_t *out) {
 static int devpts_stat(vnode_t *v, vfs_stat_t *st) {
     if (!st) return 0;
     memset(st, 0, sizeof(*st));
+    st->dev     = v->fsi ? v->fsi->dev_id : 0;
     st->mode    = v->mode;
     st->ino     = v->ino;
     st->uid     = v->uid;

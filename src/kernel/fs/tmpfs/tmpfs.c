@@ -272,6 +272,7 @@ static int tmpfs_rename(vnode_t *old_parent, const char *old_name,
 static int tmpfs_stat(vnode_t *v, vfs_stat_t *st) {
     tmpfs_inode_t *ti = vnode_ti(v);
     memset(st, 0, sizeof(*st));
+    st->dev   = v->fsi ? v->fsi->dev_id : 0;
     st->ino   = ti->ino;
     st->mode  = ti->mode;
     st->size  = ti->size;

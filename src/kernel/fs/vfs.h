@@ -198,6 +198,7 @@ struct fs_inst {
     fs_ops_t  *ops;       /* filesystem vtable                                */
     void      *priv;      /* fs-private superblock data                        */
     mount_t   *mount;     /* back-pointer to mount entry                      */
+    uint64_t   dev_id;    /* unique device ID exposed via stat(2) st_dev      */
 };
 
 /* ── Mount table entry ───────────────────────────────────────────────────── */

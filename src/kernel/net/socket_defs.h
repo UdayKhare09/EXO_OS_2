@@ -78,6 +78,7 @@
 #define POLLNVAL   0x0020
 #define POLLRDNORM 0x0040
 #define POLLWRNORM POLLOUT
+#define POLLRDHUP  0x2000   /* peer closed (half-close) — Linux ABI */
 
 /* ── ioctl network commands ──────────────────────────────────────────────── */
 #define SIOCGIFADDR    0x8915

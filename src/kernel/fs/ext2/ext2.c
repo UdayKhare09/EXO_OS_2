@@ -993,22 +993,75 @@ static int ext2_rmdir(vnode_t *parent, const char *name) {
 
 static int ext2_rename(vnode_t *old_parent, const char *old_name,
                         vnode_t *new_parent, const char *new_name) {
-    ext2_sb_t   *sb = get_sb(old_parent);
-    /* Find the inode of old_name */
+    ext2_sb_t *sb = get_sb(old_parent);
     vnode_t *target = ext2_lookup(old_parent, old_name);
     if (!target) return -ENOENT;
+
     uint32_t ino = get_ino(target);
-    ext2_inode_t vi;
-    ext2_read_inode(sb, ino, &vi);
-    uint8_t ftype = (vi.i_mode & EXT2_IFMT) == EXT2_S_IFDIR ? EXT2_DT_DIR : EXT2_DT_REG;
+    ext2_inode_t inode;
+    int rc = ext2_read_inode(sb, ino, &inode);
+    if (rc < 0) {
+        target->ops->evict(target);
+        kfree(target);
+        return -EIO;
+    }
+    uint8_t ftype = (inode.i_mode & EXT2_IFMT) == EXT2_S_IFDIR ? EXT2_DT_DIR : EXT2_DT_REG;
+
+    vnode_t *existing = ext2_lookup(new_parent, new_name);
+    if (existing) {
+        uint32_t dst_ino = get_ino(existing);
+        existing->ops->evict(existing);
+        kfree(existing);
+
+        /* POSIX: rename over another hard-link to the same inode is a no-op. */
+        if (dst_ino == ino) {
+            target->ops->evict(target);
+            kfree(target);
+            return 0;
+        }
+
+        rc = ext2_unlink(new_parent, new_name);
+        if (rc < 0) {
+            target->ops->evict(target);
+            kfree(target);
+            return rc;
+        }
+    }
+
+    /* Keep source inode alive while we do add-then-remove. */
+    inode.i_links_count++;
+    if (ext2_write_inode(sb, ino, &inode) < 0) {
+        target->ops->evict(target);
+        kfree(target);
+        return -EIO;
+    }
+
+    rc = ext2_dir_add_entry(sb, get_ino(new_parent), ino, new_name, ftype);
+    if (rc < 0) {
+        if (ext2_read_inode(sb, ino, &inode) == 0 && inode.i_links_count > 0) {
+            inode.i_links_count--;
+            ext2_write_inode(sb, ino, &inode);
+        }
+        target->ops->evict(target);
+        kfree(target);
+        return rc;
+    }
+
+    rc = ext2_unlink(old_parent, old_name);
+    if (rc < 0) {
+        int rollback = ext2_unlink(new_parent, new_name);
+        if (rollback < 0 && ext2_read_inode(sb, ino, &inode) == 0 && inode.i_links_count > 0) {
+            inode.i_links_count--;
+            ext2_write_inode(sb, ino, &inode);
+        }
+        target->ops->evict(target);
+        kfree(target);
+        return rc;
+    }
+
     target->ops->evict(target);
     kfree(target);
-
-    /* Add new entry */
-    if (ext2_dir_add_entry(sb, get_ino(new_parent), ino, new_name, ftype) < 0)
-        return -ENOSPC;
-    /* Remove old entry */
-    return ext2_unlink(old_parent, old_name);
+    return 0;
 }
 
 static int ext2_stat(vnode_t *v, vfs_stat_t *st) {

@@ -525,6 +525,13 @@ int64_t sys_poll(struct pollfd *fds, uint64_t nfds, int timeout) {
     uint64_t deadline = (timeout > 0) ? (start_ticks + (uint64_t)timeout) : 0;
 
     for (;;) {
+        /* ── check for pending unmasked signal ────────────────────────────── */
+        if (cur) {
+            uint32_t pend = __atomic_load_n(&cur->sig_pending, __ATOMIC_RELAXED);
+            if (pend & ~cur->sig_mask)
+                return -EINTR;
+        }
+
         ready = 0;
         for (uint64_t i = 0; i < nfds; i++) {
             fds[i].revents = 0;
@@ -557,13 +564,42 @@ int64_t sys_poll(struct pollfd *fds, uint64_t nfds, int timeout) {
         if (ready > 0) break;
         if (timeout == 0) break;
 
-        if (timeout > 0) {
+        /* ── event-driven wait: find the first socket we can block on ──────── *
+         * Prefer a RX-interested socket; fall back to TX if none.             *
+         * For multi-fd polls (e.g. curl watching a single TCP fd) this covers *
+         * the common case without busy-spinning.                               */
+        socket_t *wait_sk = NULL;
+        for (uint64_t i = 0; i < nfds && !wait_sk; i++) {
+            int want_rx = fds[i].events &
+                          (POLLIN | POLLRDNORM | POLLRDHUP | POLLHUP | POLLERR);
+            if (!want_rx) continue;
+            file_t *f = fd_get(cur, fds[i].fd);
+            if (!f || f->f_ops != &g_socket_file_ops) continue;
+            socket_t *sk = (socket_t *)f->private_data;
+            if (sk) wait_sk = sk;
+        }
+
+        if (wait_sk) {
+            /* block on the socket's RX wait queue until data arrives or
+             * the caller's timeout expires — no busy-spin needed            */
+            if (timeout < 0) {
+                /* infinite: use a very large timeout so signals can still
+                 * interrupt — waitq_wait_timeout iterates on return         */
+                waitq_wait_timeout(&wait_sk->wq_rx, 60000ULL);
+            } else {
+                uint64_t now = sched_get_ticks();
+                if (now >= deadline) break;
+                waitq_wait_timeout(&wait_sk->wq_rx, deadline - now);
+            }
+        } else if (timeout > 0) {
+            /* non-socket fd (tty, pipe, …): fall back to short timed sleep   */
             uint64_t now = sched_get_ticks();
             if (now >= deadline) break;
             uint64_t remain = deadline - now;
-            sched_sleep((uint32_t)(remain > 10 ? 10 : remain));
+            sched_sleep((uint32_t)(remain > 5 ? 5 : remain));
         } else {
-            sched_sleep(10);
+            /* timeout == -1, no socket: brief sleep to avoid a hot spin      */
+            sched_sleep(1);
         }
     }
     return (int64_t)ready;

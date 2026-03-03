@@ -28,6 +28,11 @@ void waitq_init(waitq_t *wq);
  * When woken by waitq_wake_*, the task becomes RUNNABLE. */
 void waitq_wait(waitq_t *wq);
 
+/* Like waitq_wait() but returns after at most timeout_ms milliseconds.
+ * Returns 0 if woken by waitq_wake_*, 1 if the timeout expired first.
+ * Uses a ktimer internally — safe to call from task context only. */
+int waitq_wait_timeout(waitq_t *wq, uint64_t timeout_ms);
+
 /* Wake one task from the wait queue (FIFO order).
  * Safe to call from any CPU or ISR context. */
 void waitq_wake_one(waitq_t *wq);

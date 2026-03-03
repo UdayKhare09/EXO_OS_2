@@ -76,9 +76,10 @@ int vfs_mount(const char *path, blkdev_t *dev, const char *fstype) {
     /* Allocate fs instance */
     fs_inst_t *fsi = kzalloc(sizeof(fs_inst_t));
     if (!fsi) return -ENOMEM;
-    fsi->dev  = dev;
-    fsi->ops  = ops;
-    fsi->mount = m;
+    fsi->dev    = dev;
+    fsi->ops    = ops;
+    fsi->mount  = m;
+    fsi->dev_id = (uint64_t)(m - g_mounts) + 1; /* 1-based mount-slot index */
 
     /* Call filesystem's mount operation */
     vnode_t *root = ops->mount(fsi, dev);

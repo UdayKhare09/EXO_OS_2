@@ -1,5 +1,6 @@
 /* net/tcp_input.c — TCP segment receive processing (RFC 793) */
 #include "net/tcp.h"
+#include "net/socket.h"   /* socket_t, wq_rx — woken when data/FIN/RST arrives */
 #include "net/ipv4.h"
 #include "net/netutil.h"
 #include "lib/klog.h"
@@ -25,6 +26,10 @@ static void tcp_deliver_data(tcp_tcb_t *tcb, const uint8_t *data, size_t len) {
 
     /* wake recv() waiters */
     waitq_wake_all(&tcb->wq_recv);
+
+    /* wake any task blocked in poll()/select() on this socket */
+    if (tcb->socket)
+        waitq_wake_all(&((socket_t *)tcb->socket)->wq_rx);
 }
 
 /* ── push completed child connection to listener accept queue ────────────── */
@@ -184,6 +189,9 @@ void tcp_rx(netdev_t *dev, skbuff_t *skb) {
         waitq_wake_all(&tcb->wq_connect);
         waitq_wake_all(&tcb->wq_recv);
         waitq_wake_all(&tcb->wq_send);
+        /* also wake any poll() waiter so it can report POLLERR/POLLHUP */
+        if (tcb->socket)
+            waitq_wake_all(&((socket_t *)tcb->socket)->wq_rx);
         spinlock_release(&tcb->lock);
         skb_free(skb);
         return;
@@ -315,6 +323,9 @@ void tcp_rx(netdev_t *dev, skbuff_t *skb) {
                 tcb->state = TCP_CLOSE_WAIT;
                 KLOG_DEBUG("tcp: → CLOSE_WAIT\n");
                 waitq_wake_all(&tcb->wq_recv);  /* EOF for reader */
+                /* wake poll() waiter — FIN sets POLLIN+POLLHUP */
+                if (tcb->socket)
+                    waitq_wake_all(&((socket_t *)tcb->socket)->wq_rx);
                 break;
             case TCP_FIN_WAIT_1:
                 /* simultaneous close */

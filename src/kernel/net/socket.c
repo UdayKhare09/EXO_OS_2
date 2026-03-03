@@ -160,7 +160,13 @@ int socket_create(int domain, int type, int protocol) {
         sk->proto_ops = &tcp_proto_ops;
     else if (protocol == IPPROTO_UDP)
         sk->proto_ops = &udp_proto_ops;
-    else if (real_type == SOCK_RAW && protocol == IPPROTO_ICMP)
+    else if ((real_type == SOCK_RAW || real_type == SOCK_DGRAM) &&
+             protocol == IPPROTO_ICMP)
+        /* SOCK_DGRAM+ICMP = Linux "ping socket" (RFC 792, unprivileged).
+         * SOCK_RAW+ICMP   = traditional raw socket (needs CAP_NET_RAW).
+         * Both share the same raw_icmp_proto_ops: we send/receive the full
+         * ICMP message (type/code/cksum/id/seq + payload) without the IP
+         * header, which is exactly what iputils ping expects.             */
         sk->proto_ops = &raw_icmp_proto_ops;
     else {
         kfree(sk);
@@ -189,8 +195,9 @@ int socket_create(int domain, int type, int protocol) {
         cur->fd_flags[fd] |= FD_CLOEXEC;
 
     KLOG_DEBUG("socket: created %s socket fd=%d\n",
-         protocol == IPPROTO_TCP ? "TCP" :
-         (protocol == IPPROTO_UDP ? "UDP" : "RAW-ICMP"), fd);
+         protocol == IPPROTO_TCP  ? "TCP" :
+         protocol == IPPROTO_UDP  ? "UDP" :
+         real_type == SOCK_DGRAM  ? "DGRAM-ICMP" : "RAW-ICMP", fd);
     return fd;
 }
 

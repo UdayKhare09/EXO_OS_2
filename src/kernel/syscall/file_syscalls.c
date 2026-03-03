@@ -593,6 +593,7 @@ int64_t sys_fdatasync(int fd) {
 /* ── vfs_stat → convert to linux_stat_t ────────────────────────────────── */
 static void fill_linux_stat(linux_stat_t *lst, const vfs_stat_t *st) {
     __builtin_memset(lst, 0, sizeof(*lst));
+    lst->st_dev    = st->dev;
     lst->st_ino    = st->ino;
     lst->st_mode   = st->mode;
     lst->st_nlink  = st->nlink;
@@ -674,7 +675,7 @@ int64_t sys_getcwd(char *buf, uint64_t size) {
     size_t len = strlen(t->cwd);
     if (len + 1 > size) return -ERANGE;
     memcpy(buf, t->cwd, len + 1);
-    return (int64_t)(uintptr_t)buf;
+    return (int64_t)(len + 1);  /* Linux ABI: return byte count, not pointer */
 }
 
 /* ── sys_chdir ───────────────────────────────────────────────────────────── */

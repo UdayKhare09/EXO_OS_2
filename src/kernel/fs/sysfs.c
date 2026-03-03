@@ -566,6 +566,7 @@ static int sysfs_stat(vnode_t *v, vfs_stat_t *st) {
     if (!st) return 0;
     memset(st, 0, sizeof(*st));
     sysfs_node_t *sn = (sysfs_node_t *)v->fs_data;
+    st->dev  = v->fsi ? v->fsi->dev_id : 0;
     st->mode = v->mode;
     st->ino = v->ino;
     if (sn && (sn->type == SYS_FILE_PCI_UEVENT ||
