@@ -150,3 +150,10 @@ blkdev_t *blkdev_partition_create(blkdev_t *parent, const char *name,
     }
     return dev;
 }
+
+/* ── Language-addon helpers ──────────────────────────────────────────────── */
+/* Called by the Zig addon (libexo_zig.a) to read dev->name without exposing
+ * the full blkdev_t layout through an opaque pointer. */
+const char *blkdev_get_name(const blkdev_t *dev) {
+    return dev ? dev->name : "";
+}

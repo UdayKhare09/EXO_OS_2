@@ -87,3 +87,8 @@ int blkdev_flush(blkdev_t *dev);
  * Returns the new blkdev_t* or NULL on failure. */
 blkdev_t *blkdev_partition_create(blkdev_t *parent, const char *name,
                                   uint64_t lba_start, uint64_t lba_end);
+
+/* Return the ASCII name of `dev` (the name[32] field).
+ * Provided so language addons (Zig, Rust) can access the name without
+ * knowing the full blkdev_t layout. */
+const char *blkdev_get_name(const blkdev_t *dev);

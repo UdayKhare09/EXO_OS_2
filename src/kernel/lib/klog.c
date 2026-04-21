@@ -94,3 +94,19 @@ void klog_error(const char *fmt, ...) {
 void klog_debug(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt); klog_vprint(fmt, ap); va_end(ap);
 }
+
+/* ── Language-addon helper ───────────────────────────────────────────────── */
+/* Called by libexo_zig.a and libexo_rust.a — they cannot use variadic C     */
+/* functions, so they pass pre-formatted strings here instead.                */
+static const char *const level_prefix[] = { "[E] ", "[W] ", "[I] ", "[D] " };
+
+void klog_write_str(int level, const char *msg) {
+    const char *pfx = (level >= 0 && level <= 3) ? level_prefix[level] : "[?] ";
+    klog_acquire();
+    serial_puts(pfx);
+    serial_puts(msg);
+    ring_write(pfx);
+    ring_write(msg);
+    if (g_write_fn) { g_write_fn(pfx); g_write_fn(msg); }
+    klog_release();
+}

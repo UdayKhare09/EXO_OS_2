@@ -1,7 +1,7 @@
 # EXO_OS Root Makefile
 # Limine 8 (UEFI) bootloader — GPT disk image with three partitions:
 #   p1: EFI System (FAT32, 64 MiB)  → /boot
-#   p2: Linux Root (ext2)            → /
+#   p2: Linux Root (ext4)            → /
 #   p3: Linux Data (ext2)            → /mnt
 
 MAKEFLAGS += --no-builtin-rules
@@ -71,13 +71,22 @@ OBJCOPY := llvm-objcopy
 TARGET_TRIPLE := x86_64-unknown-elf
 
 # ── Rust addon ────────────────────────────────────────────────────────────────
-# src/rust/ is a no_std staticlib that adds Rust components to the kernel.
-# It is compiled for x86_64-unknown-none (bare-metal, kernel code model).
+# src/rust/ is a no_std staticlib compiled for x86_64-unknown-none.
 RUST_CRATE_DIR  := src/rust
 RUST_TARGET_DIR := $(BUILD_DIR)/rust-target
 RUST_PROFILE    := release
 RUST_TARGET     := x86_64-unknown-none
 RUST_LIB        := $(RUST_TARGET_DIR)/$(RUST_TARGET)/$(RUST_PROFILE)/libexo_rust.a
+
+# ── Zig addon ─────────────────────────────────────────────────────────────────
+# src/zig/ is a freestanding staticlib compiled by zig build.
+# It replaces fs/gpt.c — the GPT parser is now implemented in src/zig/src/gpt.zig.
+# ZIG_GLOBAL_CACHE_DIR is redirected into build/ to keep the tree clean.
+ZIG_CRATE_DIR  := src/zig
+ZIG_OUT_DIR    := $(BUILD_DIR)/zig-out
+ZIG_CACHE_DIR  := $(BUILD_DIR)/zig-cache
+ZIG_LIB        := $(ZIG_OUT_DIR)/lib/libexo_zig.a
+
 SRC_DIR  := src/kernel
 ARCH_DIR := $(SRC_DIR)/arch/x86_64
 
@@ -112,9 +121,10 @@ LDFLAGS := \
     -T $(SRC_DIR)/linker.ld
 
 # ── Sources & objects ─────────────────────────────────────────────────────────
-# Path helpers are now implemented in src/rust/src/path.rs and exported from
-# libexo_rust.a, so the legacy C implementation is intentionally deleted and not globbed here.
-C_SRCS    := $(shell find $(SRC_DIR) -name '*.c')
+# Exclusions:
+#   fs/path.c  — replaced by src/rust/src/path.rs   → libexo_rust.a
+#   fs/gpt.c   — replaced by src/zig/src/gpt.zig    → libexo_zig.a
+C_SRCS    := $(filter-out $(SRC_DIR)/fs/gpt.c, $(shell find $(SRC_DIR) -name '*.c'))
 AS_SRCS   := $(shell find $(SRC_DIR) -name '*.S')
 NASM_SRCS := $(filter-out $(ARCH_DIR)/trampoline.asm, \
                  $(shell find $(SRC_DIR) -name '*.asm'))
@@ -134,7 +144,7 @@ FONT_TTF      := $(SRC_DIR)/gfx/3rdparty/font.ttf
 FONT_DATA_C   := $(BUILD_DIR)/gfx_font_data.c
 FONT_DATA_OBJ := $(BUILD_DIR)/obj/gfx_font_data.c.o
 
-ALL_OBJS := $(C_OBJS) $(AS_OBJS) $(NASM_OBJS) $(TRAMPOLINE_OBJ) $(FONT_DATA_OBJ) $(RUST_LIB)
+ALL_OBJS := $(C_OBJS) $(AS_OBJS) $(NASM_OBJS) $(TRAMPOLINE_OBJ) $(FONT_DATA_OBJ) $(RUST_LIB) $(ZIG_LIB)
 DEPS     := $(C_OBJS:.o=.d)
 -include $(DEPS)
 
@@ -275,9 +285,7 @@ $(BUILD_DIR)/obj/%.asm.o: $(SRC_DIR)/%.asm
 	$(NASM) $(NASMFLAGS) $< -o $@
 
 # ── Rust staticlib ───────────────────────────────────────────────────────────
-# cargo --manifest-path keeps the invocation hermetic: no need to cd.
-# CARGO_TARGET_DIR is set explicitly so the build artefacts land inside
-# build/ rather than src/rust/target/ (which would confuse git clean).
+# CARGO_TARGET_DIR redirected into build/ so git clean works correctly.
 $(RUST_LIB): $(shell find $(RUST_CRATE_DIR)/src -name '*.rs') $(RUST_CRATE_DIR)/Cargo.toml
 	@echo ">>> Building Rust addon ($(RUST_PROFILE))..."
 	@mkdir -p $(RUST_TARGET_DIR)
@@ -287,6 +295,19 @@ $(RUST_LIB): $(shell find $(RUST_CRATE_DIR)/src -name '*.rs') $(RUST_CRATE_DIR)/
 	        --target $(RUST_TARGET) \
 	        -q
 	@echo ">>> Rust addon built: $@"
+
+# ── Zig staticlib ────────────────────────────────────────────────────────────
+# ZIG_GLOBAL_CACHE_DIR redirected into build/ to avoid polluting ~/.cache/zig.
+# Output lands in $(ZIG_OUT_DIR)/lib/libexo_zig.a (set by build.zig installArtifact).
+$(ZIG_LIB): $(shell find $(ZIG_CRATE_DIR)/src -name '*.zig') $(ZIG_CRATE_DIR)/build.zig
+	@echo ">>> Building Zig addon..."
+	@mkdir -p $(ZIG_OUT_DIR) $(ZIG_CACHE_DIR)
+	ZIG_GLOBAL_CACHE_DIR=$(abspath $(ZIG_CACHE_DIR)) \
+	    zig build \
+	        --build-file $(abspath $(ZIG_CRATE_DIR)/build.zig) \
+	        --prefix $(abspath $(ZIG_OUT_DIR)) \
+	        --cache-dir $(abspath $(ZIG_CACHE_DIR))
+	@echo ">>> Zig addon built: $@"
 
 $(KERNEL_ELF): $(ALL_OBJS)
 	@echo ">>> Linking kernel..."

@@ -24,6 +24,11 @@ void serial_puts(const char *s);
  * Set to NULL to disable. Called with the formatted string after serial. */
 void klog_set_write_fn(void (*fn)(const char *s));
 
+/* Plain-string logger for language addons (Zig, Rust) that cannot call variadic C functions.
+ * Writes `msg` directly through the same pipeline as klog_warn/klog_info.
+ * `level`: 0=error  1=warn  2=info  3=debug */
+void klog_write_str(int level, const char *msg);
+
 /* ── Ring buffer (dmesg) ─────────────────────────────────────────────────── */
 /* Returns a pointer to the internal ring buffer and its size.
  * The caller must not free the pointer.
