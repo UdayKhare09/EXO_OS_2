@@ -9,7 +9,7 @@ The project currently includes:
 - Device and platform support: AHCI, virtio-blk, virtio-net, e1000, xHCI USB, framebuffer console
 - Networking stack: Ethernet, ARP, IPv4, ICMP, UDP, TCP, AF_UNIX sockets
 - Linux-style credentials/capabilities and permission model (in progress toward broader parity)
-- A minimal userspace rootfs with musl-linked binaries, BusyBox shell, login init, and setuid `su`
+- A minimal ext2 rootfs with staged host userspace tools, glibc runtime support, login init, and setuid `su`
 
 ---
 
@@ -82,7 +82,7 @@ You need a Linux host with at least:
 - OVMF files:
   - `/usr/share/edk2/x64/OVMF_CODE.4m.fd`
   - `/usr/share/edk2/x64/OVMF_VARS.4m.fd`
-- musl toolchain headers/libs under `/usr/lib/musl` (or override `MUSL_*` vars)
+- `gcc`/glibc runtime pieces available on the host (`libc.so.6`, `ld-linux-x86-64.so.2`, headers, binutils)
 
 ---
 

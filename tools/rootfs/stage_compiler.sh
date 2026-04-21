@@ -31,10 +31,10 @@ mkdir -p \
     "${COMPILER_INC_DIR}/sys-include" \
     "${COMPILER_INC_DIR}/exo-include"
 
-# Glibc extras (CRT objects + linker stubs) go to a separate staging dir
-# so the debugfs emit can write them to /usr/lib/ (not the GCC libdir).
-GLIBC_EXT_DIR="$(dirname "${COMPILER_BIN_DIR}")/glibc-ext"
-mkdir -p "${GLIBC_EXT_DIR}"
+# Runtime linker extras (CRT objects + linker stubs) go to a separate staging
+# dir so the debugfs emit can write them to /usr/lib/ (not the GCC libdir).
+RUNTIME_EXT_DIR="$(dirname "${COMPILER_BIN_DIR}")/runtime-ext"
+mkdir -p "${RUNTIME_EXT_DIR}"
 
 # ── 1. User-facing compiler + binutils binaries ──────────────────────────────
 echo "  [1/6] Staging compiler driver + binutils binaries..."
@@ -90,15 +90,15 @@ done
 # GCC calls ld with bare filenames like Scrt1.o / crti.o / crtn.o which ld
 # resolves via its default library search path (/usr/lib).  The .so files here
 # are GNU ld linker scripts (not ELFs) that point to the actual .so.N libraries
-# already staged by the main GLIBC_RUNTIME loop.
+# already staged by the main runtime-lib staging loop.
 echo "  [3b/6] Staging glibc CRT objects + linker stubs (→ /usr/lib/)..."
 for f in Scrt1.o crt1.o crti.o crtn.o; do
-    [ -f "/usr/lib/${f}" ] && cp "/usr/lib/${f}" "${GLIBC_EXT_DIR}/${f}"
+    [ -f "/usr/lib/${f}" ] && cp "/usr/lib/${f}" "${RUNTIME_EXT_DIR}/${f}"
 done
 for f in libc.so libm.so libgcc_s.so; do
-    [ -f "/usr/lib/${f}" ] && cp "/usr/lib/${f}" "${GLIBC_EXT_DIR}/${f}"
+    [ -f "/usr/lib/${f}" ] && cp "/usr/lib/${f}" "${RUNTIME_EXT_DIR}/${f}"
 done
-[ -f /usr/lib/libc_nonshared.a ] && cp /usr/lib/libc_nonshared.a "${GLIBC_EXT_DIR}/libc_nonshared.a"
+[ -f /usr/lib/libc_nonshared.a ] && cp /usr/lib/libc_nonshared.a "${RUNTIME_EXT_DIR}/libc_nonshared.a"
 
 # ── 4. GCC internal includes ──────────────────────────────────────────────────
 echo "  [4/6] Staging GCC internal headers..."
@@ -175,7 +175,7 @@ for f in "${COMPILER_INT_DIR}"/*; do
 done
 
 # Glibc CRT objects + linker stubs → usr/lib/
-for f in "${GLIBC_EXT_DIR}"/*; do
+for f in "${RUNTIME_EXT_DIR}"/*; do
     [ -f "${f}" ] || continue
     n=$(basename "${f}")
     echo "write ${f} usr/lib/${n}" >> "${COMPILER_DBG_CMDS}"

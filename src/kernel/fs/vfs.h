@@ -372,7 +372,7 @@ vnode_t *vfs_alloc_vnode(void);
  */
 file_t *vfs_open(const char *path, int flags, uint32_t mode);
 
-/* ── Path utilities (path.c) ─────────────────────────────────────────────── */
+/* ── Path utilities (implemented in Rust path.rs) ────────────────────────── */
 
 /* Normalise absolute path (collapse ".", "..", "//"). Returns 0 or errno.
  * `out` must be at least VFS_MOUNT_PATH_MAX bytes. */

@@ -4,6 +4,8 @@
 #   p2: Linux Root (ext2)            → /
 #   p3: Linux Data (ext2)            → /mnt
 
+MAKEFLAGS += --no-builtin-rules
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 ARCH      := x86_64
 BUILD_DIR := build
@@ -98,9 +100,9 @@ LDFLAGS := \
     -T $(SRC_DIR)/linker.ld
 
 # ── Sources & objects ─────────────────────────────────────────────────────────
-# fs/path.c is excluded: path_normalize / path_join / path_dirname / path_basename
-# are now implemented in src/rust/src/path.rs and exported from libexo_rust.a.
-C_SRCS    := $(filter-out $(SRC_DIR)/fs/path.c, $(shell find $(SRC_DIR) -name '*.c'))
+# Path helpers are now implemented in src/rust/src/path.rs and exported from
+# libexo_rust.a, so the legacy C implementation is intentionally deleted and not globbed here.
+C_SRCS    := $(shell find $(SRC_DIR) -name '*.c')
 AS_SRCS   := $(shell find $(SRC_DIR) -name '*.S')
 NASM_SRCS := $(filter-out $(ARCH_DIR)/trampoline.asm, \
                  $(shell find $(SRC_DIR) -name '*.asm'))
@@ -124,7 +126,7 @@ ALL_OBJS := $(C_OBJS) $(AS_OBJS) $(NASM_OBJS) $(TRAMPOLINE_OBJ) $(FONT_DATA_OBJ)
 DEPS     := $(C_OBJS:.o=.d)
 -include $(DEPS)
 
-# ── glibc userspace dynamic binaries ────────────────────────────────────────
+# ── Production userspace staging ─────────────────────────────────────────────
 USER_CC      ?= gcc
 USER_LINKER  ?= /lib64/ld-linux-x86-64.so.2
 GLIBC_LIBC   ?= $(shell gcc -print-file-name=libc.so.6 2>/dev/null)
@@ -134,20 +136,20 @@ GLIBC_LIBPTHREAD ?= $(shell ldconfig -p 2>/dev/null | awk '/libpthread\.so\.0 .*
 GLIBC_LD_SO      ?= $(shell ldconfig -p 2>/dev/null | awk '/ld-linux-x86-64\.so\.2/{print $$NF; exit}')
 GLIBC_LIBCRYPT   ?= $(shell ldconfig -p 2>/dev/null | awk '/libcrypt\.so\.2 .*x86-64/{print $$NF; exit}; /libcrypt\.so\.1 .*x86-64/{print $$NF; exit}')
 
-GLIBC_SMOKE_DIR      := $(BUILD_DIR)/glibc-test
-GLIBC_RUNTIME_DIR    := $(GLIBC_SMOKE_DIR)/lib
-GLIBC_RUNTIME_STAMP  := $(GLIBC_RUNTIME_DIR)/.stamp
-GLIBC_DEPS_STAMP     := $(GLIBC_SMOKE_DIR)/.deps-stamp
+ROOTFS_STAGE_DIR     := $(BUILD_DIR)/rootfs-prod
+RUNTIME_LIB_DIR      := $(ROOTFS_STAGE_DIR)/runtime-lib
+RUNTIME_LIB_STAMP    := $(RUNTIME_LIB_DIR)/.stamp
+RUNTIME_DEPS_STAMP   := $(ROOTFS_STAGE_DIR)/.deps-stamp
 
 # ── GCC compiler (host copy staged into rootfs) ──────────────────────────────
 GCC_VERSION  := $(shell gcc -dumpversion 2>/dev/null)
 GCC_TRIPLET  := $(shell gcc -dumpmachine 2>/dev/null)
 GCC_LIBDIR   := $(shell dirname $$(gcc -print-libgcc-file-name 2>/dev/null))
 
-COMPILER_BIN_DIR  := $(GLIBC_SMOKE_DIR)/compiler-bin
-COMPILER_INT_DIR  := $(GLIBC_SMOKE_DIR)/compiler-int
-COMPILER_INC_DIR  := $(GLIBC_SMOKE_DIR)/compiler-inc
-COMPILER_DBG_CMDS := $(GLIBC_SMOKE_DIR)/compiler-debugfs-cmds.txt
+COMPILER_BIN_DIR  := $(ROOTFS_STAGE_DIR)/compiler-bin
+COMPILER_INT_DIR  := $(ROOTFS_STAGE_DIR)/compiler-int
+COMPILER_INC_DIR  := $(ROOTFS_STAGE_DIR)/compiler-inc
+COMPILER_DBG_CMDS := $(ROOTFS_STAGE_DIR)/compiler-debugfs-cmds.txt
 COMPILER_STAMP    := $(COMPILER_BIN_DIR)/.stamp
 
 # ── Coreutils + shell from host ──────────────────────────────────────────────
@@ -156,13 +158,23 @@ HOST_CORE_BINS := ls cat echo cp mv rm mkdir chmod ln pwd env id whoami \
                   grep sed awk sort head tail wc cut tr date uname find xargs \
                   true false test stat touch sleep kill ps clear which poweroff reboot \
                   fish ssh ping dig vi vim nano less curl git wget tar unzip zip
-COREUTILS_DIR   := $(GLIBC_SMOKE_DIR)/coreutils
+COREUTILS_DIR   := $(ROOTFS_STAGE_DIR)/coreutils
 COREUTILS_STAMP := $(COREUTILS_DIR)/.stamp
 
 # ── External binaries (configured in script) ─────────────────────────────────
 EXTERNAL_BIN_LIST_SH := tools/rootfs/external_bins.sh
-EXTERNAL_BIN_DIR     := $(GLIBC_SMOKE_DIR)/external-bin
+EXTERNAL_BIN_DIR     := $(ROOTFS_STAGE_DIR)/external-bin
 EXTERNAL_BIN_STAMP   := $(EXTERNAL_BIN_DIR)/.stamp
+
+USERSPACE_STAGE_INPUTS = $(COREUTILS_STAMP) $(EXTERNAL_BIN_STAMP) $(INIT_BIN) $(SU_BIN) $(COMPILER_STAMP)
+ROOTFS_DIRS := \
+	dev tmp boot proc sys sys/bus sys/bus/usb sys/bus/usb/devices sys/bus/pci \
+	sys/bus/pci/devices home home/root home/uday \
+	etc etc/ssl etc/ssl/certs \
+	bin lib lib/x86_64-linux-gnu lib64 \
+	usr usr/bin usr/sbin usr/lib usr/lib/x86_64-linux-gnu \
+	usr/include usr/share usr/share/terminfo usr/share/terminfo/l \
+	sbin var run mnt dev/shm
 
 # ── rootfs config files ──────────────────────────────────────────────
 ROOTFS_NSSWITCH := tools/rootfs/nsswitch.conf
@@ -268,33 +280,33 @@ $(KERNEL_ELF): $(ALL_OBJS)
 	@echo ">>> Linking kernel..."
 	$(LD) $(LDFLAGS) $^ -o $@
 
-# ── glibc dynamic binaries and setup ────────────────────────────────────────
-$(GLIBC_RUNTIME_STAMP):
+# ── Runtime libraries and setup ─────────────────────────────────────────────
+$(RUNTIME_LIB_STAMP):
 	@test -f "$(GLIBC_LIBC)" || (echo "Missing glibc: run 'apt install gcc' or set GLIBC_LIBC"; exit 1)
 	@test -f "$(GLIBC_LD_SO)" || (echo "Missing dynamic linker: $(GLIBC_LD_SO)"; exit 1)
 	@test -f "$(GLIBC_LIBCRYPT)" || (echo "Missing libcrypt: $(GLIBC_LIBCRYPT)"; exit 1)
-	@mkdir -p $(GLIBC_RUNTIME_DIR)
-	cp $(GLIBC_LIBC)      $(GLIBC_RUNTIME_DIR)/libc.so.6
-	cp $(GLIBC_LIBM)      $(GLIBC_RUNTIME_DIR)/libm.so.6
+	@mkdir -p $(RUNTIME_LIB_DIR)
+	cp $(GLIBC_LIBC)      $(RUNTIME_LIB_DIR)/libc.so.6
+	cp $(GLIBC_LIBM)      $(RUNTIME_LIB_DIR)/libm.so.6
 	@if [ -n "$(GLIBC_LIBDL)" ] && [ -f "$(GLIBC_LIBDL)" ]; then \
-		cp $(GLIBC_LIBDL) $(GLIBC_RUNTIME_DIR)/libdl.so.2; \
+		cp $(GLIBC_LIBDL) $(RUNTIME_LIB_DIR)/libdl.so.2; \
 	else \
-		cp $(GLIBC_LIBC)  $(GLIBC_RUNTIME_DIR)/libdl.so.2; \
+		cp $(GLIBC_LIBC)  $(RUNTIME_LIB_DIR)/libdl.so.2; \
 	fi
 	@if [ -n "$(GLIBC_LIBPTHREAD)" ] && [ -f "$(GLIBC_LIBPTHREAD)" ]; then \
-		cp $(GLIBC_LIBPTHREAD) $(GLIBC_RUNTIME_DIR)/libpthread.so.0; \
+		cp $(GLIBC_LIBPTHREAD) $(RUNTIME_LIB_DIR)/libpthread.so.0; \
 	else \
-		cp $(GLIBC_LIBC)       $(GLIBC_RUNTIME_DIR)/libpthread.so.0; \
+		cp $(GLIBC_LIBC)       $(RUNTIME_LIB_DIR)/libpthread.so.0; \
 	fi
-	cp $(GLIBC_LD_SO)     $(GLIBC_RUNTIME_DIR)/ld-linux-x86-64.so.2
-	cp $(GLIBC_LIBCRYPT)  $(GLIBC_RUNTIME_DIR)/libcrypt.so.2
+	cp $(GLIBC_LD_SO)     $(RUNTIME_LIB_DIR)/ld-linux-x86-64.so.2
+	cp $(GLIBC_LIBCRYPT)  $(RUNTIME_LIB_DIR)/libcrypt.so.2
 	@touch $@
 
 $(COREUTILS_STAMP):
 	@HOST_CORE_BINS="$(HOST_CORE_BINS)" HOST_SHELL="$(HOST_SHELL)" \
 		COREUTILS_DIR="$(COREUTILS_DIR)" sh tools/rootfs/stage_bins.sh
 
-$(COMPILER_STAMP): $(GLIBC_RUNTIME_STAMP) tools/rootfs/stage_compiler.sh
+$(COMPILER_STAMP): $(RUNTIME_LIB_STAMP) tools/rootfs/stage_compiler.sh
 	@GCC_VERSION="$(GCC_VERSION)" GCC_TRIPLET="$(GCC_TRIPLET)" \
 		GCC_LIBDIR="$(GCC_LIBDIR)" \
 		COMPILER_BIN_DIR="$(COMPILER_BIN_DIR)" \
@@ -342,42 +354,36 @@ $(EFI_IMG): $(KERNEL_ELF) $(LIMINE_DIR)/limine.h
 	mcopy -i $@ src/boot/limine.conf       ::/boot/limine/limine.conf
 
 # ── Root partition (ext2, no root needed — debugfs) ───────────────────────────
-# Auto-discover all transitive .so deps of every staged binary and copy to GLIBC_RUNTIME_DIR
-$(GLIBC_DEPS_STAMP): $(GLIBC_RUNTIME_STAMP) $(COREUTILS_STAMP) $(EXTERNAL_BIN_STAMP) $(INIT_BIN) $(SU_BIN) $(COMPILER_STAMP)
+# Auto-discover all transitive .so deps of every staged binary and copy to the
+# production runtime-lib staging directory.
+$(RUNTIME_DEPS_STAMP): $(RUNTIME_LIB_STAMP) $(USERSPACE_STAGE_INPUTS)
 	@echo ">>> Auto-discovering shared library dependencies..."
-	@find $(COREUTILS_DIR) $(EXTERNAL_BIN_DIR) $(COMPILER_BIN_DIR) $(COMPILER_INT_DIR) \
-	     -maxdepth 1 -type f 2>/dev/null > /tmp/exo_bins.txt; \
-	 for b in $(INIT_BIN) $(SU_BIN); do [ -f "$$b" ] && echo "$$b"; done >> /tmp/exo_bins.txt; \
-	 xargs -r ldd < /tmp/exo_bins.txt 2>/dev/null \
+	@bins_file="$(ROOTFS_STAGE_DIR)/runtime-deps.txt"; \
+	 find $(COREUTILS_DIR) $(EXTERNAL_BIN_DIR) $(COMPILER_BIN_DIR) $(COMPILER_INT_DIR) \
+	     -maxdepth 1 -type f 2>/dev/null > "$$bins_file"; \
+	 for b in $(INIT_BIN) $(SU_BIN); do [ -f "$$b" ] && echo "$$b"; done >> "$$bins_file"; \
+	 xargs -r ldd < "$$bins_file" 2>/dev/null \
 	 | awk '/=> \//{print $$3}' | sort -u \
-	 | while read so; do \
+	 | while read -r so; do \
 		 [ -f "$$so" ] || continue; \
 		 name=$$(basename "$$so"); \
-		 dest="$(GLIBC_RUNTIME_DIR)/$$name"; \
+		 dest="$(RUNTIME_LIB_DIR)/$$name"; \
 		 [ -f "$$dest" ] || { echo "  staging $$name"; cp "$$so" "$$dest"; }; \
 	   done
 	@touch $@
 
-$(ROOT_IMG): $(GLIBC_DEPS_STAMP) $(COREUTILS_STAMP) $(EXTERNAL_BIN_STAMP) $(INIT_BIN) $(SU_BIN) $(COMPILER_STAMP) \
+$(ROOT_IMG): $(RUNTIME_DEPS_STAMP) $(USERSPACE_STAGE_INPUTS) \
              $(ROOTFS_PROFILE) $(ROOTFS_ENV_FILE) $(ROOTFS_PASSWD) $(ROOTFS_SHADOW) \
              $(ROOTFS_GROUP) $(ROOTFS_RESOLV) $(ROOTFS_NSSWITCH) $(ROOTFS_LD_CONF)
 	@echo ">>> Building root partition (ext2)..."
 	dd if=/dev/zero of=$@ bs=512 count=$(ROOT_SECTORS) 2>/dev/null
 	mkfs.ext2 -q -L "EXOOS_ROOT" -b 4096 $@
-	$(foreach d, dev tmp boot proc sys sys/bus sys/bus/usb sys/bus/usb/devices sys/bus/pci \
-		sys/bus/pci/devices home home/root home/uday \
-		etc etc/ssl etc/ssl/certs \
-		bin lib lib/x86_64-linux-gnu lib64 \
-		usr usr/bin usr/sbin usr/lib usr/lib/x86_64-linux-gnu \
-		usr/include \
-		usr/share usr/share/terminfo usr/share/terminfo/l \
-		sbin var run mnt dev/shm, \
-		debugfs -w -R "mkdir $(d)" $@ 2>/dev/null || true ;)
+	$(foreach d,$(ROOTFS_DIRS),debugfs -w -R "mkdir $(d)" $@ 2>/dev/null || true ;)
 	@# ── glibc runtime + all auto-discovered .so deps ──────────────────────────
-	@# Writes every .so in GLIBC_RUNTIME_DIR to lib/x86_64-linux-gnu/, lib/, and
+	@# Writes every .so in RUNTIME_LIB_DIR to lib/x86_64-linux-gnu/, lib/, and
 	@# usr/lib/ so ld-linux finds deps regardless of /etc/ld.so.cache presence.
 	@# ld-linux itself also lands in lib64/ (canonical PT_INTERP path).
-	@for so in $(GLIBC_RUNTIME_DIR)/*.so*; do \
+	@for so in $(RUNTIME_LIB_DIR)/*.so*; do \
 		[ -f "$$so" ] || continue; \
 		n=$$(basename "$$so"); \
 		case "$$n" in \
@@ -476,7 +482,7 @@ clean:
 	rm -rf $(BUILD_DIR)/obj $(KERNEL_ELF) $(DISK_IMG) \
 		   $(EFI_IMG) $(ROOT_IMG) $(DATA_IMG) $(BUILD_DIR)/limine.h \
 		   $(FONT_DATA_C) $(FONT_DATA_OBJ) $(OVMF_VARS) \
-		   $(GLIBC_SMOKE_DIR) $(RUST_TARGET_DIR)
+		   $(ROOTFS_STAGE_DIR) $(RUST_TARGET_DIR)
 
 distclean:
 	rm -rf $(BUILD_DIR)
