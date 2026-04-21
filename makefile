@@ -16,6 +16,15 @@ KERNEL_ELF := $(BUILD_DIR)/exo.elf
 
 comma := ,
 
+define alloc_image
+	@size_bytes=$$(( $(1) * 512 )); \
+	if command -v fallocate >/dev/null 2>&1; then \
+		fallocate -l $$size_bytes $@; \
+	else \
+		truncate -s $$size_bytes $@; \
+	fi
+endef
+
 # ── Limine ────────────────────────────────────────────────────────────────────
 LIMINE_TAG  := v8.x-binary
 LIMINE_REPO := https://github.com/limine-bootloader/limine.git
@@ -35,6 +44,9 @@ ROOT_END      := $(shell echo $$(($(ROOT_START) + $(ROOT_SECTORS) - 1)))
 DATA_START    := $(shell echo $$(($(ROOT_END) + 1)))
 DATA_END      := $(shell echo $$((($(DISK_SIZE_MB) * 2048) - 34)))
 DATA_SECTORS  := $(shell echo $$(($(DATA_END) - $(DATA_START) + 1)))
+EFI_START_MIB := $(shell echo $$(($(EFI_START) / 2048)))
+ROOT_START_MIB := $(shell echo $$(($(ROOT_START) / 2048)))
+DATA_START_MIB := $(shell echo $$(($(DATA_START) / 2048)))
 
 EFI_IMG  := $(BUILD_DIR)/efi.img
 ROOT_IMG := $(BUILD_DIR)/root.img
@@ -346,7 +358,7 @@ $(SU_BIN): $(SU_SRC)
 # ── EFI partition (FAT32, no root needed — mtools) ────────────────────────────
 $(EFI_IMG): $(KERNEL_ELF) $(LIMINE_DIR)/limine.h
 	@echo ">>> Building EFI partition (FAT32, $(EFI_SECTORS) sectors)..."
-	dd if=/dev/zero of=$@ bs=512 count=$(EFI_SECTORS) 2>/dev/null
+	$(call alloc_image,$(EFI_SECTORS))
 	mkfs.fat -F 32 -n "EFI" $@ >/dev/null
 	mmd   -i $@ ::/EFI ::/EFI/BOOT ::/boot ::/boot/limine
 	mcopy -i $@ $(LIMINE_DIR)/BOOTX64.EFI  ::/EFI/BOOT/BOOTX64.EFI
@@ -376,7 +388,7 @@ $(ROOT_IMG): $(RUNTIME_DEPS_STAMP) $(USERSPACE_STAGE_INPUTS) \
              $(ROOTFS_PROFILE) $(ROOTFS_ENV_FILE) $(ROOTFS_PASSWD) $(ROOTFS_SHADOW) \
              $(ROOTFS_GROUP) $(ROOTFS_RESOLV) $(ROOTFS_NSSWITCH) $(ROOTFS_LD_CONF)
 	@echo ">>> Building root partition (ext2)..."
-	dd if=/dev/zero of=$@ bs=512 count=$(ROOT_SECTORS) 2>/dev/null
+	$(call alloc_image,$(ROOT_SECTORS))
 	mkfs.ext2 -q -L "EXOOS_ROOT" -b 4096 $@
 	$(foreach d,$(ROOTFS_DIRS),debugfs -w -R "mkdir $(d)" $@ 2>/dev/null || true ;)
 	@# ── glibc runtime + all auto-discovered .so deps ──────────────────────────
@@ -450,20 +462,24 @@ $(ROOT_IMG): $(RUNTIME_DEPS_STAMP) $(USERSPACE_STAGE_INPUTS) \
 # ── Data partition (ext2) ─────────────────────────────────────────────────────
 $(DATA_IMG):
 	@echo ">>> Building data partition (ext2)..."
-	dd if=/dev/zero of=$@ bs=512 count=$(DATA_SECTORS) 2>/dev/null
+	$(call alloc_image,$(DATA_SECTORS))
 	mkfs.ext2 -q -L "EXOOS_DATA" -b 4096 $@
 
 # ── GPT disk image ────────────────────────────────────────────────────────────
 $(DISK_IMG): $(EFI_IMG) $(ROOT_IMG) $(DATA_IMG)
 	@echo ">>> Assembling $(DISK_SIZE_MB) MiB GPT disk image..."
-	dd if=/dev/zero of=$@ bs=1M count=$(DISK_SIZE_MB) 2>/dev/null
+	@if command -v fallocate >/dev/null 2>&1; then \
+		fallocate -l $(DISK_SIZE_MB)M $@; \
+	else \
+		truncate -s $(DISK_SIZE_MB)M $@; \
+	fi
 	sgdisk -Z $@ >/dev/null 2>&1
 	sgdisk -n 1:$(EFI_START):$(EFI_END) -t 1:ef00 -c 1:"EFI System" $@ >/dev/null
 	sgdisk -n 2:$(ROOT_START):$(ROOT_END) -t 2:8300 -c 2:"Linux Root"  $@ >/dev/null
 	sgdisk -n 3:$(DATA_START):$(DATA_END) -t 3:8300 -c 3:"Linux Data"  $@ >/dev/null
-	dd if=$(EFI_IMG)  of=$@ bs=512 seek=$(EFI_START)  conv=notrunc 2>/dev/null
-	dd if=$(ROOT_IMG) of=$@ bs=512 seek=$(ROOT_START) conv=notrunc 2>/dev/null
-	dd if=$(DATA_IMG) of=$@ bs=512 seek=$(DATA_START) conv=notrunc 2>/dev/null
+	dd if=$(EFI_IMG)  of=$@ bs=1M seek=$(EFI_START_MIB)  conv=notrunc status=none
+	dd if=$(ROOT_IMG) of=$@ bs=1M seek=$(ROOT_START_MIB) conv=notrunc status=none
+	dd if=$(DATA_IMG) of=$@ bs=1M seek=$(DATA_START_MIB) conv=notrunc status=none
 	@echo ">>> Disk image ready: $@"
 
 # ── OVMF vars (writable per-VM copy) ─────────────────────────────────────────
