@@ -1,0 +1,21 @@
+[package]
+name        = "exo_rust"
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["EXO_OS contributors"]
+description = "Rust components for the EXO_OS kernel (bare-metal, no_std)"
+
+# Emit a C-compatible static archive so ld.lld can link it into exo.elf
+[lib]
+name       = "exo_rust"
+crate-type = ["staticlib"]
+
+[profile.release]
+opt-level       = 2
+debug           = true   # keep DWARF — gdb usable via run-debug
+lto             = false  # thin LTO off: avoids llvm-ar version skew with clang
+panic           = "abort" # matches kernel: no unwinding runtime
+codegen-units   = 1
+
+[profile.dev]
+panic = "abort"

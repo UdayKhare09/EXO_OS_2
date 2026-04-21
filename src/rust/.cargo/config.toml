@@ -1,0 +1,24 @@
+# .cargo/config.toml — per-crate Cargo configuration
+# Applied automatically whenever Cargo is invoked from src/rust/ or with
+# --manifest-path src/rust/Cargo.toml.
+
+[build]
+# Always compile for the bare-metal x86_64 target (no OS, no libc, no std).
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+# Mirror the kernel CFLAGS: kernel model, no red-zone, SSE enabled.
+# rustflags are appended to every rustc invocation for this target.
+rustflags = [
+    # Match the kernel code model so the linker can merge .o files correctly.
+    "-C", "code-model=kernel",
+
+    # The kernel explicitly disables the red-zone (interrupt handlers assume
+    # the stack pointer is always valid). Without this flag a Rust function
+    # called from the kernel could corrupt the interrupt frame.
+    "-C", "target-feature=+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,\
++avx,+avx2,+f16c,+fma,+aes,+pclmul,+popcnt,+bmi1,+bmi2,+lzcnt,-red-zone",
+
+    # No position-independent code (matches -fno-PIC in CFLAGS).
+    "-C", "relocation-model=static",
+]

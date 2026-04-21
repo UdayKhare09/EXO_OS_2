@@ -23,3 +23,14 @@ void kpanic(const char *fmt, ...) {
     __asm__ volatile("cli");
     for (;;) __asm__ volatile("hlt");
 }
+
+/* kpanic_halt — no-argument halt entry point used by the Rust panic handler.
+ * Rust cannot call kpanic() directly (variadic C ABI is unsafe/complex from
+ * Rust's perspective), so the #[panic_handler] in src/rust/src/panic.rs calls
+ * this thin wrapper instead. */
+__attribute__((noreturn))
+void kpanic_halt(void) {
+    klog_error("\n\n*** KERNEL PANIC (Rust) ***\n  System halted.\n");
+    __asm__ volatile("cli");
+    for (;;) __asm__ volatile("hlt");
+}

@@ -55,6 +55,15 @@ NASM    := nasm
 OBJCOPY := llvm-objcopy
 
 TARGET_TRIPLE := x86_64-unknown-elf
+
+# ── Rust addon ────────────────────────────────────────────────────────────────
+# src/rust/ is a no_std staticlib that adds Rust components to the kernel.
+# It is compiled for x86_64-unknown-none (bare-metal, kernel code model).
+RUST_CRATE_DIR  := src/rust
+RUST_TARGET_DIR := $(BUILD_DIR)/rust-target
+RUST_PROFILE    := release
+RUST_TARGET     := x86_64-unknown-none
+RUST_LIB        := $(RUST_TARGET_DIR)/$(RUST_TARGET)/$(RUST_PROFILE)/libexo_rust.a
 SRC_DIR  := src/kernel
 ARCH_DIR := $(SRC_DIR)/arch/x86_64
 
@@ -89,7 +98,9 @@ LDFLAGS := \
     -T $(SRC_DIR)/linker.ld
 
 # ── Sources & objects ─────────────────────────────────────────────────────────
-C_SRCS    := $(shell find $(SRC_DIR) -name '*.c')
+# fs/path.c is excluded: path_normalize / path_join / path_dirname / path_basename
+# are now implemented in src/rust/src/path.rs and exported from libexo_rust.a.
+C_SRCS    := $(filter-out $(SRC_DIR)/fs/path.c, $(shell find $(SRC_DIR) -name '*.c'))
 AS_SRCS   := $(shell find $(SRC_DIR) -name '*.S')
 NASM_SRCS := $(filter-out $(ARCH_DIR)/trampoline.asm, \
                  $(shell find $(SRC_DIR) -name '*.asm'))
@@ -109,7 +120,7 @@ FONT_TTF      := $(SRC_DIR)/gfx/3rdparty/font.ttf
 FONT_DATA_C   := $(BUILD_DIR)/gfx_font_data.c
 FONT_DATA_OBJ := $(BUILD_DIR)/obj/gfx_font_data.c.o
 
-ALL_OBJS := $(C_OBJS) $(AS_OBJS) $(NASM_OBJS) $(TRAMPOLINE_OBJ) $(FONT_DATA_OBJ)
+ALL_OBJS := $(C_OBJS) $(AS_OBJS) $(NASM_OBJS) $(TRAMPOLINE_OBJ) $(FONT_DATA_OBJ) $(RUST_LIB)
 DEPS     := $(C_OBJS:.o=.d)
 -include $(DEPS)
 
@@ -238,6 +249,20 @@ $(BUILD_DIR)/obj/%.S.o: $(SRC_DIR)/%.S $(BUILD_DIR)/limine.h
 $(BUILD_DIR)/obj/%.asm.o: $(SRC_DIR)/%.asm
 	@mkdir -p $(dir $@)
 	$(NASM) $(NASMFLAGS) $< -o $@
+
+# ── Rust staticlib ───────────────────────────────────────────────────────────
+# cargo --manifest-path keeps the invocation hermetic: no need to cd.
+# CARGO_TARGET_DIR is set explicitly so the build artefacts land inside
+# build/ rather than src/rust/target/ (which would confuse git clean).
+$(RUST_LIB): $(shell find $(RUST_CRATE_DIR)/src -name '*.rs') $(RUST_CRATE_DIR)/Cargo.toml
+	@echo ">>> Building Rust addon ($(RUST_PROFILE))..."
+	@mkdir -p $(RUST_TARGET_DIR)
+	CARGO_TARGET_DIR=$(abspath $(RUST_TARGET_DIR)) \
+	    cargo build --$(RUST_PROFILE) \
+	        --manifest-path $(RUST_CRATE_DIR)/Cargo.toml \
+	        --target $(RUST_TARGET) \
+	        -q
+	@echo ">>> Rust addon built: $@"
 
 $(KERNEL_ELF): $(ALL_OBJS)
 	@echo ">>> Linking kernel..."
@@ -451,7 +476,7 @@ clean:
 	rm -rf $(BUILD_DIR)/obj $(KERNEL_ELF) $(DISK_IMG) \
 		   $(EFI_IMG) $(ROOT_IMG) $(DATA_IMG) $(BUILD_DIR)/limine.h \
 		   $(FONT_DATA_C) $(FONT_DATA_OBJ) $(OVMF_VARS) \
-		   $(GLIBC_SMOKE_DIR)
+		   $(GLIBC_SMOKE_DIR) $(RUST_TARGET_DIR)
 
 distclean:
 	rm -rf $(BUILD_DIR)
