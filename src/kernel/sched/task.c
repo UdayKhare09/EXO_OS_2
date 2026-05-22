@@ -1,4 +1,5 @@
 #include "task.h"
+#include "sched.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "mm/pagecache.h"
@@ -134,6 +135,11 @@ static task_t *task_alloc_common(const char *name, uint32_t cpu_id, int is_kthre
     /* Priority scheduler fields */
     t->priority        = 4;
     t->timeslice_ticks = 0;
+    t->start_tick      = 0;
+    t->user_ticks      = 0;
+    t->system_ticks    = 0;
+    t->nvcsw           = 0;
+    t->nivcsw          = 0;
 
     /* IPC + signal resources */
     t->sig_pending  = 0;
@@ -155,6 +161,7 @@ static task_t *task_alloc_common(const char *name, uint32_t cpu_id, int is_kthre
     t->cwd[0] = '/';
     t->cwd[1] = '\0';
     t->exe_path[0] = '\0';   /* set by execve; empty for kernel threads (linux: /proc/pid/exe unresolvable) */
+    t->start_tick = sched_get_ticks();
     task_register(t);
 
     return t;

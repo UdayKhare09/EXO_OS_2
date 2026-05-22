@@ -15,6 +15,7 @@
 #include "fs/vfs.h"
 #include "fs/fd.h"
 #include "ipc/signal.h"
+#include "lib/build_info.h"
 #include "lib/klog.h"
 #include "lib/string.h"
 #include "lib/panic.h"
@@ -130,6 +131,7 @@ int64_t sys_epoll_pwait(int epfd, epoll_event_t *events, int maxevents, int time
 int64_t sys_fork(cpu_regs_t *regs);
 int64_t sys_execve(const char *path, char *const argv[], char *const envp[]);
 int64_t sys_wait4(int pid, int *wstatus, int options, void *rusage);
+int64_t sys_waitid(int idtype, uint64_t id, void *infop, int options, void *rusage);
 int64_t sys_mmap(uint64_t addr, uint64_t len, int prot, int flags,
                  int fd, int64_t offset);
 int64_t sys_munmap(uint64_t addr, uint64_t len);
@@ -196,6 +198,11 @@ static int64_t sc_exit(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,ui
         if (cur->parent) {
             signal_send(cur->parent, SIGCHLD);
             sched_unblock(cur->parent);
+        }
+
+        if (cur->vfork_parent) {
+            sched_unblock(cur->vfork_parent);
+            cur->vfork_parent = NULL;
         }
 
         /* Write 0 to clear_child_tid and futex-wake (for threading) */
@@ -1354,10 +1361,10 @@ static int64_t sc_uname(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,u
     if (!u) return -EFAULT;
 
     memset(u, 0, sizeof(*u));
-    strncpy(u->sysname, "Linux", sizeof(u->sysname) - 1);
-    strncpy(u->nodename, "exo", sizeof(u->nodename) - 1);
-    strncpy(u->release, "0.1.0", sizeof(u->release) - 1);
-    strncpy(u->version, "EXO_OS", sizeof(u->version) - 1);
+    strncpy(u->sysname, EXO_KERNEL_NAME, sizeof(u->sysname) - 1);
+    strncpy(u->nodename, EXO_KERNEL_HOSTNAME, sizeof(u->nodename) - 1);
+    strncpy(u->release, EXO_KERNEL_RELEASE, sizeof(u->release) - 1);
+    strncpy(u->version, EXO_KERNEL_VERSION, sizeof(u->version) - 1);
     strncpy(u->machine, "x86_64", sizeof(u->machine) - 1);
     strncpy(u->domainname, "localdomain", sizeof(u->domainname) - 1);
     return 0;
@@ -1423,6 +1430,8 @@ static int64_t sc_get_robust_list(uint64_t a,uint64_t b,uint64_t c,uint64_t d,ui
 
 static int64_t sc_wait4(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
     { (void)e;(void)f; return sys_wait4((int)a,(int*)b,(int)c,(void*)d); }
+static int64_t sc_waitid(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f)
+    { (void)f; return sys_waitid((int)a, b, (void *)c, (int)d, (void *)e); }
 
 /* Fork needs the register frame to set up child's return */
 static cpu_regs_t *g_fork_regs = NULL;  /* set before dispatching fork */
@@ -1753,6 +1762,7 @@ static syscall_fn_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [SYS_EXECVE]    = sc_execve,
     [SYS_EXIT]      = sc_exit,
     [SYS_WAIT4]     = sc_wait4,
+    [SYS_WAITID]    = sc_waitid,
     [SYS_KILL]      = sc_kill,
     [SYS_UNAME]     = sc_uname,
     [SYS_TKILL]     = sc_tkill,

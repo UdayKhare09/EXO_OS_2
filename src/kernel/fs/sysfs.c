@@ -5,6 +5,7 @@
 #include "lib/string.h"
 #include "lib/klog.h"
 #include "lib/string.h"
+#include "lib/build_info.h"
 #include "drivers/storage/blkdev.h"
 #include "arch/x86_64/pci.h"
 #include "drivers/usb/usb_core.h"
@@ -349,9 +350,9 @@ static ssize_t sysfs_read(vnode_t *v, void *buf, size_t len, uint64_t off) {
     }
     if (sn->type == SYS_KERNEL_FILE) {
         switch (sn->subtype) {
-        case 0: ksnprintf(tmp,sizeof(tmp),"5.15.0\n"); break;
-        case 1: ksnprintf(tmp,sizeof(tmp),"exo\n"); break;
-        case 2: ksnprintf(tmp,sizeof(tmp),"Linux\n"); break;
+        case 0: ksnprintf(tmp,sizeof(tmp),"%s\n", EXO_KERNEL_RELEASE); break;
+        case 1: ksnprintf(tmp,sizeof(tmp),"%s\n", EXO_KERNEL_HOSTNAME); break;
+        case 2: ksnprintf(tmp,sizeof(tmp),"%s\n", EXO_KERNEL_NAME); break;
         default: return -EIO;
         }
         return sysfs_emit_text((char *)buf, len, tmp, off, len);

@@ -7,12 +7,15 @@
 #include "fs/fd.h"
 #include "mm/kmalloc.h"
 #include "lib/string.h"
+#include "lib/build_info.h"
 #include "lib/klog.h"
+#include "arch/x86_64/cpu.h"
 #include "sched/sched.h"
 #include "sched/task.h"
 #include "sched/cred.h"
 #include "mm/pmm.h"
 #include "arch/x86_64/smp.h"
+#include "arch/x86_64/rtc.h"
 #include "drivers/storage/blkdev.h"
 #include "drivers/net/netdev.h"
 #include <stdint.h>
@@ -80,6 +83,8 @@
 #define PROC_CRYPTO         57
 #define PROC_NET_FIB_TRIE   58
 #define PROC_NET_FIB_STAT   59
+#define PROC_PID_TASK_DIR   60
+#define PROC_PID_TID_DIR    61
 
 /* ── Per-vnode data ──────────────────────────────────────────────────────── */
 typedef struct {
@@ -205,9 +210,63 @@ static char proc_state_letter(task_state_t st) {
     }
 }
 
+static task_t *procfs_task_get(uint32_t tid) {
+    task_t *t = task_lookup(tid);
+    if (!t || t->state == TASK_DEAD)
+        return NULL;
+    return t;
+}
+
+static uint32_t procfs_thread_count(uint32_t tgid) {
+    uint32_t count = 0;
+    for (uint32_t i = 1; i < TASK_TABLE_SIZE; i++) {
+        task_t *t = task_get_from_table(i);
+        if (!t || t->state == TASK_DEAD)
+            continue;
+        if (t->pid == tgid)
+            count++;
+    }
+    return count ? count : 1;
+}
+
+static uint64_t procfs_group_nvcsw(uint32_t tgid) {
+    uint64_t total = 0;
+    for (uint32_t i = 1; i < TASK_TABLE_SIZE; i++) {
+        task_t *t = task_get_from_table(i);
+        if (!t || t->state == TASK_DEAD)
+            continue;
+        if (t->pid == tgid)
+            total += __atomic_load_n(&t->nvcsw, __ATOMIC_RELAXED);
+    }
+    return total;
+}
+
+static uint64_t procfs_group_nivcsw(uint32_t tgid) {
+    uint64_t total = 0;
+    for (uint32_t i = 1; i < TASK_TABLE_SIZE; i++) {
+        task_t *t = task_get_from_table(i);
+        if (!t || t->state == TASK_DEAD)
+            continue;
+        if (t->pid == tgid)
+            total += __atomic_load_n(&t->nivcsw, __ATOMIC_RELAXED);
+    }
+    return total;
+}
+
+static uint64_t procfs_task_vsize(task_t *t) {
+    uint64_t vsize = 0;
+    for (vma_t *v = t->vma_list; v; v = v->next)
+        vsize += v->end - v->start;
+    return vsize ? vsize : 16ULL * 1024 * 1024;
+}
+
+static uint64_t procfs_task_rss_pages(task_t *t) {
+    return procfs_task_vsize(t) / PAGE_SIZE / 4;
+}
+
 /* ── /proc/<pid>/status — full Linux 5.15 format ────────────────────────── */
 static ssize_t gen_status(uint32_t pid, char *buf, size_t bufsz) {
-    task_t *t = task_lookup(pid);
+    task_t *t = procfs_task_get(pid);
     if (!t) return -ESRCH;
 
     int fdcount = 0;
@@ -232,7 +291,7 @@ static ssize_t gen_status(uint32_t pid, char *buf, size_t bufsz) {
     off = PA(buf, bufsz, off, "State:\t%s\n", state_name(t->state));
     off = PA(buf, bufsz, off, "Tgid:\t%u\n", (unsigned)t->pid);
     off = PA(buf, bufsz, off, "Ngid:\t0\n");
-    off = PA(buf, bufsz, off, "Pid:\t%u\n",  (unsigned)t->pid);
+    off = PA(buf, bufsz, off, "Pid:\t%u\n",  (unsigned)t->tid);
     off = PA(buf, bufsz, off, "PPid:\t%u\n", (unsigned)t->ppid);
     off = PA(buf, bufsz, off, "TracerPid:\t0\n");
     off = PA(buf, bufsz, off, "Uid:\t%u\t%u\t%u\t%u\n",
@@ -248,7 +307,7 @@ static ssize_t gen_status(uint32_t pid, char *buf, size_t bufsz) {
         off = PA(buf, bufsz, off, " %u", (unsigned)t->cred.groups[gi]);
     off = PA(buf, bufsz, off, "\n");
     off = PA(buf, bufsz, off, "NStgid:\t%u\n", (unsigned)t->pid);
-    off = PA(buf, bufsz, off, "NSpid:\t%u\n",  (unsigned)t->pid);
+    off = PA(buf, bufsz, off, "NSpid:\t%u\n",  (unsigned)t->tid);
     off = PA(buf, bufsz, off, "NSpgid:\t%u\n", (unsigned)t->pgid);
     off = PA(buf, bufsz, off, "NSsid:\t%u\n",  (unsigned)t->sid);
     off = PA(buf, bufsz, off, "VmPeak:\t%8llu kB\n", (unsigned long long)(vm_size/1024));
@@ -269,7 +328,7 @@ static ssize_t gen_status(uint32_t pid, char *buf, size_t bufsz) {
     off = PA(buf, bufsz, off, "HugetlbPages:\t       0 kB\n");
     off = PA(buf, bufsz, off, "CoreDumping:\t0\n");
     off = PA(buf, bufsz, off, "THP_enabled:\t1\n");
-    off = PA(buf, bufsz, off, "Threads:\t1\n");
+    off = PA(buf, bufsz, off, "Threads:\t%u\n", (unsigned)procfs_thread_count(t->pid));
     off = PA(buf, bufsz, off, "SigQ:\t0/31717\n");
     char hex[20];
     fmt_hex16((uint64_t)t->sig_pending, hex);
@@ -298,14 +357,16 @@ static ssize_t gen_status(uint32_t pid, char *buf, size_t bufsz) {
     off = PA(buf, bufsz, off, "Cpus_allowed_list:\t0-%u\n", ncpu - 1);
     off = PA(buf, bufsz, off, "Mems_allowed:\t00000001\n");
     off = PA(buf, bufsz, off, "Mems_allowed_list:\t0\n");
-    off = PA(buf, bufsz, off, "voluntary_ctxt_switches:\t100\n");
-    off = PA(buf, bufsz, off, "nonvoluntary_ctxt_switches:\t50\n");
+    off = PA(buf, bufsz, off, "voluntary_ctxt_switches:\t%llu\n",
+             (unsigned long long)procfs_group_nvcsw(t->pid));
+    off = PA(buf, bufsz, off, "nonvoluntary_ctxt_switches:\t%llu\n",
+             (unsigned long long)procfs_group_nivcsw(t->pid));
     return (ssize_t)off;
 }
 
 /* ── /proc/<pid>/maps ─────────────────────────────────────────────────────── */
 static ssize_t gen_maps(uint32_t pid, char *buf, size_t bufsz) {
-    task_t *t = task_lookup(pid);
+    task_t *t = procfs_task_get(pid);
     if (!t) return -ESRCH;
 
     size_t off = 0;
@@ -342,31 +403,33 @@ static ssize_t gen_maps(uint32_t pid, char *buf, size_t bufsz) {
 
 /* ── /proc/<pid>/stat ─────────────────────────────────────────────────────── */
 static ssize_t gen_pid_stat(uint32_t pid, char *buf, size_t bufsz) {
-    task_t *t = task_lookup(pid);
+    task_t *t = procfs_task_get(pid);
     if (!t) return -ESRCH;
 
-    uint64_t ticks = sched_get_ticks();
-    uint64_t utime = ticks / 2, stime = ticks / 2;
-    uint64_t start = (ticks > 100) ? ticks - 100 : 1;
-    uint64_t vsize = 0;
-    for (vma_t *v = t->vma_list; v; v = v->next) vsize += v->end - v->start;
-    if (!vsize) vsize = 16ULL*1024*1024;
-    uint64_t rss = vsize / PAGE_SIZE / 4;
+    uint64_t utime = __atomic_load_n(&t->user_ticks, __ATOMIC_RELAXED) / 10;
+    uint64_t stime = __atomic_load_n(&t->system_ticks, __ATOMIC_RELAXED) / 10;
+    uint64_t start = __atomic_load_n(&t->start_tick, __ATOMIC_RELAXED) / 10;
+    uint64_t vsize = procfs_task_vsize(t);
+    uint64_t rss = procfs_task_rss_pages(t);
+    uint32_t threads = procfs_thread_count(t->pid);
+    uint64_t processor = t->cpu_id;
 
     int n = ksnprintf(buf, bufsz,
-        "%u (%s) %c %u %u %u 0 -1 4194304 0 0 0 0 %llu %llu 0 0 20 0 1 0 %llu %llu %llu"
-        " 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0\n",
-        t->pid, t->name, proc_state_letter(t->state),
+        "%u (%s) %c %u %u %u 0 -1 4194304 0 0 0 0 %llu %llu 0 0 20 0 %u 0 %llu %llu %llu "
+        "18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 %llu 0 0 0 0 0 0\n",
+        t->tid, t->name, proc_state_letter(t->state),
         t->ppid, t->pgid, t->sid,
         (unsigned long long)utime, (unsigned long long)stime,
-        (unsigned long long)(start/10),
-        (unsigned long long)vsize, (unsigned long long)rss);
+        threads,
+        (unsigned long long)start,
+        (unsigned long long)vsize, (unsigned long long)rss,
+        (unsigned long long)processor);
     return (n < 0) ? -EIO : (ssize_t)n;
 }
 
 /* ── /proc/<pid>/cmdline ──────────────────────────────────────────────────── */
 static ssize_t gen_pid_cmdline(uint32_t pid, char *buf, size_t bufsz) {
-    task_t *t = task_lookup(pid);
+    task_t *t = procfs_task_get(pid);
     if (!t) return -ESRCH;
     size_t nlen = strlen(t->name);
     if (nlen + 1 >= bufsz) nlen = bufsz - 2;
@@ -377,7 +440,7 @@ static ssize_t gen_pid_cmdline(uint32_t pid, char *buf, size_t bufsz) {
 
 /* ── /proc/<pid>/io ───────────────────────────────────────────────────────── */
 static ssize_t gen_pid_io(uint32_t pid, char *buf, size_t bufsz) {
-    task_t *t = task_lookup(pid); if (!t) return -ESRCH; (void)t;
+    task_t *t = procfs_task_get(pid); if (!t) return -ESRCH; (void)t;
     size_t off = 0;
     off = PA(buf, bufsz, off, "rchar: 0\n");
     off = PA(buf, bufsz, off, "wchar: 0\n");
@@ -405,7 +468,7 @@ static ssize_t gen_pid_oom_adj(uint32_t pid, char *buf, size_t bufsz) {
 
 /* ── /proc/<pid>/wchan ────────────────────────────────────────────────────── */
 static ssize_t gen_pid_wchan(uint32_t pid, char *buf, size_t bufsz) {
-    task_t *t = task_lookup(pid); if (!t) return -ESRCH;
+    task_t *t = procfs_task_get(pid); if (!t) return -ESRCH;
     const char *wc = (t->state == TASK_SLEEPING || t->state == TASK_BLOCKED)
                      ? "poll_schedule_timeout" : "0";
     int n = ksnprintf(buf, bufsz, "%s\n", wc);
@@ -414,7 +477,7 @@ static ssize_t gen_pid_wchan(uint32_t pid, char *buf, size_t bufsz) {
 
 /* ── /proc/<pid>/smaps ────────────────────────────────────────────────────── */
 static ssize_t gen_pid_smaps(uint32_t pid, char *buf, size_t bufsz) {
-    task_t *t = task_lookup(pid); if (!t) return -ESRCH;
+    task_t *t = procfs_task_get(pid); if (!t) return -ESRCH;
     size_t off = 0;
     for (vma_t *vma = t->vma_list; vma; vma = vma->next) {
         char sh[17], eh[17];
@@ -582,18 +645,102 @@ static ssize_t gen_uptime(char *buf, size_t bufsz) {
     return (n < 0) ? -EIO : (ssize_t)n;
 }
 
+static void procfs_cpu_vendor(char *buf, size_t bufsz) {
+    uint32_t eax, ebx, ecx, edx;
+    cpuid(0, &eax, &ebx, &ecx, &edx);
+    if (bufsz < 13) {
+        if (bufsz) buf[0] = '\0';
+        return;
+    }
+    memcpy(buf + 0, &ebx, 4);
+    memcpy(buf + 4, &edx, 4);
+    memcpy(buf + 8, &ecx, 4);
+    buf[12] = '\0';
+}
+
+static void procfs_cpu_brand(char *buf, size_t bufsz) {
+    uint32_t eax, ebx, ecx, edx;
+    cpuid(0x80000000u, &eax, &ebx, &ecx, &edx);
+    if (eax < 0x80000004u || bufsz < 49) {
+        strncpy(buf, "EXO_OS Virtual CPU", bufsz ? bufsz - 1 : 0);
+        if (bufsz) buf[bufsz - 1] = '\0';
+        return;
+    }
+
+    uint32_t *out = (uint32_t *)buf;
+    for (uint32_t leaf = 0; leaf < 3; ++leaf) {
+        cpuid(0x80000002u + leaf, &eax, &ebx, &ecx, &edx);
+        out[leaf * 4 + 0] = eax;
+        out[leaf * 4 + 1] = ebx;
+        out[leaf * 4 + 2] = ecx;
+        out[leaf * 4 + 3] = edx;
+    }
+    buf[48] = '\0';
+
+    char trimmed[49];
+    size_t src = 0, dst = 0;
+    while (buf[src] == ' ') src++;
+    for (; buf[src] && dst + 1 < sizeof(trimmed); ++src) {
+        if (buf[src] == ' ' && dst > 0 && trimmed[dst - 1] == ' ')
+            continue;
+        trimmed[dst++] = buf[src];
+    }
+    while (dst > 0 && trimmed[dst - 1] == ' ') dst--;
+    trimmed[dst] = '\0';
+    strncpy(buf, trimmed[0] ? trimmed : "EXO_OS Virtual CPU", bufsz - 1);
+    buf[bufsz - 1] = '\0';
+}
+
+static void procfs_cpu_signature(uint32_t *family, uint32_t *model, uint32_t *stepping) {
+    uint32_t eax, ebx, ecx, edx;
+    cpuid(1, &eax, &ebx, &ecx, &edx);
+
+    uint32_t fam = (eax >> 8) & 0xF;
+    uint32_t mdl = (eax >> 4) & 0xF;
+    uint32_t ext_fam = (eax >> 20) & 0xFF;
+    uint32_t ext_mdl = (eax >> 16) & 0xF;
+    if (fam == 0xF) fam += ext_fam;
+    if (fam == 0x6 || fam == 0xF) mdl += (ext_mdl << 4);
+
+    if (family) *family = fam;
+    if (model) *model = mdl;
+    if (stepping) *stepping = eax & 0xF;
+}
+
+static uint32_t procfs_cpu_mhz(void) {
+    uint32_t max_leaf, ebx, ecx, edx;
+    cpuid(0, &max_leaf, &ebx, &ecx, &edx);
+    if (max_leaf >= 0x16) {
+        uint32_t eax;
+        cpuid(0x16, &eax, &ebx, &ecx, &edx);
+        if (eax)
+            return eax;
+    }
+    return 1000;
+}
+
 static ssize_t gen_cpuinfo(char *buf, size_t bufsz) {
     size_t off = 0;
+    char vendor[13];
+    char brand[49];
+    uint32_t family = 0, model = 0, stepping = 0;
+    uint32_t mhz = 1000;
+
+    procfs_cpu_vendor(vendor, sizeof(vendor));
+    procfs_cpu_brand(brand, sizeof(brand));
+    procfs_cpu_signature(&family, &model, &stepping);
+    mhz = procfs_cpu_mhz();
+
     uint32_t ncpu = smp_cpu_count(); if (!ncpu) ncpu = 1;
     for (uint32_t i = 0; i < ncpu; i++) {
         off = PA(buf,bufsz,off,"processor\t: %u\n", i);
-        off = PA(buf,bufsz,off,"vendor_id\t: GenuineIntel\n");
-        off = PA(buf,bufsz,off,"cpu family\t: 6\n");
-        off = PA(buf,bufsz,off,"model\t\t: 94\n");
-        off = PA(buf,bufsz,off,"model name\t: EXO_OS Virtual CPU @ 1.000GHz\n");
-        off = PA(buf,bufsz,off,"stepping\t: 3\n");
+        off = PA(buf,bufsz,off,"vendor_id\t: %s\n", vendor);
+        off = PA(buf,bufsz,off,"cpu family\t: %u\n", family);
+        off = PA(buf,bufsz,off,"model\t\t: %u\n", model);
+        off = PA(buf,bufsz,off,"model name\t: %s\n", brand);
+        off = PA(buf,bufsz,off,"stepping\t: %u\n", stepping);
         off = PA(buf,bufsz,off,"microcode\t: 0x1\n");
-        off = PA(buf,bufsz,off,"cpu MHz\t\t: 1000.000\n");
+        off = PA(buf,bufsz,off,"cpu MHz\t\t: %u.000\n", mhz);
         off = PA(buf,bufsz,off,"cache size\t: 8192 KB\n");
         off = PA(buf,bufsz,off,"physical id\t: 0\nsiblings\t: %u\n", ncpu);
         off = PA(buf,bufsz,off,"core id\t\t: %u\ncpu cores\t: %u\n", i, ncpu);
@@ -611,7 +758,8 @@ static ssize_t gen_cpuinfo(char *buf, size_t bufsz) {
 
 static ssize_t gen_version(char *buf, size_t bufsz) {
     int n = ksnprintf(buf, bufsz,
-        "Linux version 5.15.0-exo (root@exo) (clang 15.0.0) #1 SMP Mon Jan  1 00:00:00 UTC 2024\n");
+        "%s version %s (root@%s) (clang 15.0.0) #1 SMP\n",
+        EXO_KERNEL_NAME, EXO_KERNEL_RELEASE, EXO_KERNEL_HOSTNAME);
     return (n < 0) ? -EIO : (ssize_t)n;
 }
 
@@ -631,16 +779,48 @@ static ssize_t gen_loadavg(char *buf, size_t bufsz) {
 
 static ssize_t gen_stat(char *buf, size_t bufsz) {
     uint32_t ncpu = smp_cpu_count(); if (!ncpu) ncpu = 1;
-    uint64_t ticks = sched_get_ticks();
-    uint64_t jiffies = ticks / 10; /* ms → jiffies @100Hz */
+    sched_cpu_stat_t stats[MAX_CPUS];
+    int stat_count = sched_snapshot_cpu_stats(stats, MAX_CPUS);
     size_t off = 0;
-    off = PA(buf, bufsz, off, "cpu  %llu 0 0 %llu 0 0 0 0 0 0\n",
-             (unsigned long long)jiffies, (unsigned long long)(jiffies*3));
-    for (uint32_t i = 0; i < ncpu; i++)
-        off = PA(buf, bufsz, off, "cpu%u %llu 0 0 %llu 0 0 0 0 0 0\n",
-                 i, (unsigned long long)(jiffies/ncpu), (unsigned long long)(jiffies*3/ncpu));
-    off = PA(buf, bufsz, off, "intr 0\nctxt 0\nbtime 0\n");
-    off = PA(buf, bufsz, off, "processes %u\n", TASK_TABLE_SIZE);
+    uint64_t total_user = 0, total_system = 0, total_idle = 0;
+    for (int i = 0; i < stat_count; i++) {
+        total_user += stats[i].user_ticks / 10;
+        total_system += stats[i].system_ticks / 10;
+        total_idle += stats[i].idle_ticks / 10;
+    }
+    off = PA(buf, bufsz, off, "cpu  %llu 0 %llu %llu 0 0 0 0 0 0\n",
+             (unsigned long long)total_user,
+             (unsigned long long)total_system,
+             (unsigned long long)total_idle);
+    for (uint32_t i = 0; i < ncpu; i++) {
+        uint64_t user = 0, system = 0, idle = 0;
+        if ((int)i < stat_count) {
+            user = stats[i].user_ticks / 10;
+            system = stats[i].system_ticks / 10;
+            idle = stats[i].idle_ticks / 10;
+        }
+        off = PA(buf, bufsz, off, "cpu%u %llu 0 %llu %llu 0 0 0 0 0 0\n",
+                 i,
+                 (unsigned long long)user,
+                 (unsigned long long)system,
+                 (unsigned long long)idle);
+    }
+    uint64_t ctxt = 0;
+    uint32_t processes = 0;
+    for (uint32_t i = 1; i < TASK_TABLE_SIZE; i++) {
+        task_t *t = task_get_from_table(i);
+        if (!t || t->state == TASK_DEAD)
+            continue;
+        ctxt += __atomic_load_n(&t->nvcsw, __ATOMIC_RELAXED);
+        ctxt += __atomic_load_n(&t->nivcsw, __ATOMIC_RELAXED);
+        processes++;
+    }
+    rtc_epoch_t now = rtc_get_epoch();
+    uint64_t uptime_sec = sched_get_ticks() / 1000;
+    rtc_epoch_t btime = now > (rtc_epoch_t)uptime_sec ? now - (rtc_epoch_t)uptime_sec : now;
+    off = PA(buf, bufsz, off, "intr 0\nctxt %llu\nbtime %lld\n",
+             (unsigned long long)ctxt, (long long)btime);
+    off = PA(buf, bufsz, off, "processes %u\n", processes);
     uint32_t run = 0, blk = 0;
     for (uint32_t i = 0; i < TASK_TABLE_SIZE; i++) {
         task_t *t = task_get_from_table(i);
@@ -960,8 +1140,12 @@ static vnode_t *procfs_lookup(vnode_t *dir, const char *name) {
                 return procfs_alloc_node(root_map[i].t, 0, 0, root_map[i].m);
         }
         uint32_t pid = parse_pid(name);
-        if (pid != (uint32_t)-1 && task_lookup(pid))
-            return procfs_alloc_node(PROC_PID_DIR, pid, 0, VFS_S_IFDIR | 0555);
+        if (pid != (uint32_t)-1) {
+            task_t *t = task_lookup(pid);
+            /* Only expose user-space thread-group leaders, matching readdir. */
+            if (t && !t->is_kthread && t->tid == t->pid)
+                return procfs_alloc_node(PROC_PID_DIR, pid, 0, VFS_S_IFDIR | 0555);
+        }
         return NULL;
     }
 
@@ -972,6 +1156,7 @@ static vnode_t *procfs_lookup(vnode_t *dir, const char *name) {
             { "stat",          PROC_PID_STAT,      VFS_S_IFREG | 0444 },
             { "cmdline",       PROC_PID_CMD,       VFS_S_IFREG | 0444 },
             { "exe",           PROC_PID_EXE,       VFS_S_IFLNK | 0777 },
+            { "task",          PROC_PID_TASK_DIR,  VFS_S_IFDIR | 0555 },
             { "fd",            PROC_PID_FD_DIR,    VFS_S_IFDIR | 0500 },
             { "fdinfo",        PROC_PID_FDINFO_DIR,VFS_S_IFDIR | 0500 },
             { "io",            PROC_PID_IO,        VFS_S_IFREG | 0400 },
@@ -985,6 +1170,38 @@ static vnode_t *procfs_lookup(vnode_t *dir, const char *name) {
         for (size_t i = 0; i < sizeof(pid_map)/sizeof(pid_map[0]); i++) {
             if (strcmp(name, pid_map[i].n) == 0)
                 return procfs_alloc_node(pid_map[i].t, pn->pid, 0, pid_map[i].m);
+        }
+        return NULL;
+    }
+
+    if (pn->type == PROC_PID_TASK_DIR) {
+        uint32_t tid = parse_pid(name);
+        task_t *t = procfs_task_get(tid);
+        if (tid == (uint32_t)-1 || !t || t->pid != pn->pid)
+            return NULL;
+        return procfs_alloc_node(PROC_PID_TID_DIR, tid, (int)pn->pid, VFS_S_IFDIR | 0555);
+    }
+
+    if (pn->type == PROC_PID_TID_DIR) {
+        struct { const char *n; int t; uint32_t m; } tid_map[] = {
+            { "status",        PROC_STATUS,        VFS_S_IFREG | 0444 },
+            { "maps",          PROC_MAPS,          VFS_S_IFREG | 0444 },
+            { "stat",          PROC_PID_STAT,      VFS_S_IFREG | 0444 },
+            { "cmdline",       PROC_PID_CMD,       VFS_S_IFREG | 0444 },
+            { "exe",           PROC_PID_EXE,       VFS_S_IFLNK | 0777 },
+            { "fd",            PROC_PID_FD_DIR,    VFS_S_IFDIR | 0500 },
+            { "fdinfo",        PROC_PID_FDINFO_DIR,VFS_S_IFDIR | 0500 },
+            { "io",            PROC_PID_IO,        VFS_S_IFREG | 0400 },
+            { "cgroup",        PROC_PID_CGROUP,    VFS_S_IFREG | 0444 },
+            { "oom_score_adj", PROC_PID_OOM_ADJ,   VFS_S_IFREG | 0644 },
+            { "wchan",         PROC_PID_WCHAN,     VFS_S_IFREG | 0444 },
+            { "smaps",         PROC_PID_SMAPS,     VFS_S_IFREG | 0444 },
+            { "smaps_rollup",  PROC_PID_SMAPS,     VFS_S_IFREG | 0444 },
+            { "environ",       PROC_PID_ENVIRON,   VFS_S_IFREG | 0400 },
+        };
+        for (size_t i = 0; i < sizeof(tid_map) / sizeof(tid_map[0]); i++) {
+            if (strcmp(name, tid_map[i].n) == 0)
+                return procfs_alloc_node(tid_map[i].t, pn->pid, 0, tid_map[i].m);
         }
         return NULL;
     }
@@ -1209,6 +1426,9 @@ static int procfs_readdir(vnode_t *dir, uint64_t *cookie, vfs_dirent_t *out) {
         for (uint32_t i = 0; i < TASK_TABLE_SIZE; i++) {
             task_t *t = task_get_from_table(i);
             if (!t || t->state == TASK_DEAD) continue;
+            /* Only emit thread-group leaders (pid == tid) — skip threads and
+             * kernel workers (is_kthread) to match Linux /proc behaviour.     */
+            if (t->is_kthread || t->tid != t->pid) continue;
             if (found == skip) {
                 out->ino = t->pid; out->type = VFS_DT_DIR;
                 itoa_simple(t->pid, out->name, VFS_NAME_MAX);
@@ -1222,7 +1442,7 @@ static int procfs_readdir(vnode_t *dir, uint64_t *cookie, vfs_dirent_t *out) {
     if (pn->type == PROC_PID_DIR) {
         static const struct { const char *n; uint32_t t; } pid_ents[] = {
             {"status",VFS_DT_REG},{"maps",VFS_DT_REG},{"stat",VFS_DT_REG},
-            {"cmdline",VFS_DT_REG},{"exe",VFS_DT_LNK},{"fd",VFS_DT_DIR},
+            {"cmdline",VFS_DT_REG},{"exe",VFS_DT_LNK},{"task",VFS_DT_DIR},{"fd",VFS_DT_DIR},
             {"fdinfo",VFS_DT_DIR},{"io",VFS_DT_REG},{"cgroup",VFS_DT_REG},
             {"oom_score_adj",VFS_DT_REG},{"wchan",VFS_DT_REG},{"smaps",VFS_DT_REG},
             {"environ",VFS_DT_REG},
@@ -1232,6 +1452,42 @@ static int procfs_readdir(vnode_t *dir, uint64_t *cookie, vfs_dirent_t *out) {
         out->ino = (pn->pid<<4)|(idx+1); out->type = pid_ents[idx].t;
         strncpy(out->name, pid_ents[idx].n, VFS_NAME_MAX); out->name[VFS_NAME_MAX]='\0';
         *cookie = idx + 1; return 1;
+    }
+
+    if (pn->type == PROC_PID_TASK_DIR) {
+        uint64_t found = 0;
+        for (uint32_t i = 1; i < TASK_TABLE_SIZE; i++) {
+            task_t *t = task_get_from_table(i);
+            if (!t || t->state == TASK_DEAD || t->pid != pn->pid)
+                continue;
+            if (found == idx) {
+                out->ino = ((uint64_t)pn->pid << 20) | t->tid;
+                out->type = VFS_DT_DIR;
+                itoa_simple(t->tid, out->name, VFS_NAME_MAX);
+                *cookie = idx + 1;
+                return 1;
+            }
+            found++;
+        }
+        return 0;
+    }
+
+    if (pn->type == PROC_PID_TID_DIR) {
+        static const struct { const char *n; uint32_t t; } tid_ents[] = {
+            {"status",VFS_DT_REG},{"maps",VFS_DT_REG},{"stat",VFS_DT_REG},
+            {"cmdline",VFS_DT_REG},{"exe",VFS_DT_LNK},{"fd",VFS_DT_DIR},
+            {"fdinfo",VFS_DT_DIR},{"io",VFS_DT_REG},{"cgroup",VFS_DT_REG},
+            {"oom_score_adj",VFS_DT_REG},{"wchan",VFS_DT_REG},{"smaps",VFS_DT_REG},
+            {"environ",VFS_DT_REG},
+        };
+        uint64_t n = sizeof(tid_ents) / sizeof(tid_ents[0]);
+        if (idx >= n) return 0;
+        out->ino = (pn->pid << 4) | (idx + 1);
+        out->type = tid_ents[idx].t;
+        strncpy(out->name, tid_ents[idx].n, VFS_NAME_MAX);
+        out->name[VFS_NAME_MAX] = '\0';
+        *cookie = idx + 1;
+        return 1;
     }
 
     if (pn->type == PROC_PID_FD_DIR) {

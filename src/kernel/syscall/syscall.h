@@ -109,6 +109,7 @@
 #define SYS_GETDENTS64  217
 #define SYS_SET_TID_ADDRESS 218
 #define SYS_TGKILL      234
+#define SYS_WAITID      247
 #define SYS_CLOCK_GETTIME   228
 #define SYS_CLOCK_GETRES    229
 #define SYS_CLOCK_NANOSLEEP 230
@@ -236,6 +237,7 @@
 #define CLONE_FS        0x00000200
 #define CLONE_FILES     0x00000400
 #define CLONE_SIGHAND   0x00000800
+#define CLONE_VFORK     0x00004000
 #define CLONE_THREAD    0x00010000
 #define CLONE_NEWNS     0x00020000
 #define CLONE_SYSVSEM   0x00040000
@@ -249,6 +251,28 @@
 /* futex ops */
 #define FUTEX_WAIT      0
 #define FUTEX_WAKE      1
+
+/* waitid() idtype values */
+#define P_ALL   0
+#define P_PID   1
+#define P_PGID  2
+#define P_PIDFD 3
+
+/* wait options */
+#define WNOHANG     1
+#define WUNTRACED   2
+#define WSTOPPED    2
+#define WEXITED     4
+#define WCONTINUED  8
+#define WNOWAIT     0x01000000
+
+/* siginfo si_code values for SIGCHLD */
+#define CLD_EXITED     1
+#define CLD_KILLED     2
+#define CLD_DUMPED     3
+#define CLD_TRAPPED    4
+#define CLD_STOPPED    5
+#define CLD_CONTINUED  6
 
 /* Linux stat structure (x86-64 ABI) */
 typedef struct {

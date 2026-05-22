@@ -54,6 +54,7 @@ typedef struct {
     uint32_t queue_len;       /* total tasks across all queues              */
     uint32_t cpu_id;
     volatile int rq_lock;     /* spinlock protecting all queues             */
+    sched_cpu_stat_t stats;   /* accumulated CPU time buckets               */
 } cpu_sched_t;
 
 static cpu_sched_t cpu_scheds[MAX_CPUS];
@@ -123,7 +124,6 @@ static void idle_entry(void *arg) {
 
 /* ── Timer ISR handler (called on every CPU for vec APIC_TIMER_VEC) ───────── */
 static void sched_timer_isr(cpu_regs_t *regs) {
-    (void)regs;
     apic_send_eoi();
     /* Advance the shared ms clock ONLY from the hardware timer ISR.
      * sched_tick() is also called directly from sched_sleep / sched_task_exit;
@@ -134,6 +134,18 @@ static void sched_timer_isr(cpu_regs_t *regs) {
         uint64_t now = __atomic_add_fetch(&g_jiffies, 1, __ATOMIC_RELAXED);
         ktimer_tick(now);
         sched_process_itimers(now);
+    }
+    task_t *cur = cpu_scheds[ci->id].current;
+    if (cur == cpu_scheds[ci->id].idle) {
+        __atomic_add_fetch(&cpu_scheds[ci->id].stats.idle_ticks, 1, __ATOMIC_RELAXED);
+    } else if (regs && ((regs->cs & 3u) == 3u)) {
+        __atomic_add_fetch(&cpu_scheds[ci->id].stats.user_ticks, 1, __ATOMIC_RELAXED);
+        if (cur)
+            __atomic_add_fetch(&cur->user_ticks, 1, __ATOMIC_RELAXED);
+    } else {
+        __atomic_add_fetch(&cpu_scheds[ci->id].stats.system_ticks, 1, __ATOMIC_RELAXED);
+        if (cur)
+            __atomic_add_fetch(&cur->system_ticks, 1, __ATOMIC_RELAXED);
     }
     sched_tick();
 }
@@ -209,6 +221,8 @@ void sched_tick(void) {
             if (prev == cs->idle)
                 prev->priority = NPRIO - 1;
 
+            if (prev != cs->idle)
+                __atomic_add_fetch(&prev->nivcsw, 1, __ATOMIC_RELAXED);
             rq_enqueue(cs, prev);
         }
     }
@@ -372,6 +386,8 @@ void sched_block(void) {
         cur->priority--;
     }
 
+    if (cur && cur != cs->idle)
+        __atomic_add_fetch(&cur->nvcsw, 1, __ATOMIC_RELAXED);
     cur->state = TASK_BLOCKED;
     sched_tick();
 }
@@ -480,6 +496,8 @@ void sched_sleep(uint32_t ms) {
     rq_unlock(cs);
     irq_restore(f);
 
+    if (cur && cur != cs->idle)
+        __atomic_add_fetch(&cur->nvcsw, 1, __ATOMIC_RELAXED);
     /* Yield CPU; sched_tick() will re-enqueue us after deadline */
     sched_tick();
 }
@@ -499,4 +517,22 @@ int sched_snapshot_tasks(sched_task_info_t *buf, int max_count) {
         n++;
     }
     return n;
+}
+
+int sched_snapshot_cpu_stats(sched_cpu_stat_t *buf, int max_count) {
+    if (!buf || max_count <= 0)
+        return 0;
+
+    uint32_t ncpu = smp_cpu_count();
+    if (!ncpu)
+        ncpu = 1;
+    if ((uint32_t)max_count < ncpu)
+        ncpu = (uint32_t)max_count;
+
+    for (uint32_t i = 0; i < ncpu; i++) {
+        buf[i].user_ticks = __atomic_load_n(&cpu_scheds[i].stats.user_ticks, __ATOMIC_RELAXED);
+        buf[i].system_ticks = __atomic_load_n(&cpu_scheds[i].stats.system_ticks, __ATOMIC_RELAXED);
+        buf[i].idle_ticks = __atomic_load_n(&cpu_scheds[i].stats.idle_ticks, __ATOMIC_RELAXED);
+    }
+    return (int)ncpu;
 }

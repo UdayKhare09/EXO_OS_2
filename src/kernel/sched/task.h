@@ -73,6 +73,7 @@ typedef struct task {
     uint8_t       keep_caps;        /* prctl(PR_SET_KEEPCAPS)                   */
     uint8_t       seccomp_mode;     /* 0=disabled, 1=strict, 2=filter(stub)     */
     struct task  *parent;           /* parent task pointer                      */
+    struct task  *vfork_parent;     /* blocked parent waiting on CLONE_VFORK    */
     struct task  *children;         /* first child (linked via child_next)      */
     struct task  *child_next;       /* next sibling (in parent's children list) */
     int           exit_status;      /* set by sys_exit(), read by wait()        */
@@ -84,6 +85,11 @@ typedef struct task {
     /* ── Scheduling (MLFQ) ──────────────────────────────────────────────── */
     uint8_t       priority;         /* 0=highest, 7=lowest                       */
     uint32_t      timeslice_ticks;  /* ticks used in current timeslice           */
+    uint64_t      user_ticks;       /* timer ticks spent executing in user mode  */
+    uint64_t      system_ticks;     /* timer ticks spent executing in kernel mode */
+    uint64_t      start_tick;       /* sched_get_ticks() value when task started  */
+    uint64_t      nvcsw;            /* voluntary context switches                */
+    uint64_t      nivcsw;           /* involuntary context switches              */
 
     /* ── Sleep ──────────────────────────────────────────────────────────── */
     uint64_t      sleep_deadline;   /* wake when g_jiffies >= this value         */

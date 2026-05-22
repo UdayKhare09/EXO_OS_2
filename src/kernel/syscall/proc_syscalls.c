@@ -19,6 +19,7 @@
 #include "lib/string.h"
 #include "lib/panic.h"
 #include "arch/x86_64/cpu.h"
+#include "arch/x86_64/smp.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -83,6 +84,70 @@ static int vma_overlaps_range(task_t *t, uint64_t start, uint64_t end) {
         return 1;
     }
     return 0;
+}
+
+static void clone_live_fpu_state(task_t *parent, task_t *child) {
+    if (!parent || !child || !child->fpu_state)
+        return;
+
+    cpu_info_t *ci = smp_self();
+    if (parent == sched_current() && ci && ci->isr_xsave_buf) {
+        memcpy(child->fpu_state, ci->isr_xsave_buf, PAGE_SIZE);
+        return;
+    }
+
+    if (parent->fpu_state)
+        memcpy(child->fpu_state, parent->fpu_state, PAGE_SIZE);
+}
+
+static int child_matches_wait_filter(task_t *child, int idtype, uint64_t id) {
+    if (!child)
+        return 0;
+
+    switch (idtype) {
+        case P_ALL:
+            return 1;
+        case P_PID:
+            return child->pid == (uint32_t)id;
+        case P_PGID:
+            return child->pgid == (uint32_t)id;
+        default:
+            return 0;
+    }
+}
+
+typedef struct kernel_siginfo {
+    union {
+        struct {
+            int si_signo;
+            int si_errno;
+            int si_code;
+            struct {
+                int pid;
+                uint32_t uid;
+                int status;
+                int pad;
+                int64_t utime;
+                int64_t stime;
+            } sigchld;
+        };
+        int _pad[128 / sizeof(int)];
+    };
+} kernel_siginfo_t;
+
+static void waitid_fill_siginfo(kernel_siginfo_t *info, task_t *child) {
+    memset(info, 0, sizeof(*info));
+    info->si_signo = SIGCHLD;
+    info->sigchld.pid = (int)child->pid;
+    info->sigchld.uid = child->cred.uid;
+
+    if ((child->exit_status & 0x7F) == 0) {
+        info->si_code = CLD_EXITED;
+        info->sigchld.status = (child->exit_status >> 8) & 0xFF;
+    } else {
+        info->si_code = CLD_KILLED;
+        info->sigchld.status = child->exit_status & 0x7F;
+    }
 }
 
 static inline uint32_t vma_perm_from_prot(int prot) {
@@ -265,8 +330,7 @@ int64_t sys_fork(cpu_regs_t *regs) {
      * FPU state was already flushed to parent->fpu_state by task_switch_asm
      * before the current syscall entry.  A child that immediately exec()s will
      * reset its state via sys_execve anyway. */
-    if (parent->fpu_state && child->fpu_state)
-        memcpy(child->fpu_state, parent->fpu_state, PAGE_SIZE);
+    clone_live_fpu_state(parent, child);
 
     /* Copy memory management state */
     child->brk_base    = parent->brk_base;
@@ -896,6 +960,12 @@ int64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
         : : "r"(cur->fpu_state) : "eax", "edx", "memory"
     );
 
+    /* vfork() parent resumes only after the child either execs or exits. */
+    if (cur->vfork_parent) {
+        sched_unblock(cur->vfork_parent);
+        cur->vfork_parent = NULL;
+    }
+
     /* Jump there NOW */
     __asm__ volatile(
         "mov %0, %%rsp\n\t"
@@ -960,6 +1030,56 @@ retry:
         return 0;
 
     /* Block and retry when woken by child exit */
+    sched_block();
+    goto retry;
+}
+
+int64_t sys_waitid(int idtype, uint64_t id, void *infop, int options, void *rusage) {
+    (void)rusage;
+    task_t *cur = sched_current();
+    if (!cur) return -ESRCH;
+    if (!infop) return -EFAULT;
+    if (idtype != P_ALL && idtype != P_PID && idtype != P_PGID) return -EINVAL;
+    if ((options & (WEXITED | WSTOPPED | WCONTINUED)) == 0) return -EINVAL;
+
+    kernel_siginfo_t *info = (kernel_siginfo_t *)infop;
+    memset(info, 0, sizeof(*info));
+
+retry:
+    for (task_t *child = cur->children; child; child = child->child_next) {
+        if (!child_matches_wait_filter(child, idtype, id))
+            continue;
+        if (child->state != TASK_ZOMBIE)
+            continue;
+        if (!(options & WEXITED))
+            continue;
+
+        waitid_fill_siginfo(info, child);
+
+        if (!(options & WNOWAIT)) {
+            task_t **pp = &cur->children;
+            while (*pp && *pp != child) pp = &(*pp)->child_next;
+            if (*pp) *pp = child->child_next;
+            task_destroy(child);
+        }
+        return 0;
+    }
+
+    int have_matching_child = 0;
+    for (task_t *child = cur->children; child; child = child->child_next) {
+        if (child_matches_wait_filter(child, idtype, id)) {
+            have_matching_child = 1;
+            break;
+        }
+    }
+    if (!have_matching_child)
+        return -ECHILD;
+
+    if (options & WNOHANG) {
+        memset(info, 0, sizeof(*info));
+        return 0;
+    }
+
     sched_block();
     goto retry;
 }
@@ -1282,6 +1402,7 @@ int64_t sys_clone(uint64_t flags, uint64_t stack, uint64_t parent_tid_ptr,
     bool share_vm     = (flags & CLONE_VM) != 0;
     bool share_files  = (flags & CLONE_FILES) != 0;
     bool is_thread    = (flags & CLONE_THREAD) != 0;
+    bool is_vfork     = (flags & CLONE_VFORK) != 0;
 
     /* Thread groups must share an address space. Keep this strict check,
      * but tolerate runtimes that omit CLONE_SIGHAND while still expecting
@@ -1320,6 +1441,7 @@ int64_t sys_clone(uint64_t flags, uint64_t stack, uint64_t parent_tid_ptr,
     cred_copy(&child->cred, &parent->cred);
     child->umask  = parent->umask;
     child->parent = parent;
+    child->vfork_parent = NULL;
 
     if (is_thread) {
         child->pid = parent->pid;
@@ -1340,6 +1462,8 @@ int64_t sys_clone(uint64_t flags, uint64_t stack, uint64_t parent_tid_ptr,
     }
 
     vma_list_clone(child, parent);
+
+    clone_live_fpu_state(parent, child);
 
     child->brk_base    = parent->brk_base;
     child->brk_current = parent->brk_current;
@@ -1383,9 +1507,15 @@ int64_t sys_clone(uint64_t flags, uint64_t stack, uint64_t parent_tid_ptr,
 
     child->rsp = kstack_child;
 
-    int target_cpu = sched_pick_cpu();
+    int target_cpu = is_vfork ? (int)parent->cpu_id : (int)sched_pick_cpu();
     child->cpu_id = target_cpu;
     sched_add_task(child, target_cpu);
+
+    if (is_vfork) {
+        child->vfork_parent = parent;
+        parent->state = TASK_BLOCKED;
+        sched_tick();
+    }
 
     KLOG_DEBUG("clone: child tid=%u flags=%llx\n", child->tid, flags);
     return (int64_t)child->tid;

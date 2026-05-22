@@ -48,9 +48,18 @@ typedef struct {
     char         name[TASK_NAME_MAX];
 } sched_task_info_t;
 
+typedef struct {
+    uint64_t user_ticks;
+    uint64_t system_ticks;
+    uint64_t idle_ticks;
+} sched_cpu_stat_t;
+
 /* Enumerate all active tasks into buf[]. Returns count written.
  * Safe to call from any context (reads atomically). */
 int sched_snapshot_tasks(sched_task_info_t *buf, int max_count);
+
+/* Snapshot accumulated scheduler CPU time counters. */
+int sched_snapshot_cpu_stats(sched_cpu_stat_t *buf, int max_count);
 
 /* Global tick-per-ms for APIC (set by main after calibration) */
 extern uint32_t g_apic_ticks_per_ms;

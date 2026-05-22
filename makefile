@@ -179,7 +179,8 @@ HOST_SHELL   ?= $(shell which bash 2>/dev/null || which dash 2>/dev/null)
 HOST_CORE_BINS := ls cat echo cp mv rm mkdir chmod ln pwd env id whoami \
                   grep sed awk sort head tail wc cut tr date uname find xargs \
                   true false test stat touch sleep kill ps clear which poweroff reboot \
-                  fish ssh ping dig vi vim nano less curl git wget tar unzip zip
+                  fish ssh ping dig vi vim nano less curl git wget tar unzip zip fastfetch neofetch lshw htop who \
+				  lsd lsblk fdisk blkid lspci lsusb dmidecode lsmem 
 COREUTILS_DIR   := $(ROOTFS_STAGE_DIR)/coreutils
 COREUTILS_STAMP := $(COREUTILS_DIR)/.stamp
 
@@ -192,6 +193,8 @@ USERSPACE_STAGE_INPUTS = $(COREUTILS_STAMP) $(EXTERNAL_BIN_STAMP) $(INIT_BIN) $(
 ROOTFS_DIRS := \
 	dev tmp boot proc sys sys/bus sys/bus/usb sys/bus/usb/devices sys/bus/pci \
 	sys/bus/pci/devices home home/root home/uday \
+	home/root/.config home/root/.config/fastfetch \
+	home/uday/.config home/uday/.config/fastfetch \
 	etc etc/ssl etc/ssl/certs \
 	bin lib lib/x86_64-linux-gnu lib64 \
 	usr usr/bin usr/sbin usr/lib usr/lib/x86_64-linux-gnu \
@@ -208,6 +211,7 @@ ROOTFS_SHADOW   := tools/rootfs/shadow
 ROOTFS_GROUP    := tools/rootfs/group
 ROOTFS_RESOLV   := tools/rootfs/resolv.conf
 ROOTFS_MAIN_C   := tools/rootfs/main.c
+ROOTFS_FASTFETCH := tools/rootfs/fastfetch.jsonc
 ROOTFS_TERMINFO_LINUX := $(shell sh -c 'for p in /usr/share/terminfo/l/linux /lib/terminfo/l/linux /etc/terminfo/l/linux; do [ -f "$$p" ] && { echo "$$p"; exit 0; }; done')
 ROOTFS_CA_BUNDLE := $(shell sh -c 'for p in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do [ -f "$$p" ] && { echo "$$p"; exit 0; }; done')
 
@@ -407,7 +411,8 @@ $(RUNTIME_DEPS_STAMP): $(RUNTIME_LIB_STAMP) $(USERSPACE_STAGE_INPUTS)
 
 $(ROOT_IMG): $(RUNTIME_DEPS_STAMP) $(USERSPACE_STAGE_INPUTS) \
              $(ROOTFS_PROFILE) $(ROOTFS_ENV_FILE) $(ROOTFS_PASSWD) $(ROOTFS_SHADOW) \
-             $(ROOTFS_GROUP) $(ROOTFS_RESOLV) $(ROOTFS_NSSWITCH) $(ROOTFS_LD_CONF)
+             $(ROOTFS_GROUP) $(ROOTFS_RESOLV) $(ROOTFS_NSSWITCH) $(ROOTFS_LD_CONF) \
+             $(ROOTFS_FASTFETCH)
 	@echo ">>> Building root partition (ext2)..."
 	$(call alloc_image,$(ROOT_SECTORS))
 	mkfs.ext2 -q -L "EXOOS_ROOT" -b 4096 $@
@@ -456,6 +461,8 @@ $(ROOT_IMG): $(RUNTIME_DEPS_STAMP) $(USERSPACE_STAGE_INPUTS) \
 	debugfs -w -R "write $(ROOTFS_PASSWD)       etc/passwd"                $@ 2>/dev/null
 	debugfs -w -R "write $(ROOTFS_SHADOW)       etc/shadow"                $@ 2>/dev/null
 	debugfs -w -R "write $(ROOTFS_MAIN_C)       home/root/main.c"              $@ 2>/dev/null
+	debugfs -w -R "write $(ROOTFS_FASTFETCH)    home/root/.config/fastfetch/config.jsonc" $@ 2>/dev/null
+	debugfs -w -R "write $(ROOTFS_FASTFETCH)    home/uday/.config/fastfetch/config.jsonc" $@ 2>/dev/null
 	debugfs -w -R "set_inode_field etc/shadow mode 0100600"                 $@ 2>/dev/null || true
 	debugfs -w -R "write $(ROOTFS_GROUP)        etc/group"                 $@ 2>/dev/null
 	debugfs -w -R "write $(ROOTFS_RESOLV)       etc/resolv.conf"           $@ 2>/dev/null

@@ -1,0 +1,19 @@
+{
+    "modules": [
+        "title",
+        "separator",
+        "os",
+        "host",
+        "kernel",
+        "uptime",
+        "shell",
+        "terminal",
+        "terminalfont",
+        "cpu",
+        "memory",
+        "swap",
+        "disk",
+        "locale",
+        "colors"
+    ]
+}
