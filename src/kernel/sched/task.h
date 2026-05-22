@@ -4,6 +4,8 @@
 #include "mm/pmm.h"        /* for PAGE_SIZE   */
 #include "ipc/signal.h"    /* for sig_handler_t */
 #include "cred.h"
+#include "lib/spinlock.h"
+
 
 /* Forward-declare file_t to avoid circular include (fs/fd.h includes sched/task.h) */
 struct file;
@@ -82,14 +84,19 @@ typedef struct task {
     void         *ctty_pty;         /* controlling terminal PTY pair (opaque ptr to pty_pair_t) */
     uint8_t       ctty_is_raw;      /* 1 = controlling TTY is in raw (non-canonical) mode */
 
-    /* ── Scheduling (MLFQ) ──────────────────────────────────────────────── */
-    uint8_t       priority;         /* 0=highest, 7=lowest                       */
-    uint32_t      timeslice_ticks;  /* ticks used in current timeslice           */
+    /* ── Scheduling (EEVDF) ──────────────────────────────────────────────── */
+    uint8_t       priority;         /* legacy compat: 0=highest, 7=lowest        */
+    uint32_t      weight;           /* scheduling weight                         */
+    uint64_t      vruntime;         /* virtual time consumed                     */
+    uint64_t      deadline;         /* eligible virtual deadline                 */
+    uint32_t      slice_ticks;      /* allocated timeslice                       */
+    uint32_t      ticks_used;       /* ticks used in current slice               */
     uint64_t      user_ticks;       /* timer ticks spent executing in user mode  */
     uint64_t      system_ticks;     /* timer ticks spent executing in kernel mode */
     uint64_t      start_tick;       /* sched_get_ticks() value when task started  */
     uint64_t      nvcsw;            /* voluntary context switches                */
     uint64_t      nivcsw;           /* involuntary context switches              */
+    uint8_t       vruntime_initialized; /* 1 if vruntime is initialized from system virtual time */
 
     /* ── Sleep ──────────────────────────────────────────────────────────── */
     uint64_t      sleep_deadline;   /* wake when g_jiffies >= this value         */
@@ -146,6 +153,13 @@ task_t *task_create_user(const char *name, uintptr_t pml4_phys,
 
 /* Free a task (must be DEAD) */
 void task_destroy(task_t *t);
+
+/* Parent-child task relationship helpers */
+extern spinlock_t g_task_tree_lock;
+void task_add_child(task_t *parent, task_t *child);
+
+void task_remove_child(task_t *parent, task_t *child);
+void task_reparent_children(task_t *parent, task_t *new_parent);
 
 /* Look up a task by TID (returns NULL if not found or dead) */
 task_t *task_lookup(uint32_t tid);

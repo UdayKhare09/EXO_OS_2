@@ -180,7 +180,7 @@ HOST_CORE_BINS := ls cat echo cp mv rm mkdir chmod ln pwd env id whoami \
                   grep sed awk sort head tail wc cut tr date uname find xargs \
                   true false test stat touch sleep kill ps clear which poweroff reboot \
                   fish ssh ping dig vi vim nano less curl git wget tar unzip zip fastfetch neofetch lshw htop who \
-				  lsd lsblk fdisk blkid lspci lsusb dmidecode lsmem 
+				  lsd lsblk fdisk blkid lspci lsusb dmidecode lsmem ip route netstat iwconfig ifconfig curl wget 
 COREUTILS_DIR   := $(ROOTFS_STAGE_DIR)/coreutils
 COREUTILS_STAMP := $(COREUTILS_DIR)/.stamp
 

@@ -112,8 +112,21 @@ struct fbcon {
     bool csi_private;
 };
 
+#include "lib/spinlock.h"
+
 static fbcon_t g_fbcon_storage;
 static fbcon_t *g_fbcon = NULL;
+
+static spinlock_t g_fbcon_lock = 0;
+
+static inline uint64_t irq_save_cli(void) {
+    uint64_t f;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(f) :: "memory");
+    return f;
+}
+static inline void irq_restore(uint64_t f) {
+    __asm__ volatile("pushq %0; popfq" :: "r"(f) : "memory");
+}
 
 /* ── Low-level pixel helpers ─────────────────────────────────────────────── */
 
@@ -272,20 +285,34 @@ static void cursor_draw(fbcon_t *c) {
 
 void fbcon_show_cursor_inst(fbcon_t *c) {
     if (!c) return;
+    uint64_t f = irq_save_cli();
+    spinlock_acquire(&g_fbcon_lock);
     c->cursor_visible = true;
     cursor_draw(c);
+    spinlock_release(&g_fbcon_lock);
+    irq_restore(f);
 }
 
 void fbcon_hide_cursor_inst(fbcon_t *c) {
     if (!c) return;
+    uint64_t f = irq_save_cli();
+    spinlock_acquire(&g_fbcon_lock);
     c->cursor_visible = false;
     cursor_erase(c);
+    spinlock_release(&g_fbcon_lock);
+    irq_restore(f);
 }
 
 void fbcon_tick(fbcon_t *c) {
-    if (!c || !c->cursor_visible) return;
-    if (c->cursor_drawn) cursor_erase(c);
-    else                 cursor_draw(c);
+    if (!c) return;
+    uint64_t f = irq_save_cli();
+    spinlock_acquire(&g_fbcon_lock);
+    if (c->cursor_visible) {
+        if (c->cursor_drawn) cursor_erase(c);
+        else                 cursor_draw(c);
+    }
+    spinlock_release(&g_fbcon_lock);
+    irq_restore(f);
 }
 
 /* ── Scrolling ───────────────────────────────────────────────────────────── */
@@ -965,16 +992,40 @@ int fbcon_pixel_height(void) {
 
 void fbcon_putchar_inst(fbcon_t *c, char ch) {
     if (!c) return;
+    uint64_t f = irq_save_cli();
+    spinlock_acquire(&g_fbcon_lock);
     if (c->cursor_drawn) cursor_erase(c);
     emit_char(c, ch);
     if (c->cursor_visible) cursor_draw(c);
+    spinlock_release(&g_fbcon_lock);
+    irq_restore(f);
 }
 
 void fbcon_puts_inst(fbcon_t *c, const char *s) {
     if (!c || !s) return;
+    uint64_t f = irq_save_cli();
+    spinlock_acquire(&g_fbcon_lock);
     if (c->cursor_drawn) cursor_erase(c);
     while (*s) emit_char(c, *s++);
     if (c->cursor_visible) cursor_draw(c);
+    spinlock_release(&g_fbcon_lock);
+    irq_restore(f);
+}
+
+void fbcon_write_inst(fbcon_t *c, const char *s, size_t len, bool post, bool onlcr) {
+    if (!c || !s || len == 0) return;
+    uint64_t f = irq_save_cli();
+    spinlock_acquire(&g_fbcon_lock);
+    if (c->cursor_drawn) cursor_erase(c);
+    for (size_t i = 0; i < len; i++) {
+        char ch = s[i];
+        if (post && onlcr && ch == '\n')
+            emit_char(c, '\r');
+        emit_char(c, ch);
+    }
+    if (c->cursor_visible) cursor_draw(c);
+    spinlock_release(&g_fbcon_lock);
+    irq_restore(f);
 }
 
 /* ── Minimal printf ──────────────────────────────────────────────────────── */
@@ -987,9 +1038,13 @@ void fbcon_printf_inst(fbcon_t *c, const char *fmt, ...) {
     kvsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
 
+    uint64_t f = irq_save_cli();
+    spinlock_acquire(&g_fbcon_lock);
     if (c->cursor_drawn) cursor_erase(c);
     for (const char *p = buf; *p; p++) emit_char(c, *p);
     if (c->cursor_visible) cursor_draw(c);
+    spinlock_release(&g_fbcon_lock);
+    irq_restore(f);
 }
 
 /* ── fbcon_get_dimensions ─────────────────────────────────────────────────

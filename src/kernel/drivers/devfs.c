@@ -270,16 +270,10 @@ static ssize_t tty_console_write(file_t *f, const void *buf, size_t len) {
     (void)f;
     fbcon_t *con = fbcon_get();
     if (!con) return (ssize_t)len;   /* discard if no console */
-    const char *s = (const char *)buf;
     uint32_t oflag = tty_get_oflag();
     bool post  = (oflag & TTY_OFLAG_OPOST)  != 0;
     bool onlcr = (oflag & TTY_OFLAG_ONLCR) != 0;
-    for (size_t i = 0; i < len; i++) {
-        char ch = s[i];
-        if (post && onlcr && ch == '\n')
-            fbcon_putchar_inst(con, '\r');
-        fbcon_putchar_inst(con, ch);
-    }
+    fbcon_write_inst(con, (const char *)buf, len, post, onlcr);
     return (ssize_t)len;
 }
 
@@ -627,16 +621,10 @@ static ssize_t devfs_write(vnode_t *v, const void *buf, size_t len, uint64_t off
             /* Write to framebuffer console */
             fbcon_t *con = fbcon_get();
             if (con) {
-                const char *s = (const char *)buf;
                 uint32_t oflag = tty_get_oflag();
                 bool post = (oflag & TTY_OFLAG_OPOST) != 0;
                 bool onlcr = (oflag & TTY_OFLAG_ONLCR) != 0;
-                for (size_t i = 0; i < len; i++) {
-                    char ch = s[i];
-                    if (post && onlcr && ch == '\n')
-                        fbcon_putchar_inst(con, '\r');
-                    fbcon_putchar_inst(con, ch);
-                }
+                fbcon_write_inst(con, (const char *)buf, len, post, onlcr);
             }
             return (ssize_t)len;
         }
@@ -668,16 +656,10 @@ static ssize_t devfs_write(vnode_t *v, const void *buf, size_t len, uint64_t off
         case DEV_VTTY: {
             fbcon_t *con = fbcon_get();
             if (con) {
-                const char *s = (const char *)buf;
                 uint32_t oflag = tty_get_oflag();
                 bool post  = (oflag & TTY_OFLAG_OPOST) != 0;
                 bool onlcr = (oflag & TTY_OFLAG_ONLCR)  != 0;
-                for (size_t i = 0; i < len; i++) {
-                    char ch = s[i];
-                    if (post && onlcr && ch == '\n')
-                        fbcon_putchar_inst(con, '\r');
-                    fbcon_putchar_inst(con, ch);
-                }
+                fbcon_write_inst(con, (const char *)buf, len, post, onlcr);
             }
             return (ssize_t)len;
         }

@@ -1,5 +1,6 @@
 #include "task.h"
 #include "sched.h"
+#include "lib/spinlock.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "mm/pagecache.h"
@@ -14,6 +15,75 @@
 #include "fs/fd.h"   /* fd_close_all */
 #include <stdint.h>
 #include <stddef.h>
+
+static inline uint64_t irq_save_cli(void) {
+    uint64_t f;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(f) :: "memory");
+    return f;
+}
+static inline void irq_restore(uint64_t f) {
+    __asm__ volatile("pushq %0; popfq" :: "r"(f) : "memory");
+}
+
+spinlock_t g_task_tree_lock = 0;
+
+void task_add_child(task_t *parent, task_t *child) {
+    if (!parent || !child) return;
+    uint64_t f = irq_save_cli();
+    spinlock_acquire(&g_task_tree_lock);
+    child->parent = parent;
+    child->ppid = parent->pid;
+    child->child_next = parent->children;
+    parent->children = child;
+    spinlock_release(&g_task_tree_lock);
+    irq_restore(f);
+}
+
+void task_remove_child(task_t *parent, task_t *child) {
+    if (!parent || !child) return;
+    uint64_t f = irq_save_cli();
+    spinlock_acquire(&g_task_tree_lock);
+    task_t **pp = &parent->children;
+    while (*pp && *pp != child) {
+        pp = &(*pp)->child_next;
+    }
+    if (*pp) {
+        *pp = child->child_next;
+    }
+    child->child_next = NULL;
+    child->parent = NULL;
+    spinlock_release(&g_task_tree_lock);
+    irq_restore(f);
+}
+
+void task_reparent_children(task_t *parent, task_t *new_parent) {
+    if (!parent || !new_parent || parent == new_parent) return;
+    uint64_t f = irq_save_cli();
+    spinlock_acquire(&g_task_tree_lock);
+    
+    task_t *child = parent->children;
+    int has_zombie = 0;
+    while (child) {
+        task_t *next_child = child->child_next;
+        child->parent = new_parent;
+        child->ppid = new_parent->pid;
+        child->child_next = new_parent->children;
+        new_parent->children = child;
+        if (child->state == TASK_ZOMBIE) {
+            has_zombie = 1;
+        }
+        child = next_child;
+    }
+    parent->children = NULL;
+    
+    spinlock_release(&g_task_tree_lock);
+    irq_restore(f);
+    
+    if (has_zombie) {
+        signal_send(new_parent, SIGCHLD);
+        sched_unblock(new_parent);
+    }
+}
 
 /* ── Task ID registry ────────────────────────────────────────────────────── */
 static task_t *task_table[TASK_TABLE_SIZE];
@@ -132,9 +202,14 @@ static task_t *task_alloc_common(const char *name, uint32_t cpu_id, int is_kthre
     t->ctty_pty     = NULL;
     t->ctty_is_raw  = 0;
 
-    /* Priority scheduler fields */
+    /* EEVDF scheduler fields */
     t->priority        = 4;
-    t->timeslice_ticks = 0;
+    t->weight          = 1024;
+    t->vruntime        = 0;
+    t->vruntime_initialized = 0;
+    t->deadline        = 0;
+    t->slice_ticks     = 10;
+    t->ticks_used      = 0;
     t->start_tick      = 0;
     t->user_ticks      = 0;
     t->system_ticks    = 0;
@@ -226,6 +301,12 @@ task_t *task_create_user(const char *name, uintptr_t pml4_phys,
 
 void task_destroy(task_t *t) {
     if (!t) return;
+    if (g_init_task && t != g_init_task) {
+        task_reparent_children(t, g_init_task);
+    }
+    if (t->parent) {
+        task_remove_child(t->parent, t);
+    }
     task_unregister(t);
     fd_close_all(t);
     signal_table_free(t->sig_handlers);  t->sig_handlers = NULL;

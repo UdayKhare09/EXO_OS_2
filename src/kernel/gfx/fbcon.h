@@ -46,6 +46,7 @@ fbcon_t *fbcon_get(void);
 /* ── Output primitives ──────────────────────────────────────────────────── */
 void fbcon_putchar_inst (fbcon_t *c, char ch);
 void fbcon_puts_inst    (fbcon_t *c, const char *s);
+void fbcon_write_inst   (fbcon_t *c, const char *s, size_t len, bool post, bool onlcr);
 void fbcon_printf_inst  (fbcon_t *c, const char *fmt, ...);
 
 /* ── Cursor control ─────────────────────────────────────────────────────── */

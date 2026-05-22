@@ -95,7 +95,7 @@ echo "  [3b/6] Staging glibc CRT objects + linker stubs (→ /usr/lib/)..."
 for f in Scrt1.o crt1.o crti.o crtn.o; do
     [ -f "/usr/lib/${f}" ] && cp "/usr/lib/${f}" "${RUNTIME_EXT_DIR}/${f}"
 done
-for f in libc.so libm.so libgcc_s.so; do
+for f in libc.so libm.so libgcc_s.so libgcc_s_asneeded.so libatomic_asneeded.so libatomic_asneeded.a libatomic.so libatomic.so.1 libatomic.a; do
     [ -f "/usr/lib/${f}" ] && cp "/usr/lib/${f}" "${RUNTIME_EXT_DIR}/${f}"
 done
 [ -f /usr/lib/libc_nonshared.a ] && cp /usr/lib/libc_nonshared.a "${RUNTIME_EXT_DIR}/libc_nonshared.a"

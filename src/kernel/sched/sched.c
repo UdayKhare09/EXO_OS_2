@@ -42,13 +42,17 @@ static void sched_process_itimers(uint64_t now) {
 }
 
 #define NPRIO  8    /* 0 = highest priority, 7 = lowest */
-#define TIMESLICE_TICKS  10   /* ticks before priority drop */
+#define EEVDF_TICK_SCALE 1048576ULL /* 1024 * 1024 for fixed-point math */
+
+static const uint32_t prio_to_weight[NPRIO] = {
+    16384, 8192, 4096, 2048, 1024, 512, 256, 128
+};
 
 /* ── Per-CPU scheduler state ─────────────────────────────────────────────── */
 typedef struct {
     task_t  *current;         /* task currently running                     */
-    task_t  *queue_head[NPRIO]; /* head of each priority queue              */
-    task_t  *queue_tail[NPRIO]; /* tail of each priority queue              */
+    task_t  *rq_head;         /* head of EEVDF runqueue (linked list)       */
+    uint64_t V_system;        /* system virtual time (minimum vruntime)     */
     task_t  *idle;            /* dedicated idle task                        */
     task_t  *sleep_head;      /* linked list of sleeping tasks (sleep_next) */
     uint32_t queue_len;       /* total tasks across all queues              */
@@ -87,33 +91,82 @@ static inline void irq_restore(uint64_t f) {
     __asm__ volatile("pushq %0; popfq" :: "r"(f) : "memory");
 }
 
-/* ── Run-queue helpers ────────────────────────────────────────────────────── */
+/* ── Run-queue helpers (EEVDF) ────────────────────────────────────────────── */
 static void rq_enqueue(cpu_sched_t *cs, task_t *t) {
-    uint8_t pri = t->priority;
-    if (pri >= NPRIO) pri = NPRIO - 1;
+    if (t == cs->idle) return;
 
-    t->next = NULL;
-    if (!cs->queue_head[pri]) {
-        cs->queue_head[pri] = cs->queue_tail[pri] = t;
+    /* Catch up vruntime or initialize it to cs->V_system for new tasks */
+    if (!t->vruntime_initialized) {
+        t->vruntime = cs->V_system;
+        t->vruntime_initialized = 1;
     } else {
-        cs->queue_tail[pri]->next = t;
-        cs->queue_tail[pri]       = t;
+        uint64_t threshold = EEVDF_TICK_SCALE * 10;
+        if (cs->V_system > threshold && t->vruntime < cs->V_system - threshold) {
+            t->vruntime = cs->V_system - threshold;
+        }
     }
+
+    if (t->weight == 0) t->weight = 1024;
+    t->deadline = t->vruntime + ((uint64_t)t->slice_ticks * EEVDF_TICK_SCALE) / t->weight;
+
+    /* Append or push head directly */
+    t->next = cs->rq_head;
+    cs->rq_head = t;
     cs->queue_len++;
 }
 
-/* Dequeue from highest priority non-empty queue */
+/* Dequeue eligible task with the earliest deadline */
 static task_t *rq_dequeue(cpu_sched_t *cs) {
-    for (int pri = 0; pri < NPRIO; pri++) {
-        if (!cs->queue_head[pri]) continue;
-        task_t *t = cs->queue_head[pri];
-        cs->queue_head[pri] = t->next;
-        if (!cs->queue_head[pri]) cs->queue_tail[pri] = NULL;
-        t->next = NULL;
-        cs->queue_len--;
-        return t;
+    if (!cs->rq_head) return NULL;
+
+    /* 1. Calculate V_system (min vruntime in queue + current) */
+    uint64_t min_vruntime = (uint64_t)-1;
+    for (task_t *curr = cs->rq_head; curr; curr = curr->next) {
+        if (curr->vruntime < min_vruntime) min_vruntime = curr->vruntime;
     }
-    return NULL;
+    if (cs->current && cs->current != cs->idle && cs->current->state == TASK_RUNNING) {
+        if (cs->current->vruntime < min_vruntime) min_vruntime = cs->current->vruntime;
+    }
+    if (min_vruntime != (uint64_t)-1) cs->V_system = min_vruntime;
+
+    /* 2. Find earliest eligible virtual deadline */
+    task_t *best = NULL;
+    task_t *best_prev = NULL;
+    uint64_t best_dl = (uint64_t)-1;
+
+    task_t *prev = NULL;
+    for (task_t *curr = cs->rq_head; curr; prev = curr, curr = curr->next) {
+        /* task is eligible if vruntime <= V_system */
+        if (curr->vruntime <= cs->V_system) {
+            if (curr->deadline < best_dl) {
+                best_dl = curr->deadline;
+                best = curr;
+                best_prev = prev;
+            }
+        }
+    }
+
+    /* Fallback if none strictly eligible (shouldn't happen since V_system = min) */
+    if (!best) {
+        uint64_t min_vr = (uint64_t)-1;
+        prev = NULL;
+        for (task_t *curr = cs->rq_head; curr; prev = curr, curr = curr->next) {
+            if (curr->vruntime < min_vr) {
+                min_vr = curr->vruntime;
+                best = curr;
+                best_prev = prev;
+            }
+        }
+    }
+
+    /* 3. Remove best picking from queue */
+    if (best) {
+        if (best_prev) best_prev->next = best->next;
+        else           cs->rq_head     = best->next;
+        best->next = NULL;
+        cs->queue_len--;
+    }
+    return best;
 }
 
 /* ── Idle task entry ──────────────────────────────────────────────────────── */
@@ -190,39 +243,37 @@ void sched_tick(void) {
     uint32_t     cpu_id = ci->id;
     cpu_sched_t *cs     = &cpu_scheds[cpu_id];
 
+    uint64_t f = irq_save_cli();
+
     /* NOTE: g_jiffies is advanced ONLY by sched_timer_isr(), never here.
      * Direct callers (sched_sleep, sched_task_exit) must NOT modify it.   */
     uint64_t now = __atomic_load_n(&g_jiffies, __ATOMIC_RELAXED);
 
     task_t *prev = cs->current;
 
-    /* MLFQ: increment timeslice for the running task (including idle so it
-     * yields after 1 tick and gives queued workers a chance to run).       */
+    /* EEVDF: Charge virtual time for the running task */
     if (prev && prev->state == TASK_RUNNING) {
-        prev->timeslice_ticks++;
+        if (prev != cs->idle) {
+            uint32_t w = prev->weight ? prev->weight : 1024;
+            prev->vruntime += EEVDF_TICK_SCALE / w;
+        }
+        prev->ticks_used++;
     }
 
     rq_lock(cs);
 
-    /* Re-enqueue previous task if it has used its timeslice (or is idle).  */
+    /* Re-enqueue previous task if it has used its run slice, exceeded deadline, or is idle. */
     if (prev && prev->state == TASK_RUNNING) {
         /* Idle gets a 1-tick timeslice so it never starves queued workers.  */
-        uint32_t max_ticks = (prev == cs->idle) ? 1 : TIMESLICE_TICKS;
+        uint32_t max_ticks = (prev == cs->idle) ? 1 : prev->slice_ticks;
 
-        if (prev->timeslice_ticks >= max_ticks) {
+        if (prev->ticks_used >= max_ticks || (prev != cs->idle && prev->vruntime >= prev->deadline)) {
             prev->state = TASK_RUNNABLE;
-            prev->timeslice_ticks = 0;
+            prev->ticks_used = 0;
 
             if (prev != cs->idle) {
-                /* MLFQ feedback: used full timeslice → drop priority */
-                if (prev->priority < NPRIO - 1) prev->priority++;
-            }
-            /* Idle goes to the lowest-priority queue so real tasks preempt it */
-            if (prev == cs->idle)
-                prev->priority = NPRIO - 1;
-
-            if (prev != cs->idle)
                 __atomic_add_fetch(&prev->nivcsw, 1, __ATOMIC_RELAXED);
+            }
             rq_enqueue(cs, prev);
         }
     }
@@ -285,20 +336,16 @@ void sched_tick(void) {
 
     if (!next) next = cs->idle;   /* fallback to idle */
 
-    /* Fast-path SIGKILL: destroy the task before it runs */
-    if (next != cs->idle &&
-        (next->sig_pending & (1u << SIGKILL))) {
-        task_destroy(next);
-        next = cs->idle;
-    }
-
-    /* Reset timeslice counter when a task starts a fresh run */
-    next->timeslice_ticks = 0;
+    /* Reset EEVDF ticks when a task starts a fresh run */
+    next->ticks_used = 0;
 
     next->state = TASK_RUNNING;
     cs->current = next;
 
-    if (prev == next) return;     /* same task: no switch needed */
+    if (prev == next) {
+        irq_restore(f);
+        return;     /* same task: no switch needed */
+    }
 
     /* Update TSS RSP0 so ring 3 → ring 0 transitions land on
      * the incoming task's kernel stack top. */
@@ -329,6 +376,7 @@ void sched_tick(void) {
     /* Perform context switch */
     task_switch_asm(&prev->rsp, next->rsp, next->cr3,
                     prev->fpu_state, next->fpu_state);
+    irq_restore(f);
 }
 
 /* ── sched_task_exit ─────────────────────────────────────────────────────── */
@@ -341,19 +389,7 @@ void sched_task_exit(void) {
     /* Reparent any children of this task to init (PID 1).
      * This prevents dangling ->parent pointers when child exits later. */
     if (g_init_task && cur != g_init_task) {
-        task_t *child = cur->children;
-        while (child) {
-            task_t *next_child = child->child_next;
-            child->parent     = g_init_task;
-            child->ppid       = g_init_task->pid;
-            /* Link into init's children list */
-            child->child_next = g_init_task->children;
-            g_init_task->children = child;
-            child = next_child;
-        }
-        cur->children = NULL;
-        /* If we reparented any zombies, wake init so it can reap them */
-        signal_send(g_init_task, SIGCHLD);
+        task_reparent_children(cur, g_init_task);
     }
 
     /* Threads in the same thread-group (pid == parent->pid) are reaped
@@ -380,11 +416,6 @@ void sched_block(void) {
     cpu_info_t  *ci = smp_self();
     cpu_sched_t *cs = &cpu_scheds[ci->id];
     task_t *cur = cs->current;
-
-    /* MLFQ: voluntary block (I/O wait) → boost priority (reward) */
-    if (cur && cur != cs->idle && cur->priority > 0) {
-        cur->priority--;
-    }
 
     if (cur && cur != cs->idle)
         __atomic_add_fetch(&cur->nvcsw, 1, __ATOMIC_RELAXED);
@@ -464,8 +495,19 @@ task_t *sched_spawn(const char *name, task_entry_t entry, void *arg) {
 void sched_set_priority(task_t *t, uint8_t priority) {
     if (!t) return;
     if (priority >= NPRIO) priority = NPRIO - 1;
+
+    cpu_sched_t *cs = &cpu_scheds[t->cpu_id];
+    uint64_t f = irq_save_cli();
+    rq_lock(cs);
+
     t->priority = priority;
-    t->timeslice_ticks = 0;
+    t->weight   = prio_to_weight[priority];
+    t->ticks_used = 0;
+    if (t->weight == 0) t->weight = 1;
+    t->deadline = t->vruntime + ((uint64_t)t->slice_ticks * EEVDF_TICK_SCALE) / t->weight;
+
+    rq_unlock(cs);
+    irq_restore(f);
 }
 
 /* ── sched_get_ticks ──────────────────────────────────────────────────── */

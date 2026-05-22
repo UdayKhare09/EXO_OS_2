@@ -24,6 +24,16 @@
 #include <stdint.h>
 #include <stddef.h>
 
+static inline uint64_t irq_save_cli(void) {
+    uint64_t f;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(f) :: "memory");
+    return f;
+}
+static inline void irq_restore(uint64_t f) {
+    __asm__ volatile("pushq %0; popfq" :: "r"(f) : "memory");
+}
+
+
 /* ── Helper: add VMA to a task's sorted list ─────────────────────────────── */
 void vma_insert(task_t *t, vma_t *v) {
     vma_t **pp = &t->vma_list;
@@ -307,7 +317,6 @@ int64_t sys_fork(cpu_regs_t *regs) {
     }
 
     /* Set up parent-child relationship */
-    child->ppid    = parent->pid;
     child->pgid    = parent->pgid;
     child->sid     = parent->sid;
     cred_copy(&child->cred, &parent->cred);
@@ -315,11 +324,7 @@ int64_t sys_fork(cpu_regs_t *regs) {
     /* fork() inherits exe_path: child /proc/<pid>/exe points at same binary
      * (Linux: mm->exe_file is shared via get_file() across fork). */
     memcpy(child->exe_path, parent->exe_path, TASK_CWD_MAX);
-    child->parent  = parent;
-
-    /* Add to parent's children list */
-    child->child_next = parent->children;
-    parent->children  = child;
+    task_add_child(parent, child);
 
     /* Clone VMAs and fd table */
     vma_list_clone(child, parent);
@@ -994,37 +999,49 @@ int64_t sys_wait4(int pid, int *wstatus, int options, void *rusage) {
     int wnohang = options & 1;
 
 retry:
-    /* Search children */
-    for (task_t *child = cur->children; child; child = child->child_next) {
-        /* If pid > 0, wait for specific child */
-        if (pid > 0 && child->pid != (uint32_t)pid)
-            continue;
-        /* pid == -1: wait for any child; pid == 0: same pgid; pid < -1: pgid==-pid */
-        if (pid == 0 && child->pgid != cur->pgid)
-            continue;
-        if (pid < -1 && child->pgid != (uint32_t)(-pid))
-            continue;
+    {
+        uint64_t f = irq_save_cli();
+        spinlock_acquire(&g_task_tree_lock);
+        for (task_t *child = cur->children; child; child = child->child_next) {
+            /* If pid > 0, wait for specific child */
+            if (pid > 0 && child->pid != (uint32_t)pid)
+                continue;
+            /* pid == -1: wait for any child; pid == 0: same pgid; pid < -1: pgid==-pid */
+            if (pid == 0 && child->pgid != cur->pgid)
+                continue;
+            if (pid < -1 && child->pgid != (uint32_t)(-pid))
+                continue;
 
-        if (child->state == TASK_ZOMBIE) {
-            int status = child->exit_status;
-            if (wstatus) *wstatus = status;
+            if (child->state == TASK_ZOMBIE) {
+                int status = child->exit_status;
+                if (wstatus) *wstatus = status;
 
-            int child_pid = (int)child->pid;
+                int child_pid = (int)child->pid;
 
-            /* Remove from children list */
-            task_t **pp = &cur->children;
-            while (*pp && *pp != child) pp = &(*pp)->child_next;
-            if (*pp) *pp = child->child_next;
+                /* Remove from children list */
+                task_t **pp = &cur->children;
+                while (*pp && *pp != child) pp = &(*pp)->child_next;
+                if (*pp) *pp = child->child_next;
+                child->child_next = NULL;
+                child->parent = NULL;
 
-            /* Fully reclaim */
-            task_destroy(child);
-            return child_pid;
+                spinlock_release(&g_task_tree_lock);
+                irq_restore(f);
+
+                /* Fully reclaim */
+                task_destroy(child);
+                return child_pid;
+            }
         }
-    }
 
-    /* No zombie children found */
-    if (!cur->children)
-        return -ECHILD;
+        /* No zombie children found */
+        bool has_children = (cur->children != NULL);
+        spinlock_release(&g_task_tree_lock);
+        irq_restore(f);
+
+        if (!has_children)
+            return -ECHILD;
+    }
 
     if (wnohang)
         return 0;
@@ -1046,34 +1063,51 @@ int64_t sys_waitid(int idtype, uint64_t id, void *infop, int options, void *rusa
     memset(info, 0, sizeof(*info));
 
 retry:
-    for (task_t *child = cur->children; child; child = child->child_next) {
-        if (!child_matches_wait_filter(child, idtype, id))
-            continue;
-        if (child->state != TASK_ZOMBIE)
-            continue;
-        if (!(options & WEXITED))
-            continue;
+    {
+        uint64_t f = irq_save_cli();
+        spinlock_acquire(&g_task_tree_lock);
+        for (task_t *child = cur->children; child; child = child->child_next) {
+            if (!child_matches_wait_filter(child, idtype, id))
+                continue;
+            if (child->state != TASK_ZOMBIE)
+                continue;
+            if (!(options & WEXITED))
+                continue;
 
-        waitid_fill_siginfo(info, child);
+            waitid_fill_siginfo(info, child);
 
-        if (!(options & WNOWAIT)) {
-            task_t **pp = &cur->children;
-            while (*pp && *pp != child) pp = &(*pp)->child_next;
-            if (*pp) *pp = child->child_next;
-            task_destroy(child);
+            if (!(options & WNOWAIT)) {
+                task_t **pp = &cur->children;
+                while (*pp && *pp != child) pp = &(*pp)->child_next;
+                if (*pp) *pp = child->child_next;
+                child->child_next = NULL;
+                child->parent = NULL;
+
+                spinlock_release(&g_task_tree_lock);
+                irq_restore(f);
+
+                task_destroy(child);
+            } else {
+                spinlock_release(&g_task_tree_lock);
+                irq_restore(f);
+            }
+            return 0;
         }
-        return 0;
-    }
 
-    int have_matching_child = 0;
-    for (task_t *child = cur->children; child; child = child->child_next) {
-        if (child_matches_wait_filter(child, idtype, id)) {
-            have_matching_child = 1;
-            break;
+        int have_matching_child = 0;
+        for (task_t *child = cur->children; child; child = child->child_next) {
+            if (child_matches_wait_filter(child, idtype, id)) {
+                have_matching_child = 1;
+                break;
+            }
         }
+
+        spinlock_release(&g_task_tree_lock);
+        irq_restore(f);
+
+        if (!have_matching_child)
+            return -ECHILD;
     }
-    if (!have_matching_child)
-        return -ECHILD;
 
     if (options & WNOHANG) {
         memset(info, 0, sizeof(*info));
@@ -1435,20 +1469,17 @@ int64_t sys_clone(uint64_t flags, uint64_t stack, uint64_t parent_tid_ptr,
         child->owns_address_space = 1;
     }
 
-    child->ppid   = parent->pid;
     child->pgid   = parent->pgid;
     child->sid    = parent->sid;
     cred_copy(&child->cred, &parent->cred);
     child->umask  = parent->umask;
-    child->parent = parent;
     child->vfork_parent = NULL;
 
     if (is_thread) {
         child->pid = parent->pid;
     }
 
-    child->child_next = parent->children;
-    parent->children  = child;
+    task_add_child(parent, child);
 
     if (share_files) {
         for (int i = 0; i < TASK_FD_TABLE_SIZE; i++) {

@@ -1908,8 +1908,13 @@ static void syscall_dispatch(cpu_regs_t *regs) {
     if (cur && cur->seccomp_mode == SECCOMP_MODE_STRICT && !seccomp_strict_allows_syscall(nr)) {
         signal_send(cur, SIGKILL);
         regs->rax = (uint64_t)-EPERM;
-        if (cur->is_user)
+        if (cur->is_user) {
             signal_deliver_user(cur, regs);
+            if (cur->state == TASK_DEAD || cur->state == TASK_ZOMBIE) {
+                sched_tick();
+                for (;;) cpu_halt();
+            }
+        }
         return;
     }
 
@@ -1928,8 +1933,13 @@ static void syscall_dispatch(cpu_regs_t *regs) {
 
     /* Deliver pending signals on return to user-space */
     cur = sched_current();
-    if (cur && cur->is_user)
+    if (cur && cur->is_user) {
         signal_deliver_user(cur, regs);
+        if (cur->state == TASK_DEAD || cur->state == TASK_ZOMBIE) {
+            sched_tick();
+            for (;;) cpu_halt();
+        }
+    }
 }
 
 /* ── SYSCALL fast-path handler (called from syscall_entry asm) ────────────── */
@@ -1941,8 +1951,13 @@ void syscall_dispatch_fast(cpu_regs_t *regs) {
     if (cur && cur->seccomp_mode == SECCOMP_MODE_STRICT && !seccomp_strict_allows_syscall(nr)) {
         signal_send(cur, SIGKILL);
         regs->rax = (uint64_t)-EPERM;
-        if (cur->is_user)
+        if (cur->is_user) {
             signal_deliver_user(cur, regs);
+            if (cur->state == TASK_DEAD || cur->state == TASK_ZOMBIE) {
+                sched_tick();
+                for (;;) cpu_halt();
+            }
+        }
         return;
     }
 
@@ -1962,8 +1977,13 @@ void syscall_dispatch_fast(cpu_regs_t *regs) {
 
     /* Deliver pending signals on return to user-space */
     cur = sched_current();
-    if (cur && cur->is_user)
+    if (cur && cur->is_user) {
         signal_deliver_user(cur, regs);
+        if (cur->state == TASK_DEAD || cur->state == TASK_ZOMBIE) {
+            sched_tick();
+            for (;;) cpu_halt();
+        }
+    }
 }
 
 /* ── SYSCALL/SYSRET MSR setup ─────────────────────────────────────────────── */
